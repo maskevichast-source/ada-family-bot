@@ -659,3 +659,64 @@ def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = 
             ws.update_cell(row_idx, 6, "sent")
     except Exception as e:
         print(f"[Напоминания] Не удалось отметить напоминание: {e}")
+
+def fix_entire_table_by_strict_rules():
+    try:
+        from services.categories import (
+            normalize_category, normalize_subcategory, normalize_necessity, 
+            normalize_strict_bank, EXPENSE_CATEGORIES, INCOME_CATEGORIES, 
+            FALLBACK_EXPENSE_CATEGORY, TYPE_EXPENSE, TYPE_INCOME
+        )
+        ws = get_db().worksheet("Transactions")
+        all_values = ws.get_all_values()
+        if len(all_values) <= 1: return "Таблица пуста, нечего исправлять."
+            
+        headers = [str(h).strip().lower() for h in all_values[0]]
+        col_map = {h: i for i, h in enumerate(headers)}
+        
+        updates = []
+        for row_idx, row in enumerate(all_values[1:], start=2):
+            padded = row + [""] * (len(headers) - len(row))
+            
+            cat_idx, sub_idx, nec_idx, bank_idx, res_idx, type_idx, curr_idx, funds_idx = (
+                col_map.get(k) for k in ["category", "subcategory", "necessity", "bank", "resource", "type", "currency", "funds_type"]
+            )
+            
+            def get_val(idx): return padded[idx] if idx is not None else ""
+            cat, sub, nec, bank, res, typ, curr, funds = map(get_val, [cat_idx, sub_idx, nec_idx, bank_idx, res_idx, type_idx, curr_idx, funds_idx])
+            
+            new_type = typ if typ in [TYPE_EXPENSE, TYPE_INCOME] else TYPE_EXPENSE
+            if new_type == TYPE_INCOME:
+                new_cat = normalize_category(cat, INCOME_CATEGORIES, "Кэшбэк и прочие поступления")
+                new_nec = "" 
+            else:
+                new_cat = normalize_category(cat, EXPENSE_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
+                new_nec = normalize_necessity(nec, new_cat)
+                
+            new_sub = normalize_subcategory(new_cat, sub)
+            new_res = res if res in ["Карта", "Наличные", "Счет"] else "Карта"
+            new_bank = normalize_strict_bank(bank, new_res)
+            new_curr = curr if curr else "KZT"
+            new_funds = funds if funds in ["Собственные", "Кредитные", "Рассрочка"] else "Собственные"
+            
+            def add_update(idx, new_val):
+                if idx is not None and padded[idx] != new_val:
+                    updates.append({'range': gspread.utils.rowcol_to_a1(row_idx, idx+1), 'values': [[new_val]]})
+            
+            add_update(cat_idx, new_cat)
+            add_update(sub_idx, new_sub)
+            add_update(nec_idx, new_nec)
+            add_update(bank_idx, new_bank)
+            add_update(type_idx, new_type)
+            add_update(curr_idx, new_curr)
+            add_update(res_idx, new_res)
+            add_update(funds_idx, new_funds)
+            
+        if updates:
+            ws.batch_update(updates)
+            return f"✅ Таблица отполирована по строгим правилам! Изменено ячеек: {len(updates)}.\nБольше никаких пустых банков и русских 'нужное'."
+        else:
+            return "✅ Таблица проверена. Всё уже идеально заполнено по правилам."
+    except Exception as e:
+        print(f"[Таблицы] Ошибка массовой проверки: {e}")
+        return f"⚠️ Не смогла обновить таблицу целиком: {e}"
