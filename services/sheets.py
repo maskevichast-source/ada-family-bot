@@ -98,52 +98,34 @@ def get_db():
 # --- ТРАНЗАКЦИИ И АНАЛИТИКА ---
 def append_transaction(data: dict):
     now = datetime.datetime.now(ASTANA_TZ)
-
+    from services.categories import (
+        normalize_subcategory, normalize_necessity, normalize_strict_bank, TYPE_INCOME, TYPE_EXPENSE
+    )
+    
     raw_amount = data.get("amount", 0)
     amount = parse_amount(raw_amount)
-    if amount == int(amount):
-        amount = int(amount)
+    if amount == int(amount): amount = int(amount)
 
-    if not data.get("transaction_id"):
-        data["transaction_id"] = f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_{amount}"
-
+    data["transaction_id"] = data.get("transaction_id") or f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_{amount}"
     data["date"] = now.strftime("%Y-%m-%d %H:%M:%S")
-    if not data.get("user"):
-        data["user"] = "Влад"
+    data["user"] = data.get("user") or "Влад"
+    
+    typ = data.get("type") or TYPE_EXPENSE
+    if typ not in (TYPE_EXPENSE, TYPE_INCOME): typ = TYPE_EXPENSE
+    data["type"] = typ
 
-    if not data.get("type") or str(data.get("type")).strip() == "":
-        data["type"] = TYPE_EXPENSE
-
-    # Раньше эти поля молча оставались пустыми, если ИИ их не прислал —
-    # отсюда пустые ячейки валюты/банка на части записей.
-    if not data.get("currency"):
-        data["currency"] = "KZT"
-
-    # Частая путаница у ИИ: "Наличные" — это способ оплаты (resource),
-    # а не банк. Если "Наличные" всё же попало в bank, переносим его в
-    # resource и не оставляем как есть в bank.
-    bank_value = str(data.get("bank") or "").strip()
-    if bank_value.lower() in ("наличные", "нал", "cash"):
-        if not data.get("resource"):
-            data["resource"] = "Наличные"
-        data["bank"] = ""
-
-    if not data.get("bank"):
-        data["bank"] = "Не указан"
-    # Ловит случаи вроде source="Kaspi.kz" (название магазина из текста
-    # пользователя, а не способ оплаты) — приводит к нормальному "Kaspi Gold".
-    data["source"] = normalize_bank_source(data.get("bank"), data.get("source"))
-    if not data.get("funds_type"):
-        data["funds_type"] = "Собственные"
-    if not data.get("resource"):
-        data["resource"] = "Карта"
-
-    columns = [
-        "transaction_id", "date", "user", "type", "amount", "currency", 
-        "bank", "source", "funds_type", "resource", "category", 
-        "subcategory", "merchant", "necessity", "user_comment", "ai_comment"
-    ]
-    row = [str(data.get(col, "") or "") for col in columns]
+    cat = data.get("category", "")
+    data["subcategory"] = normalize_subcategory(cat, data.get("subcategory"))
+    data["necessity"] = normalize_necessity(data.get("necessity"), cat) if typ != TYPE_INCOME else ""
+    
+    res = data.get("resource")
+    data["resource"] = res if res in ["Карта", "Наличные", "Счет"] else "Карта"
+    data["bank"] = normalize_strict_bank(data.get("bank"), data["resource"])
+    data["source"] = normalize_bank_source(data["bank"], data.get("source"))
+    
+    funds = data.get("funds_type")
+    data["funds_type"] = funds if funds in ["Собственные", "Кредитные", "Рассрочка"] else "Собственные"
+    data["currency"] = data.get("currency") or "KZT"
 
     try:
         ws = get_db().worksheet("Transactions")
