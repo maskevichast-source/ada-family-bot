@@ -146,6 +146,13 @@ async def handle_text_message(message: types.Message, text_override: str | None 
         or "график" in normalized_text
         or "диаграмм" in normalized_text
     ):
+        if "всю таблицу проверь" in normalized_text or "исправь всю таблицу" in normalized_text or "проверь таблицу" in normalized_text:
+        await safe_answer(message, "⏳ Начинаю полную проверку и нормализацию таблицы Transactions. Это займёт пару секунд...")
+        from services.sheets import fix_entire_table_by_strict_rules
+        result_msg = await asyncio.to_thread(fix_entire_table_by_strict_rules)
+        add_chat_message(chat_id, "Ада", result_msg)
+        await safe_answer(message, result_msg)
+        return
         try:
             transactions = await asyncio.to_thread(get_last_200_transactions)
             if "доход" in normalized_text:
