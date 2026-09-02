@@ -79,29 +79,47 @@ def _parse_json(content: object) -> dict:
 
 def _render_pdf(pdf_path: Path, output_path: Path) -> Path:
     rendered_prefix = output_path.with_suffix("")
-    result = subprocess.run(
-        [
-            "pdftoppm",
-            "-f",
-            "1",
-            "-singlefile",
-            "-png",
-            "-r",
-            "150",
-            str(pdf_path),
-            str(rendered_prefix),
-        ],
-        capture_output=True,
-        text=True,
-        timeout=30,
-        check=False,
-    )
-    if result.returncode != 0:
-        raise RuntimeError(result.stderr.strip() or "Не удалось преобразовать PDF")
-    rendered_path = rendered_prefix.with_suffix(".png")
-    if not rendered_path.exists():
-        raise RuntimeError("PDF не содержит доступной страницы")
-    return rendered_path
+    
+    # Способ 1: через системный pdftoppm (если доступен)
+    try:
+        result = subprocess.run(
+            [
+                "pdftoppm",
+                "-f",
+                "1",
+                "-singlefile",
+                "-png",
+                "-r",
+                "150",
+                str(pdf_path),
+                str(rendered_prefix),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+        if result.returncode == 0:
+            rendered_path = rendered_prefix.with_suffix(".png")
+            if rendered_path.exists():
+                return rendered_path
+    except Exception:
+        pass
+
+    # Способ 2: через чистый python (pypdfium2), не требующий системных утилит
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        page = pdf[0]
+        image = page.render(scale=2).to_pil()
+        rendered_path = rendered_prefix.with_suffix(".png")
+        image.save(str(rendered_path), "PNG")
+        if rendered_path.exists():
+            return rendered_path
+    except Exception as error:
+        raise RuntimeError(f"Не удалось преобразовать PDF ни одним способом: {error}")
+
+    raise RuntimeError("PDF не содержит доступной страницы")
 
 
 async def parse_receipt(
