@@ -116,7 +116,16 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
     append_transaction(tx)
     report = _format_confirmation_report(tx, f"Категория выбрана: {chosen['label']}.")
     add_chat_message(chat_id, "Ада", report)
-    await callback.message.edit_text(report)
+
+    # Безопасное редактирование с защитой от ошибок Telegram Markdown
+    try:
+        await callback.message.edit_text(report)
+    except Exception:
+        try:
+            await callback.message.edit_text(report, parse_mode=None)
+        except Exception:
+            pass
+
     await callback.answer("Записано!")
 
 
@@ -298,7 +307,6 @@ async def _process_text_message(message: Message, text: str):
         tx["user"] = user_name
         tx["user_comment"] = text
 
-        # Санитарная очистка текста над кнопками
         amt_str = _format_currency(tx.get("amount", 0))
         curr = tx.get("currency", "KZT")
         res_label = ", наличные" if tx.get("resource") == "Наличные" else ""
@@ -341,7 +349,7 @@ async def _process_text_message(message: Message, text: str):
         if not tx.get("user_comment"): tx["user_comment"] = text
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
 
-        # Проверка на реальный дубль (не блокируем, а предупреждаем и записываем)
+        # Не блокируем, а предупреждаем и записываем
         amount = parse_amount(tx.get("amount", 0))
         duplicate = find_recent_duplicate_transaction(amount, text)
         if duplicate:
