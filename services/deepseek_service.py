@@ -11,7 +11,13 @@ from services.categories import (
 )
 from services.banks import BANK_ALIASES_PROMPT
 
-client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+# Жёсткий таймаут 20 секунд, чтобы бот никогда не зависал на несколько минут
+client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com",
+    timeout=20.0,
+    max_retries=1
+)
 
 _SUBCATEGORIES_PROMPT = "\n".join(
     f"- {cat}: {', '.join(subs)}" for cat, subs in SUBCATEGORIES_MAP.items()
@@ -51,7 +57,7 @@ SYSTEM_PROMPT = f"""
      {{"label": "👟 Повседневная обувь", "category": "Одежда и обувь", "subcategory": "Обувь"}},
      {{"label": "🏃 Спортивная для тренировок", "category": "Спорт и фитнес", "subcategory": "Спортинвентарь"}}
    ]
-4. В поле "reply" задай короткий вопрос: «Уточни, куда записать покупку?»
+4. В поле "reply" задай короткий живой вопрос.
 
 ПРАВИЛА ИНТЕНТОВ:
 1. "transaction" — однозначная запись расхода/дохода
@@ -76,7 +82,7 @@ def _format_history_compact(history: list) -> str:
     if not history:
         return "История пуста."
     lines = []
-    for t in history[-80:]:
+    for t in history[-60:]:
         date_short = str(t.get("date", ""))[:16]
         u = t.get("user", "")
         tp = t.get("type", "РАСХОД")
@@ -114,7 +120,7 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
 
     today_str = _format_history_compact(today_txs) if today_txs else "Сегодня покупок ещё НЕ БЫЛО."
     messages.append({"role": "system", "content": f"[ТРАНЗАКЦИИ ЗА СЕГОДНЯ ({today_prefix})]:\n{today_str}"})
-    past_str = _format_history_compact(past_txs[-40:])
+    past_str = _format_history_compact(past_txs[-30:])
     messages.append({"role": "system", "content": f"[АРХИВ ПРЕДЫДУЩИХ ОПЕРАЦИЙ]:\n{past_str}"})
 
     if limits:
@@ -131,7 +137,7 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
         messages.append({"role": "system", "content": f"[РАССРОЧКИ]:\n{json.dumps(installments, ensure_ascii=False)}"})
 
     if chat_history:
-        chat_lines = [f"{m['sender']}: {m['text']}" for m in chat_history[-50:]]
+        chat_lines = [f"{m['sender']}: {m['text']}" for m in chat_history[-30:]]
         messages.append({"role": "system", "content": "[ИСТОРИЯ ЧАТА]:\n" + "\n".join(chat_lines)})
 
     messages.append({"role": "user", "content": f"{user_name}: {text_to_parse}"})
@@ -144,7 +150,7 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
         )
         result = json.loads(response.choices[0].message.content)
 
-        # ── ПЕРЕХВАТ 1: Проверка по матрице частых триггеров ──
+        # ── ПЕРЕХВАТ 1: Проверка по матрице триггеров ──
         ambig_options = get_ambiguous_options(text_to_parse)
         if ambig_options:
             tx = result.get("transaction") or {}
@@ -163,9 +169,9 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             result["transaction"] = tx
             result["clarification_options"] = ambig_options
             if not result.get("reply"):
-                result["reply"] = "Уточни, куда отнести эту покупку:"
+                result["reply"] = "Уточни, куда записать эту покупку:"
 
-        # ── ПЕРЕХВАТ 2: Если DeepSeek сам вернул альтернативы из промпта ──
+        # ── ПЕРЕХВАТ 2: Альтернативы от DeepSeek ──
         tx = result.get("transaction") or {}
         alts = tx.get("alternatives") or result.get("alternatives") or []
         if alts and not result.get("clarification_options"):
@@ -179,5 +185,24 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
 
         return result
     except Exception as error:
-        print(f"[DeepSeek] Ошибка запроса: {error}")
-        return {"intent": "chat", "reply": "Я на связи, но немного задумалась. Повтори ещё раз!"}
+        print(f"[DeepSeek] Ошибка запроса или таймаут: {error}")
+        # Если в запросе была финансовая трата с неоднозначным товаром — не отдаём ошибку, а сразу выводим кнопки!
+        from services.money import parse_amount
+        amt = parse_amount(text_to_parse)
+        ambig_options = get_ambiguous_options(text_to_parse)
+        if ambig_options and amt > 0:
+            return {
+                "intent": "need_clarification",
+                "reply": "Уточни, куда отнести эту покупку:",
+                "clarification_options": ambig_options,
+                "transaction": {
+                    "amount": amt,
+                    "currency": "KZT",
+                    "type": TYPE_EXPENSE,
+                    "bank": "Не указан",
+                    "source": "Основная карта",
+                    "resource": "Наличные" if "нал" in text_to_parse.lower() else "Карта",
+                    "user_comment": text_to_parse,
+                }
+            }
+        return {"intent": "chat", "reply": "Я на связи, слушаю!"}
