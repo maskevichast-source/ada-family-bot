@@ -56,3 +56,4 @@ def normalize_bank_source(bank: str | None, source: str | None) -> str:
         return KNOWN_SOURCES_BY_BANK[bank_norm]
 
     return source_norm or "Основная карта"
+
