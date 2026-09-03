@@ -19,7 +19,7 @@ from services.sheets import (
 from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
 from services.pending_clarifications import sweep_expired_clarifications
-from services.timezone import ASTANA_TZ
+from services.timezone import ASTANA_TZ, parse_flexible_datetime
 from services.weather import get_weather_forecast, get_tomorrow_forecast
 from services.charts import generate_expense_chart
 
@@ -115,17 +115,15 @@ async def handle_all_messages(message: types.Message):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def check_reminders():
-    """Проверка и отправка напоминаний каждую минуту."""
+    """Проверка и отправка напоминаний каждую минуту с устойчивым парсингом дат."""
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             reminders = get_pending_reminders()
             for rem in reminders:
                 try:
-                    rem_time = datetime.datetime.strptime(
-                        str(rem.get("remind_at")), "%Y-%m-%d %H:%M:%S"
-                    ).replace(tzinfo=ASTANA_TZ)
-                    if now >= rem_time:
+                    rem_time = parse_flexible_datetime(rem.get("remind_at"))
+                    if rem_time and now >= rem_time:
                         target_user = str(rem.get("target_user", "")) or "Семья"
                         text = str(rem.get("text", ""))
                         recurrence = str(rem.get("recurrence", "once"))
@@ -259,7 +257,6 @@ async def sweep_clarifications():
 
 
 async def main():
-    # Создаём лист-справочник категорий для Power BI
     await asyncio.to_thread(ensure_power_bi_dimension_table)
 
     asyncio.create_task(check_reminders())
