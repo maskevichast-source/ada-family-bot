@@ -38,3 +38,4 @@ async def safe_send_message(bot, chat_id, text: str, **kwargs):
         if _looks_like_markdown_error(error):
             return await bot.send_message(chat_id=chat_id, text=text, parse_mode=None, **kwargs)
         raise
+
