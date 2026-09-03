@@ -1,4 +1,4 @@
-"""Обработка текстовых сообщений от пользователя (все интенты)."""
+"""Обработка текстовых сообщений от пользователя."""
 
 import asyncio
 import datetime
@@ -7,6 +7,7 @@ import re
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 from aiogram import types
 
+from config import get_authorized_user_name
 from services.categories import (
     TYPE_EXPENSE, TYPE_INCOME,
     EXPENSE_CATEGORIES, INCOME_CATEGORIES,
@@ -87,7 +88,6 @@ def _build_clarification_keyboard(options: list[dict]) -> InlineKeyboardMarkup:
 
 
 async def handle_category_clarification_callback(callback: types.CallbackQuery):
-    """Обработчик нажатия на кнопки выбора категории/подкатегории."""
     chat_id = callback.message.chat.id
     data = callback.data
 
@@ -114,6 +114,7 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
 
     append_transaction(tx)
     report = _format_confirmation_report(tx, f"Категория уточнена: {chosen['label']}.")
+    add_chat_message(chat_id, "Ада", report)
     await callback.message.edit_text(report)
     await callback.answer("Записано!")
 
@@ -131,7 +132,7 @@ async def handle_voice(message: Message):
         downloaded = await message.bot.download_file(file.file_path)
         file_bytes = downloaded.read()
     except Exception as e:
-        await safe_answer(message, "Не удалось скачать аудиосообщение.")
+        await safe_answer(message, "Не удалось скачать голосовое сообщение.")
         return
 
     ext = "oga"
@@ -148,8 +149,11 @@ async def handle_voice(message: Message):
 
 
 async def _process_text_message(message: Message, text: str):
-    user_name = message.from_user.first_name or "Пользователь"
+    # Строго определяем пользователя: Влад или Диана
+    user_name = get_authorized_user_name(message.from_user.id) or message.from_user.first_name or "Пользователь"
     chat_id = message.chat.id
+
+    # Записываем сообщение пользователя в память
     add_chat_message(chat_id, user_name, text)
 
     # 1. Чек ожидает комментария
@@ -166,10 +170,12 @@ async def _process_text_message(message: Message, text: str):
                     f"• {_format_currency(tx.get('amount'))} {tx.get('currency')} | "
                     f"{tx.get('bank')} | {tx.get('category')} ({text})"
                 )
-            await safe_answer(message, "\n".join(lines))
+            rep = "\n".join(lines)
+            add_chat_message(chat_id, "Ада", rep)
+            await safe_answer(message, rep)
             return
 
-    # 2. Перехват текстового ответа на вопрос об уточнении («на работу», «домой»)
+    # 2. Перехват текстового ответа на уточнение («на работу», «домой»)
     clarification = get_clarification(chat_id)
     if clarification:
         text_lower = text.lower()
@@ -193,6 +199,7 @@ async def _process_text_message(message: Message, text: str):
             tx["necessity"] = normalize_necessity(tx.get("necessity"), tx["category"])
             append_transaction(tx)
             report = _format_confirmation_report(tx, f"Поняла, это {matched_opt['label']}!")
+            add_chat_message(chat_id, "Ада", report)
             await safe_answer(message, report)
             return
 
@@ -202,7 +209,7 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, f"```\n{debug_text}\n```")
         return
 
-    # 4. /chart (полноценный дашборд с BufferedInputFile)
+    # 4. /chart (дашборд с передачей BufferedInputFile)
     if text.strip().lower() in {"график", "/chart", "chart"}:
         try:
             image_bytes = await asyncio.to_thread(generate_expense_chart)
@@ -234,15 +241,14 @@ async def _process_text_message(message: Message, text: str):
                     target_amount, part1_amt, part1_cat, part1_desc,
                     part2_amt, part2_cat, part2_desc
                 )
-                if success:
-                    await safe_answer(message, f"Разделила: {part1_cat} — {part1_amt} тг, {part2_cat} — {part2_amt} тг.")
-                else:
-                    await safe_answer(message, "Не нашла такую транзакцию.")
+                res = f"Разделила: {part1_cat} — {part1_amt} тг, {part2_cat} — {part2_amt} тг." if success else "Не нашла такую транзакцию."
+                add_chat_message(chat_id, "Ада", res)
+                await safe_answer(message, res)
                 return
         await safe_answer(message, "Формат: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>")
         return
 
-    # 6. Обработка через нейросеть
+    # 6. Запрос к DeepSeek
     history = get_last_200_transactions()
     limits = get_category_limits()
     reminders = get_pending_reminders()
@@ -272,7 +278,9 @@ async def _process_text_message(message: Message, text: str):
             tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
             kb = _build_clarification_keyboard(options)
             set_clarification(chat_id, tx, options)
-            await message.answer(reply or "Уточни, куда отнести эту покупку:", reply_markup=kb)
+            prompt_text = reply or "Уточни, куда отнести эту покупку:"
+            add_chat_message(chat_id, "Ада", prompt_text)
+            await message.answer(prompt_text, reply_markup=kb)
             return
 
     # ТРАНЗАКЦИЯ
@@ -297,7 +305,7 @@ async def _process_text_message(message: Message, text: str):
         if not tx.get("currency"): tx["currency"] = "KZT"
         if not tx.get("funds_type"): tx["funds_type"] = "Собственные"
         if not tx.get("resource"): tx["resource"] = "Карта"
-        if not tx.get("user"): tx["user"] = user_name
+        tx["user"] = user_name
         if not tx.get("merchant"): tx["merchant"] = ""
         if not tx.get("user_comment"): tx["user_comment"] = text
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
@@ -305,15 +313,14 @@ async def _process_text_message(message: Message, text: str):
         amount = parse_amount(tx.get("amount", 0))
         duplicate = find_recent_duplicate_transaction(amount)
         if duplicate:
-            await safe_answer(
-                message,
-                f"⚠️ Похожая операция на {_format_currency(amount)} тг уже была записана "
-                f"({duplicate.get('category')} — {duplicate.get('date')}). Записать ещё раз?",
-            )
+            dup_msg = f"⚠️ Похожая операция на {_format_currency(amount)} тг уже была записана ({duplicate.get('category')} — {duplicate.get('date')}). Записать ещё раз?"
+            add_chat_message(chat_id, "Ада", dup_msg)
+            await safe_answer(message, dup_msg)
             return
 
         append_transaction(tx)
         report = _format_confirmation_report(tx, reply)
+        add_chat_message(chat_id, "Ада", report)
         await safe_answer(message, report)
         return
 
@@ -347,7 +354,9 @@ async def _process_text_message(message: Message, text: str):
                     new_value = normalize_necessity(new_value)
                 updated = find_and_update_record(worksheet, search_query, column, new_value)
                 results.append("обновлено" if updated else "не найдено")
-        await safe_answer(message, reply or f"Результат: {', '.join(results)}.")
+        msg = reply or f"Результат: {', '.join(results)}."
+        add_chat_message(chat_id, "Ада", msg)
+        await safe_answer(message, msg)
         return
 
     # РАССРОЧКИ
@@ -355,14 +364,18 @@ async def _process_text_message(message: Message, text: str):
         data = parsed.get("installment", {})
         if data:
             add_installment(data)
-        await safe_answer(message, reply or "Записала рассрочку.")
+        res = reply or "Записала рассрочку."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "close_installment":
         query = parsed.get("search_query", "")
         if query:
             close_installment(query)
-        await safe_answer(message, reply or "Закрыла рассрочку.")
+        res = reply or "Закрыла рассрочку."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "get_installments":
@@ -375,9 +388,11 @@ async def _process_text_message(message: Message, text: str):
                     f"{_format_currency(item.get('total_amount'))} тг, "
                     f"{_format_currency(item.get('monthly_payment'))} тг/мес"
                 )
-            await safe_answer(message, "\n".join(lines))
+            res = "\n".join(lines)
         else:
-            await safe_answer(message, "Нет активных рассрочек.")
+            res = "Нет активных рассрочек."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # ПОДПИСКИ
@@ -385,7 +400,9 @@ async def _process_text_message(message: Message, text: str):
         name = parsed.get("subscription_name", "")
         if name:
             deactivate_subscription(name)
-        await safe_answer(message, reply or "Отменила подписку.")
+        res = reply or "Отменила подписку."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "get_subscriptions":
@@ -393,13 +410,12 @@ async def _process_text_message(message: Message, text: str):
         if items:
             lines = ["📋 **Активные подписки:**"]
             for item in items:
-                lines.append(
-                    f"- {item.get('name')}: {_format_currency(item.get('amount'))} тг/мес "
-                    f"({item.get('bank')})"
-                )
-            await safe_answer(message, "\n".join(lines))
+                lines.append(f"- {item.get('name')}: {_format_currency(item.get('amount'))} тг/мес ({item.get('bank')})")
+            res = "\n".join(lines)
         else:
-            await safe_answer(message, "Нет активных подписок.")
+            res = "Нет активных подписок."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # НАПОМИНАНИЯ
@@ -413,14 +429,18 @@ async def _process_text_message(message: Message, text: str):
             return
         for time_str in times:
             add_reminder(target, time_str, text_rem, recurrence)
-        await safe_answer(message, reply or "Поставила напоминание.")
+        res = reply or "Поставила напоминание."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "delete_reminder":
         query = parsed.get("search_query", "")
         if query:
             delete_record_by_keyword("Reminders", query)
-        await safe_answer(message, reply or "Удалила напоминание.")
+        res = reply or "Удалила напоминание."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "get_reminders":
@@ -429,9 +449,11 @@ async def _process_text_message(message: Message, text: str):
             lines = ["📋 **Активные напоминания:**"]
             for item in items:
                 lines.append(f"- {item.get('target_user')}: {item.get('text')} ({item.get('remind_at')})")
-            await safe_answer(message, "\n".join(lines))
+            res = "\n".join(lines)
         else:
-            await safe_answer(message, "Нет активных напоминаний.")
+            res = "Нет активных напоминаний."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # СПИСОК ПОКУПОК
@@ -439,14 +461,18 @@ async def _process_text_message(message: Message, text: str):
         items = parsed.get("shopping_items", [])
         if items:
             add_shopping_items(items, user_name)
-        await safe_answer(message, reply or "Добавила в список покупок.")
+        res = reply or "Добавила в список покупок."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "clear_shopping":
         items = parsed.get("shopping_items", [])
         if items:
             mark_shopping_items_done(items)
-        await safe_answer(message, reply or "Убрала из списка.")
+        res = reply or "Убрала из списка."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "get_shopping":
@@ -455,9 +481,11 @@ async def _process_text_message(message: Message, text: str):
             lines = ["🛒 **Список покупок:**"]
             for item in items:
                 lines.append(f"- {item.get('item')}")
-            await safe_answer(message, "\n".join(lines))
+            res = "\n".join(lines)
         else:
-            await safe_answer(message, "Список покупок пуст.")
+            res = "Список покупок пуст."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # ПОЕЗДКИ
@@ -468,7 +496,9 @@ async def _process_text_message(message: Message, text: str):
         notes = parsed.get("notes", "")
         if destination:
             add_trip_plan(destination, dates, budget, notes)
-        await safe_answer(message, reply or "Записала поездку.")
+        res = reply or "Записала поездку."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "get_trips":
@@ -476,13 +506,12 @@ async def _process_text_message(message: Message, text: str):
         if items:
             lines = ["✈️ **Запланированные поездки:**"]
             for item in items:
-                lines.append(
-                    f"- {item.get('destination')} ({item.get('dates')}): "
-                    f"{_format_currency(item.get('budget'))} тг"
-                )
-            await safe_answer(message, "\n".join(lines))
+                lines.append(f"- {item.get('destination')} ({item.get('dates')}): {_format_currency(item.get('budget'))} тг")
+            res = "\n".join(lines)
         else:
-            await safe_answer(message, "Нет запланированных поездок.")
+            res = "Нет запланированных поездок."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # ЛИМИТЫ
@@ -492,9 +521,11 @@ async def _process_text_message(message: Message, text: str):
             lines = ["📊 **Текущие лимиты:**"]
             for cat, limit in current_limits.items():
                 lines.append(f"- {cat}: {_format_currency(limit)} тг")
-            await safe_answer(message, "\n".join(lines))
+            res = "\n".join(lines)
         else:
-            await safe_answer(message, "Лимиты не заданы.")
+            res = "Лимиты не заданы."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "generate_limits":
@@ -504,12 +535,14 @@ async def _process_text_message(message: Message, text: str):
                 lines = ["📊 **Сгенерированные лимиты:**"]
                 for cat, limit in new_limits.items():
                     lines.append(f"- {cat}: {_format_currency(limit)} тг")
-                await safe_answer(message, "\n".join(lines))
+                res = "\n".join(lines)
             else:
-                await safe_answer(message, "Недостаточно данных для генерации лимитов.")
+                res = "Недостаточно данных для генерации лимитов."
         except Exception as error:
             print(f"[Лимиты] Ошибка генерации: {error}")
-            await safe_answer(message, "Не удалось сгенерировать лимиты.")
+            res = "Не удалось сгенерировать лимиты."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # СВОДКА И ДОХОДЫ
@@ -537,7 +570,9 @@ async def _process_text_message(message: Message, text: str):
         lines.append("📉 **По категориям:**")
         for cat, amt in sorted(by_category.items(), key=lambda x: -x[1]):
             lines.append(f"  - {cat}: {_format_currency(amt)} тг")
-        await safe_answer(message, "\n".join(lines))
+        res = "\n".join(lines)
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     if intent == "get_income":
@@ -550,24 +585,24 @@ async def _process_text_message(message: Message, text: str):
         lines = [f"💰 **Доходы за {now.strftime('%B %Y')}:** {_format_currency(total)} тг"]
         for t in incomes:
             lines.append(f"  - {t.get('cat')}: {_format_currency(t.get('amt'))} тг ({t.get('comm')})")
-        await safe_answer(message, "\n".join(lines))
+        res = "\n".join(lines)
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # ПОГОДА
     if intent == "get_weather":
         forecast = await get_weather_forecast()
-        if forecast:
-            await safe_answer(message, forecast)
-        else:
-            await safe_answer(message, "Не удалось получить прогноз погоды.")
+        res = forecast or "Не удалось получить прогноз погоды."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # РАЗДЕЛЕНИЕ
     if intent == "split_transaction":
-        await safe_answer(
-            message,
-            reply or "Чтобы разделить операцию, напиши: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>"
-        )
+        res = reply or "Чтобы разделить операцию, напиши: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>"
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # УДАЛЕНИЕ
@@ -575,8 +610,12 @@ async def _process_text_message(message: Message, text: str):
         query = parsed.get("search_query", "")
         if query:
             delete_record_by_keyword("Transactions", query)
-        await safe_answer(message, reply or "Удалила запись.")
+        res = reply or "Удалила запись."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
-    # ЧАТ
-    await safe_answer(message, reply or "Чем могу помочь?")
+    # ОБЫЧНЫЙ ЧАТ
+    res = reply or "Чем могу помочь?"
+    add_chat_message(chat_id, "Ада", res)
+    await safe_answer(message, res)
