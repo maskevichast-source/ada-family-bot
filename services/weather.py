@@ -162,3 +162,4 @@ async def get_tomorrow_forecast() -> str | None:
     except Exception as error:
         print(f"[Погода] Не удалось получить прогноз на завтра: {error}")
         return None
+
