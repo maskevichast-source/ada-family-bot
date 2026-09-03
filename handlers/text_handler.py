@@ -1,4 +1,4 @@
-"""Обработка текстовых сообщений от пользователя."""
+"""Обработка текстовых сообщений от пользователя (все интенты)."""
 
 import asyncio
 import datetime
@@ -81,7 +81,7 @@ def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
 
 
 def _build_clarification_keyboard(options: list[dict]) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру с крупными кнопками в столбик."""
+    """Создаёт клавиатуру с крупными кнопками (от 2 до 4 штук)."""
     buttons = []
     for idx, opt in enumerate(options):
         buttons.append([InlineKeyboardButton(text=opt["label"], callback_data=f"clarify_opt:{idx}")])
@@ -173,7 +173,7 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, rep)
             return
 
-    # 2. Перехват текстового ответа на вопрос («на работу», «домой»)
+    # 2. Перехват текстового ответа на вопрос («на работу», «домой», «спорт» и т.п.)
     clarification = get_clarification(chat_id)
     if clarification:
         text_lower = text.lower()
@@ -183,10 +183,11 @@ async def _process_text_message(message: Message, text: str):
             if any(w in text_lower for w in words if len(w) > 3):
                 matched_opt = opt
                 break
-        if "работ" in text_lower or "кафе" in text_lower or "собой" in text_lower or "перекус" in text_lower or "офис" in text_lower:
-            matched_opt = clarification["options"][0]
-        elif "дом" in text_lower or "продукт" in text_lower or "семь" in text_lower:
-            matched_opt = clarification["options"][-1]
+        if not matched_opt:
+            if any(k in text_lower for k in ["работ", "кафе", "собой", "перекус", "офис", "зал", "спорт"]):
+                matched_opt = clarification["options"][0]
+            elif any(k in text_lower for k in ["дом", "продукт", "семь", "каждый день", "обычн"]):
+                matched_opt = clarification["options"][-1]
 
         if matched_opt:
             pop_clarification(chat_id)
@@ -267,10 +268,10 @@ async def _process_text_message(message: Message, text: str):
     intent = parsed.get("intent", "chat")
     reply = parsed.get("reply", "")
 
-    # ── ПЕРЕХВАТ И ВЫВОД КНОПОК УТОЧНЕНИЯ ──
-    # Проверяем как явный статус need_clarification, так и наличие неоднозначного товара в сообщении
-    ambig_options = get_ambiguous_options(text) or parsed.get("clarification_options")
+    # ── УНИВЕРСАЛЬНЫЙ ПЕРЕХВАТ: КНОПКИ ДЛЯ ЛЮБОЙ НЕПОНЯТНОЙ СИТУАЦИИ ──
+    ambig_options = parsed.get("clarification_options") or get_ambiguous_options(text)
 
+    # Если есть варианты кнопок И (intent требует уточнения ЛИБО в тексте есть сумма покупки):
     if ambig_options and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0):
         tx = parsed.get("transaction") or {}
         if not tx.get("amount"):
@@ -292,11 +293,10 @@ async def _process_text_message(message: Message, text: str):
         set_clarification(chat_id, tx, ambig_options)
         prompt_text = reply or "Уточни, куда записать эту покупку:"
         add_chat_message(chat_id, "Ада", prompt_text)
-        # Отправляем сообщение С КЛАВИАТУРОЙ ИЗ ДВУХ КНОПОК
         await message.answer(prompt_text, reply_markup=kb)
         return
 
-    # ТРАНЗАКЦИЯ
+    # ТРАНЗАКЦИЯ (ОДНОЗНАЧНАЯ)
     if intent == "transaction":
         tx = parsed.get("transaction", {})
         if not tx:
