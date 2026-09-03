@@ -1,8 +1,8 @@
 """Обработка фото, PDF и скриншотов чеков."""
 
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from services.vision import parse_receipt
-from services.sheets import append_transaction
+from services.sheets import append_transaction, normalize_necessity
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending
 from services.pending_clarifications import set_clarification
@@ -13,8 +13,30 @@ from services.categories import (
     normalize_category, normalize_subcategory,
     validate_transaction_category_subcategory,
 )
-from services.sheets import normalize_necessity
 from services.banks import normalize_bank_source
+
+
+def _format_currency(value):
+    try:
+        return f"{float(value):,.0f}".replace(",", " ")
+    except (ValueError, TypeError):
+        return str(value)
+
+
+def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> str:
+    """Формирует аккуратный список записанных по чеку трат (как на Скриншоте 2)."""
+    lines = ["📸 **Записано по чеку:**"]
+    for tx in transactions:
+        amt = _format_currency(tx.get("amount", 0))
+        curr = tx.get("currency", "KZT")
+        bank = tx.get("bank", "Не указан")
+        cat = tx.get("category", "")
+        comm = str(tx.get("user_comment") or "").strip()
+        comm_str = f" ({comm})" if comm else ""
+        lines.append(f"• {amt} {curr} | {bank} | {cat}{comm_str}")
+    if ai_comment:
+        lines.append(f"\n💬 {ai_comment}")
+    return "\n".join(lines)
 
 
 async def handle_media(message: Message):
@@ -46,36 +68,6 @@ async def handle_media(message: Message):
         await safe_answer(message, reply or "Не удалось распознать чек.")
         return
 
-    # Проверяем, есть ли транзакции с низкой confidence
-    low_confidence_txs = [tx for tx in transactions if float(tx.get("confidence", 1.0)) < 0.8 and tx.get("alternatives")]
-
-    if low_confidence_txs and not caption:
-        # Если есть неоднозначные и нет подписи — показываем кнопки для первой
-        tx = low_confidence_txs[0]
-        from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-        buttons = [[InlineKeyboardButton(text=alt, callback_data=f"clarify_cat:{alt[:20]}")]
-                   for alt in tx.get("alternatives", [])]
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-
-        # Валидируем базовые поля
-        tx_type = str(tx.get("type") or TYPE_EXPENSE).strip().upper()
-        valid_categories = INCOME_CATEGORIES if tx_type == TYPE_INCOME else EXPENSE_CATEGORIES
-        fallback_cat = FALLBACK_INCOME_CATEGORY if tx_type == TYPE_INCOME else FALLBACK_EXPENSE_CATEGORY
-        tx["category"] = normalize_category(tx.get("category"), valid_categories, fallback_cat)
-        tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
-        if not tx.get("bank"): tx["bank"] = "Не указан"
-        if not tx.get("currency"): tx["currency"] = "KZT"
-        if not tx.get("funds_type"): tx["funds_type"] = "Собственные"
-        if not tx.get("resource"): tx["resource"] = "Карта"
-        if not tx.get("user"): tx["user"] = user_name
-        if not tx.get("merchant"): tx["merchant"] = ""
-        if not tx.get("user_comment"): tx["user_comment"] = caption or ""
-        if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
-
-        set_clarification(chat_id, tx, tx.get("alternatives", []))
-        sent = await message.answer(reply or "Не уверена в категории. Выбери:", reply_markup=kb)
-        return
-
     # Валидация и заполнение ВСЕХ полей
     validated_transactions = []
     for tx in transactions:
@@ -102,16 +94,37 @@ async def handle_media(message: Message):
 
         validated_transactions.append(tx)
 
+    # Проверяем, есть ли транзакции с низкой confidence (если пользователь не дал подпись)
+    low_confidence_txs = [
+        tx for tx in validated_transactions
+        if float(tx.get("confidence", 1.0)) < 0.8 and tx.get("alternatives")
+    ]
+
+    if low_confidence_txs and not caption:
+        tx = low_confidence_txs[0]
+        options = [
+            {"label": alt, "category": alt, "subcategory": ""}
+            for alt in tx.get("alternatives", [])
+        ]
+        buttons = [
+            [InlineKeyboardButton(text=opt["label"], callback_data=f"clarify_opt:{i}")]
+            for i, opt in enumerate(options)
+        ]
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+        set_clarification(chat_id, tx, options)
+        await message.answer(reply or "Не уверена в категории чека. Выбери вариант:", reply_markup=kb)
+        return
+
     if caption:
         for tx in validated_transactions:
             tx["user_comment"] = caption
             tx["user"] = user_name
             append_transaction(tx)
-        await safe_answer(message, reply or f"Записала {len(validated_transactions)} покупок.")
+        report = _format_receipt_report(validated_transactions, reply)
+        await safe_answer(message, report)
     else:
         set_pending(chat_id, validated_transactions, user_name)
         await safe_answer(
             message,
             reply or f"Распознала {len(validated_transactions)} покупок. Напиши комментарий к чеку, и я запишу."
         )
-
