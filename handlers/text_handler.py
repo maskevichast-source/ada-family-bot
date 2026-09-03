@@ -59,7 +59,6 @@ def _format_currency(value):
 
 
 def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
-    """Форматирует строгий отчёт о записи (как на Скриншоте 2)."""
     amt = _format_currency(tx.get("amount", 0))
     curr = tx.get("currency", "KZT")
     if tx.get("resource") == "Наличные":
@@ -81,7 +80,6 @@ def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
 
 
 def _build_clarification_keyboard(options: list[dict]) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру с крупными кнопками (от 2 до 4 штук)."""
     buttons = []
     for idx, opt in enumerate(options):
         buttons.append([InlineKeyboardButton(text=opt["label"], callback_data=f"clarify_opt:{idx}")])
@@ -117,7 +115,6 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
     report = _format_confirmation_report(tx, f"Категория выбрана: {chosen['label']}.")
     add_chat_message(chat_id, "Ада", report)
 
-    # Безопасное редактирование с защитой от ошибок Telegram Markdown
     try:
         await callback.message.edit_text(report)
     except Exception:
@@ -162,8 +159,9 @@ async def _process_text_message(message: Message, text: str):
     user_name = get_authorized_user_name(message.from_user.id) or message.from_user.first_name or "Пользователь"
     chat_id = message.chat.id
     add_chat_message(chat_id, user_name, text)
+    t_clean = text.strip().lower()
 
-    # 1. Чек ожидает комментария (Бережное объединение позиций)
+    # 1. Чек ожидает комментария
     if has_pending(chat_id):
         pending = pop_pending(chat_id)
         if pending:
@@ -186,20 +184,19 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, rep)
             return
 
-    # 2. Перехват текстового ответа на вопрос («на работу», «домой», «спорт» и т.п.)
+    # 2. Перехват текстового ответа на вопрос уточнения
     clarification = get_clarification(chat_id)
     if clarification:
-        text_lower = text.lower()
         matched_opt = None
         for opt in clarification.get("options", []):
             words = re.findall(r'\w+', opt["label"].lower())
-            if any(w in text_lower for w in words if len(w) > 3):
+            if any(w in t_clean for w in words if len(w) > 3):
                 matched_opt = opt
                 break
         if not matched_opt:
-            if any(k in text_lower for k in ["работ", "кафе", "собой", "перекус", "офис", "зал", "спорт"]):
+            if any(k in t_clean for k in ["работ", "кафе", "собой", "перекус", "офис", "зал", "спорт"]):
                 matched_opt = clarification["options"][0]
-            elif any(k in text_lower for k in ["дом", "продукт", "семь", "каждый день", "обычн"]):
+            elif any(k in t_clean for k in ["дом", "продукт", "семь", "каждый день", "обычн"]):
                 matched_opt = clarification["options"][-1]
 
         if matched_opt:
@@ -215,14 +212,29 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, report)
             return
 
-    # 3. /debug
-    if text.strip().lower() in {"debug", "/debug"}:
+    # ── ПРЯМОЙ ПЕРЕХВАТ: ПОГОДА (СЕГОДНЯ, ЗАВТРА, ПОСЛЕЗАВТРА, НЕДЕЛЯ) ──
+    if any(k in t_clean for k in ["погода", "погоду", "прогноз", "зонт"]):
+        target = "today"
+        if "недел" in t_clean or "5 дней" in t_clean or "выходн" in t_clean:
+            target = "week"
+        elif "послезавтра" in t_clean:
+            target = "after_tomorrow"
+        elif "завтра" in t_clean:
+            target = "tomorrow"
+
+        forecast = await get_weather_forecast(target=target)
+        res = forecast or "Не удалось связаться с погодной станцией Open-Meteo."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
+        return
+
+    # ── ПРЯМОЙ ПЕРЕХВАТ: СИСТЕМНЫЕ КОМАНДЫ ──
+    if t_clean in {"debug", "/debug"}:
         debug_text = debug_transactions_snapshot()
         await safe_answer(message, f"```\n{debug_text}\n```")
         return
 
-    # 4. /chart
-    if text.strip().lower() in {"график", "/chart", "chart"}:
+    if t_clean in {"график", "/chart", "chart"}:
         try:
             image_bytes = await asyncio.to_thread(generate_expense_chart)
             if image_bytes:
@@ -235,8 +247,8 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, "Не удалось построить график.")
         return
 
-    # 5. Разделение транзакции
-    if "раздели" in text.lower() and "транзакцию" in text.lower():
+    # ── ПРЯМОЙ ПЕРЕХВАТ: РАЗДЕЛИТЬ ТРАНЗАКЦИЮ ──
+    if "раздели" in t_clean and "транзакцию" in t_clean:
         match = re.search(r"раздели\s+транзакцию\s+(\d+)[\s:]*(.+?)[\s]*\|\s*(.+?)", text, re.IGNORECASE)
         if match:
             target_amount = float(match.group(1))
@@ -260,13 +272,12 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, "Формат: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>")
         return
 
-    # Индикатор «Ада печатает...»
     try:
         await message.bot.send_chat_action(chat_id=chat_id, action="typing")
     except Exception:
         pass
 
-    # 6. Запрос к DeepSeek
+    # ── ЗАПРОС К DEEPSEEK ДЛЯ СЛОЖНЫХ СМЫСЛОВ И ТРАНЗАКЦИЙ ──
     history = get_last_200_transactions()
     limits = get_category_limits()
     reminders = get_pending_reminders()
@@ -287,9 +298,8 @@ async def _process_text_message(message: Message, text: str):
     intent = parsed.get("intent", "chat")
     reply = parsed.get("reply", "")
 
-    # ── УНИВЕРСАЛЬНЫЙ ПЕРЕХВАТ: КНОПКИ ДЛЯ ЛЮБОЙ НЕПОНЯТНОЙ СИТУАЦИИ ──
+    # ПЕРЕХВАТ УТОЧНЕНИЙ И ВЫВОД КНОПОК
     ambig_options = parsed.get("clarification_options") or get_ambiguous_options(text)
-
     if ambig_options and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0):
         tx = parsed.get("transaction") or {}
         if not tx.get("amount"):
@@ -349,7 +359,6 @@ async def _process_text_message(message: Message, text: str):
         if not tx.get("user_comment"): tx["user_comment"] = text
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
 
-        # Не блокируем, а предупреждаем и записываем
         amount = parse_amount(tx.get("amount", 0))
         duplicate = find_recent_duplicate_transaction(amount, text)
         if duplicate:
@@ -624,21 +633,6 @@ async def _process_text_message(message: Message, text: str):
         for t in incomes:
             lines.append(f"  - {t.get('cat')}: {_format_currency(t.get('amt'))} тг ({t.get('comm')})")
         res = "\n".join(lines)
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    # ПОГОДА
-    if intent == "get_weather":
-        forecast = await get_weather_forecast()
-        res = forecast or "Не удалось получить прогноз погоды."
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    # РАЗДЕЛЕНИЕ
-    if intent == "split_transaction":
-        res = reply or "Чтобы разделить операцию, напиши: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>"
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
