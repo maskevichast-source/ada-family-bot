@@ -62,3 +62,4 @@ def format_currency(value, currency: str = "KZT") -> str:
         return f"{formatted} {currency}"
     except (ValueError, TypeError):
         return str(value)
+
