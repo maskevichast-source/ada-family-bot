@@ -1,5 +1,6 @@
 import json
 import datetime
+import traceback
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY
 from services.timezone import now_astana
@@ -14,7 +15,7 @@ from services.banks import BANK_ALIASES_PROMPT
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com",
-    timeout=15.0,
+    timeout=20.0,
     max_retries=1
 )
 
@@ -22,16 +23,16 @@ _SUBCATEGORIES_PROMPT = "\n".join(
     f"- {cat}: {', '.join(subs)}" for cat, subs in SUBCATEGORIES_MAP.items()
 )
 
-SYSTEM_PROMPT = f"""
+SYSTEM_PROMPT_TEMPLATE = f"""
 Ты — Ада, оператор-аналитик и умная помощница семьи Влада и Дианы.
 Текущий год: 2026. Часовой пояс: Астана (UTC+5).
+
+ТВОЙ ТОН:
+- Живой, дружелюбный, с лёгкой тёплой иронией. reply ВСЕГДА на русском.
 
 ГРАФИК СЕМЬИ:
 - ВЫХОДНЫЕ: Воскресенье и Понедельник.
 - РАБОЧИЕ ДНИ: Вторник, Среда, Четверг, Пятница, Суббота.
-
-ТВОЙ ТОН:
-- Живой, дружелюбный, с лёгкой тёплой иронией. reply ВСЕГДА на русском.
 
 СТРОЖАЙШИЙ ЗАПРЕТ НА ГАЛЛЮЦИНАЦИИ ТРАТ:
 - Опирайся ТОЛЬКО на факты. Если в блоке [ТРАНЗАКЦИИ ЗА СЕГОДНЯ] пусто — значит СЕГОДНЯ ещё никто ничего не покупал!
@@ -47,31 +48,17 @@ SYSTEM_PROMPT = f"""
 
 {BANK_ALIASES_PROMPT}
 
-ПРАВИЛО ПОГОДЫ:
-Если пользователь спрашивает о погоде:
-- "какая погода", "погода сейчас" -> intent: "get_weather", "weather_target": "today"
-- "погода на завтра", "завтра нужен зонт" -> intent: "get_weather", "weather_target": "tomorrow"
-- "погода на послезавтра" -> intent: "get_weather", "weather_target": "after_tomorrow"
-- "погода на неделю", "прогноз на 5 дней", "на выходные" -> intent: "get_weather", "weather_target": "week"
-
-УНИВЕРСАЛЬНОЕ ПРАВИЛО СОМНЕНИЙ И КНОПОК:
-Если категория покупки неоднозначна:
-1. Верни intent: "need_clarification".
-2. В поле "clarification_options" передай от 2 до 4 понятных вариантов с эмодзи.
-3. В поле "reply" задай короткий вопрос: «Куда запишем покупку?»
-
-ПРАВИЛА ИНТЕНТОВ:
-"transaction", "need_clarification", "correct_any_record", "split_transaction",
-"add_installment", "close_installment", "get_installments", "cancel_subscription",
-"get_subscriptions", "add_reminder", "delete_reminder", "get_reminders",
-"add_shopping", "clear_shopping", "get_shopping", "add_trip", "get_trips",
-"get_limits", "generate_limits", "get_summary", "get_income", "get_weather",
-"delete_transaction", "chat".
+ФОРМАТ ОТВЕТА:
+Ты ОБЯЗАНА отвечать ТОЛЬКО валидным JSON-объектом с полями:
+- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "chat"
+- "reply": "Твой ответ пользователю"
+- "weather_target": "today" | "tomorrow" | "after_tomorrow" | "week" (только если intent="get_weather")
+- "transaction": объект транзакции (если intent="transaction" или "need_clarification")
+- "clarification_options": список от 2 до 4 вариантов (если intent="need_clarification")
 """
 
 
 def _clean_json_content(content: str) -> dict:
-    """Надёжное извлечение JSON без падения от markdown-тегов ```json."""
     if not isinstance(content, str):
         return {}
     cleaned = content.strip()
@@ -104,7 +91,6 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
     text_to_parse = user_text or kwargs.get("user_comment") or kwargs.get("text") or ""
     now = now_astana()
     today_prefix = now.strftime("%Y-%m-%d")
-
     time_hint = get_time_context_hint(now.hour, now.weekday())
 
     today_txs = []
@@ -117,33 +103,38 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             else:
                 past_txs.append(tx)
 
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
-    messages.append({"role": "system", "content": f"ТЕКУЩЕЕ ВРЕМЯ В АСТАНЕ: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}"})
-    messages.append({"role": "system", "content": f"КОНТЕКСТ ДНЯ: {time_hint}"})
-
-    today_str = _format_history_compact(today_txs) if today_txs else "Сегодня покупок ещё НЕ БЫЛО."
-    messages.append({"role": "system", "content": f"[ТРАНЗАКЦИИ ЗА СЕГОДНЯ ({today_prefix})]:\n{today_str}"})
-    past_str = _format_history_compact(past_txs[-30:])
-    messages.append({"role": "system", "content": f"[АРХИВ ПРЕДЫДУЩИХ ОПЕРАЦИЙ]:\n{past_str}"})
+    # ── КРИТИЧЕСКИ ВАЖНО: Объединяем ВСЁ в ОДНО системное сообщение ──
+    system_sections = [
+        SYSTEM_PROMPT_TEMPLATE,
+        f"ТЕКУЩЕЕ ВРЕМЯ В АСТАНЕ: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}",
+        f"КОНТЕКСТ ДНЯ: {time_hint}",
+        f"[ТРАНЗАКЦИИ ЗА СЕГОДНЯ ({today_prefix})]:\n{_format_history_compact(today_txs) if today_txs else 'Сегодня покупок ещё НЕ БЫЛО.'}",
+        f"[АРХИВ ПРЕДЫДУЩИХ ОПЕРАЦИЙ]:\n{_format_history_compact(past_txs[-30:])}",
+    ]
 
     if limits:
-        messages.append({"role": "system", "content": f"[ТЕКУЩИЕ ЛИМИТЫ]:\n{json.dumps(limits, ensure_ascii=False)}"})
+        system_sections.append(f"[ТЕКУЩИЕ ЛИМИТЫ]:\n{json.dumps(limits, ensure_ascii=False)}")
     if reminders:
-        messages.append({"role": "system", "content": f"[АКТИВНЫЕ НАПОМИНАНИЯ]:\n{json.dumps(reminders, ensure_ascii=False)}"})
+        system_sections.append(f"[АКТИВНЫЕ НАПОМИНАНИЯ]:\n{json.dumps(reminders, ensure_ascii=False)}")
     if shopping_list:
-        messages.append({"role": "system", "content": f"[СПИСОК ПОКУПОК]:\n{json.dumps(shopping_list, ensure_ascii=False)}"})
+        system_sections.append(f"[СПИСОК ПОКУПОК]:\n{json.dumps(shopping_list, ensure_ascii=False)}")
     if trips:
-        messages.append({"role": "system", "content": f"[ПОЕЗДКИ]:\n{json.dumps(trips, ensure_ascii=False)}"})
+        system_sections.append(f"[ПОЕЗДКИ]:\n{json.dumps(trips, ensure_ascii=False)}")
     if subscriptions:
-        messages.append({"role": "system", "content": f"[ПОДПИСКИ]:\n{json.dumps(subscriptions, ensure_ascii=False)}"})
+        system_sections.append(f"[ПОДПИСКИ]:\n{json.dumps(subscriptions, ensure_ascii=False)}")
     if installments:
-        messages.append({"role": "system", "content": f"[РАССРОЧКИ]:\n{json.dumps(installments, ensure_ascii=False)}"})
-
+        system_sections.append(f"[РАССРОЧКИ]:\n{json.dumps(installments, ensure_ascii=False)}")
     if chat_history:
-        chat_lines = [f"{m['sender']}: {m['text']}" for m in chat_history[-30:]]
-        messages.append({"role": "system", "content": "[ИСТОРИЯ ЧАТА]:\n" + "\n".join(chat_lines)})
+        chat_lines = [f"{m['sender']}: {m['text']}" for m in chat_history[-25:]]
+        system_sections.append(f"[ИСТОРИЯ ЧАТА]:\n" + "\n".join(chat_lines))
 
-    messages.append({"role": "user", "content": f"{user_name}: {text_to_parse}"})
+    # СТРОГО ОДНО СИСТЕМНОЕ СООБЩЕНИЕ
+    unified_system_prompt = "\n\n".join(system_sections)
+
+    messages = [
+        {"role": "system", "content": unified_system_prompt},
+        {"role": "user", "content": f"{user_name}: {text_to_parse}"}
+    ]
 
     try:
         response = await client.chat.completions.create(
@@ -175,8 +166,10 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
                 result["reply"] = "Куда запишем эту покупку?"
 
         return result
+
     except Exception as error:
-        print(f"[DeepSeek] Ошибка или таймаут: {error}")
+        print(f"[DeepSeek Error]: {error}")
+        traceback.print_exc()
         from services.money import parse_amount
         amt = parse_amount(text_to_parse)
         ambig_options = get_ambiguous_options(text_to_parse)
