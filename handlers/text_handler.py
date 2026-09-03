@@ -14,6 +14,7 @@ from services.categories import (
     FALLBACK_EXPENSE_CATEGORY, FALLBACK_INCOME_CATEGORY,
     normalize_category, normalize_subcategory,
     validate_transaction_category_subcategory,
+    get_ambiguous_options,
 )
 from services.money import parse_amount
 from services.banks import normalize_bank_source
@@ -80,7 +81,7 @@ def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
 
 
 def _build_clarification_keyboard(options: list[dict]) -> InlineKeyboardMarkup:
-    """Создаёт клавиатуру с кнопками (2-4 штуки) с коротким надежным индексом."""
+    """Создаёт клавиатуру с крупными кнопками в столбик."""
     buttons = []
     for idx, opt in enumerate(options):
         buttons.append([InlineKeyboardButton(text=opt["label"], callback_data=f"clarify_opt:{idx}")])
@@ -110,10 +111,10 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
     tx = clarification["transaction"]
     tx["category"] = chosen["category"]
     tx["subcategory"] = chosen.get("subcategory", "")
-    tx["necessity"] = normalize_necessity(tx.get("necessity"), tx["category"])
+    tx["necessity"] = chosen.get("necessity") or normalize_necessity(tx.get("necessity"), tx["category"])
 
     append_transaction(tx)
-    report = _format_confirmation_report(tx, f"Категория уточнена: {chosen['label']}.")
+    report = _format_confirmation_report(tx, f"Категория выбрана: {chosen['label']}.")
     add_chat_message(chat_id, "Ада", report)
     await callback.message.edit_text(report)
     await callback.answer("Записано!")
@@ -149,11 +150,8 @@ async def handle_voice(message: Message):
 
 
 async def _process_text_message(message: Message, text: str):
-    # Строго определяем пользователя: Влад или Диана
     user_name = get_authorized_user_name(message.from_user.id) or message.from_user.first_name or "Пользователь"
     chat_id = message.chat.id
-
-    # Записываем сообщение пользователя в память
     add_chat_message(chat_id, user_name, text)
 
     # 1. Чек ожидает комментария
@@ -175,7 +173,7 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, rep)
             return
 
-    # 2. Перехват текстового ответа на уточнение («на работу», «домой»)
+    # 2. Перехват текстового ответа на вопрос («на работу», «домой»)
     clarification = get_clarification(chat_id)
     if clarification:
         text_lower = text.lower()
@@ -185,9 +183,9 @@ async def _process_text_message(message: Message, text: str):
             if any(w in text_lower for w in words if len(w) > 3):
                 matched_opt = opt
                 break
-        if "работ" in text_lower or "кафе" in text_lower or "собой" in text_lower or "перекус" in text_lower:
+        if "работ" in text_lower or "кафе" in text_lower or "собой" in text_lower or "перекус" in text_lower or "офис" in text_lower:
             matched_opt = clarification["options"][0]
-        elif "дом" in text_lower or "продукт" in text_lower:
+        elif "дом" in text_lower or "продукт" in text_lower or "семь" in text_lower:
             matched_opt = clarification["options"][-1]
 
         if matched_opt:
@@ -196,7 +194,7 @@ async def _process_text_message(message: Message, text: str):
             tx["category"] = matched_opt["category"]
             tx["subcategory"] = matched_opt.get("subcategory", "")
             tx["user_comment"] = f"{tx.get('user_comment', '')} ({text})".strip()
-            tx["necessity"] = normalize_necessity(tx.get("necessity"), tx["category"])
+            tx["necessity"] = matched_opt.get("necessity") or normalize_necessity(tx.get("necessity"), tx["category"])
             append_transaction(tx)
             report = _format_confirmation_report(tx, f"Поняла, это {matched_opt['label']}!")
             add_chat_message(chat_id, "Ада", report)
@@ -209,7 +207,7 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, f"```\n{debug_text}\n```")
         return
 
-    # 4. /chart (дашборд с передачей BufferedInputFile)
+    # 4. /chart
     if text.strip().lower() in {"график", "/chart", "chart"}:
         try:
             image_bytes = await asyncio.to_thread(generate_expense_chart)
@@ -269,19 +267,34 @@ async def _process_text_message(message: Message, text: str):
     intent = parsed.get("intent", "chat")
     reply = parsed.get("reply", "")
 
-    # ИНТЕРАКТИВНОЕ УТОЧНЕНИЕ КАТЕГОРИИ
-    if intent == "need_clarification":
-        tx = parsed.get("transaction", {})
-        options = parsed.get("clarification_options", [])
-        if tx and options:
-            tx["user"] = user_name
+    # ── ПЕРЕХВАТ И ВЫВОД КНОПОК УТОЧНЕНИЯ ──
+    # Проверяем как явный статус need_clarification, так и наличие неоднозначного товара в сообщении
+    ambig_options = get_ambiguous_options(text) or parsed.get("clarification_options")
+
+    if ambig_options and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0):
+        tx = parsed.get("transaction") or {}
+        if not tx.get("amount"):
+            tx["amount"] = parse_amount(text)
+        if not tx.get("currency"):
+            tx["currency"] = "KZT"
+        if not tx.get("type"):
+            tx["type"] = TYPE_EXPENSE
+        if "нал" in text.lower():
+            tx["resource"] = "Наличные"
+            tx["bank"] = "Не указан"
+            tx["source"] = "Основная карта"
+        else:
             tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
-            kb = _build_clarification_keyboard(options)
-            set_clarification(chat_id, tx, options)
-            prompt_text = reply or "Уточни, куда отнести эту покупку:"
-            add_chat_message(chat_id, "Ада", prompt_text)
-            await message.answer(prompt_text, reply_markup=kb)
-            return
+        tx["user"] = user_name
+        tx["user_comment"] = text
+
+        kb = _build_clarification_keyboard(ambig_options)
+        set_clarification(chat_id, tx, ambig_options)
+        prompt_text = reply or "Уточни, куда записать эту покупку:"
+        add_chat_message(chat_id, "Ада", prompt_text)
+        # Отправляем сообщение С КЛАВИАТУРОЙ ИЗ ДВУХ КНОПОК
+        await message.answer(prompt_text, reply_markup=kb)
+        return
 
     # ТРАНЗАКЦИЯ
     if intent == "transaction":
