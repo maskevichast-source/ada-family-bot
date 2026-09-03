@@ -60,3 +60,4 @@ def sweep_expired():
                 expired.append((chat_id, entry["transactions"], entry["user_name"]))
                 del _pending[chat_id]
     return expired
+
