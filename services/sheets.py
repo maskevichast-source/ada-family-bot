@@ -9,9 +9,9 @@ from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE
 from services.categories import TYPE_EXPENSE, SUBCATEGORIES_MAP, DEFAULT_EXPENSE_LIMITS
 from services.money import parse_amount, to_clean_number
 from services.banks import normalize_bank_source
+from services.timezone import parse_flexible_datetime, ASTANA_TZ
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-ASTANA_TZ = datetime.timezone(datetime.timedelta(hours=5), name="Asia/Astana")
 
 _cached_client = None
 _cached_db = None
@@ -123,6 +123,7 @@ def append_transaction(data: dict):
 
 
 def ensure_power_bi_dimension_table():
+    """Создаёт лист Dim_Categories со строго уникальными категориями (связь 1:* для Power BI)."""
     try:
         db = get_db()
         try:
@@ -166,7 +167,7 @@ def get_last_200_transactions():
         return [{
             "date": r.get("date"), "user": r.get("user"),
             "type": r.get("type") or TYPE_EXPENSE,
-            "amt": r.get("amount"),
+            "amt": parse_amount(r.get("amount")),
             "curr": r.get("currency"), "bank": r.get("bank"), "cat": r.get("category"),
             "subcat": r.get("subcategory"), "nec": r.get("necessity"), "comm": r.get("user_comment")
         } for r in non_empty[-200:]]
@@ -176,20 +177,41 @@ def get_last_200_transactions():
 
 
 def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
+    """Универсальное чтение периода: работает как с YYYY-MM-DD, так и с DD.MM.YYYY."""
     try:
         ws = get_db().worksheet("Transactions")
         records = _get_all_records_safe(ws)
         result = []
+
+        start_dt = parse_flexible_datetime(f"{start_date} 00:00:00")
+        end_dt = parse_flexible_datetime(f"{end_date} 00:00:00")
+
         for r in records:
-            date_str = str(r.get("date", ""))
-            if start_date <= date_str < end_date:
+            raw_date = r.get("date")
+            if not raw_date:
+                continue
+
+            r_dt = parse_flexible_datetime(raw_date)
+            matched = False
+
+            if r_dt and start_dt and end_dt:
+                matched = (start_dt <= r_dt < end_dt)
+            else:
+                d_str = str(raw_date).strip()
+                matched = (start_date <= d_str < end_date)
+
+            if matched:
                 result.append({
-                    "date": r.get("date"), "user": r.get("user"),
+                    "date": r.get("date"),
+                    "user": r.get("user"),
                     "type": r.get("type") or TYPE_EXPENSE,
-                    "amt": r.get("amount"),
-                    "curr": r.get("currency"), "bank": r.get("bank"),
-                    "cat": r.get("category"), "subcat": r.get("subcategory"),
-                    "nec": r.get("necessity"), "comm": r.get("user_comment"),
+                    "amt": parse_amount(r.get("amount", 0)),
+                    "curr": r.get("currency", "KZT"),
+                    "bank": r.get("bank", ""),
+                    "cat": r.get("category", "Прочее"),
+                    "subcat": r.get("subcategory", ""),
+                    "nec": r.get("necessity", "Want"),
+                    "comm": r.get("user_comment", ""),
                 })
         return result
     except Exception as e:
@@ -213,8 +235,8 @@ def find_recent_duplicate_transaction(amount, comment: str = "", minutes: int = 
                 r_amount = to_clean_number(r.get("amount"))
                 if r_amount != target:
                     continue
-                r_date = datetime.datetime.strptime(str(r.get("date")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=ASTANA_TZ)
-                if (now - r_date).total_seconds() <= minutes * 60:
+                r_date = parse_flexible_datetime(r.get("date"))
+                if r_date and (now - r_date).total_seconds() <= minutes * 60:
                     r_comm = str(r.get("user_comment", "")).lower()
                     if not comm_clean or comm_clean in r_comm or r_comm in comm_clean:
                         return r
@@ -250,7 +272,6 @@ def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from
             row_values = [str(v) for v in r.values()]
             row_str = " ".join(row_values).lower()
 
-            # ИСПРАВЛЕНИЕ: строго all(), чтобы совпадали ВСЕ уточнения (например "такси" И "2500")
             matched = all(k in row_str for k in specific_keywords) if specific_keywords else False
             if not matched and query_digits:
                 matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
@@ -318,20 +339,22 @@ def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = 
 
         if rec_norm == "daily" and remind_at:
             try:
-                old_dt = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M:%S")
-                next_dt = old_dt + datetime.timedelta(days=1)
-                ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-                return
+                old_dt = parse_flexible_datetime(remind_at)
+                if old_dt:
+                    next_dt = old_dt + datetime.timedelta(days=1)
+                    ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                    return
             except Exception:
                 pass
         elif rec_norm == "monthly" and remind_at:
             try:
-                old_dt = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M:%S")
-                new_month = old_dt.month + 1 if old_dt.month < 12 else 1
-                new_year = old_dt.year if old_dt.month < 12 else old_dt.year + 1
-                next_dt = old_dt.replace(year=new_year, month=new_month)
-                ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-                return
+                old_dt = parse_flexible_datetime(remind_at)
+                if old_dt:
+                    new_month = old_dt.month + 1 if old_dt.month < 12 else 1
+                    new_year = old_dt.year if old_dt.month < 12 else old_dt.year + 1
+                    next_dt = old_dt.replace(year=new_year, month=new_month)
+                    ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                    return
             except Exception:
                 pass
 
@@ -349,7 +372,7 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
 
         for idx, r in enumerate(reversed(records), start=0):
             try:
-                amt_val = float(str(r.get("amount", 0)).replace(",", "."))
+                amt_val = parse_amount(r.get("amount", 0))
                 if abs(amt_val - target_amount) < 1.0:
                     target_idx = len(records) - idx
                     target_record = r
@@ -394,9 +417,7 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
         return False
 
 
-# --- ПОДПИСКИ С ЗАЩИТОЙ ОТ ПРОПУСКОВ И ЗАДВОЕНИЙ ---
 def process_due_subscriptions(now: datetime.datetime) -> list:
-    """Проверяет и списывает подписки с проверкой last_paid — исключает пропуск месяца при рестартах."""
     due_processed = []
     try:
         ws = get_db().worksheet("Subscriptions")
@@ -412,7 +433,6 @@ def process_due_subscriptions(now: datetime.datetime) -> list:
                 day = int(parse_amount(r.get("day_of_month", 1)))
                 last_paid = str(r.get("last_paid", ""))
 
-                # Если день оплаты уже наступил, а в этом месяце списания ещё не было
                 if now.day >= day and not last_paid.startswith(current_month_prefix):
                     amt = parse_amount(r.get("amount", 0))
                     name = str(r.get("name", "Подписка"))
@@ -445,7 +465,6 @@ def process_due_subscriptions(now: datetime.datetime) -> list:
 
 
 def get_category_limits():
-    """Безопасное чтение лимитов с очисткой любых пробелов и запятых."""
     try:
         ws = get_db().worksheet("Limits")
         records = _get_all_records_safe(ws)
@@ -453,7 +472,6 @@ def get_category_limits():
         for r in records:
             cat = str(r.get("category", "")).strip()
             if cat:
-                # ИСПРАВЛЕНИЕ: parse_amount вместо сырого float()
                 limits[cat] = parse_amount(r.get("limit_amount", 0))
         return limits
     except Exception as e:
