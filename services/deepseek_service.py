@@ -141,7 +141,10 @@ SYSTEM_PROMPT = f"""
 17. Погода → "get_weather"
 18. Удалить напоминание → "delete_reminder"
 19. Удалить транзакцию → "delete_transaction"
-20. Всё остальное → "transaction" или "chat"
+20. Добавить/запланировать поездку → "add_trip" (destination, dates, budget, notes)
+21. Купил из списка покупок / убрать позицию из списка → "clear_shopping"
+    (shopping_items — список названий позиций, которые нужно убрать)
+22. Всё остальное → "transaction" или "chat"
 
 ФОРМАТ JSON:
 {{
