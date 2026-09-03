@@ -7,6 +7,7 @@ from services.ai_config import DEEPSEEK_MODEL
 from services.categories import (
     EXPENSE_CATEGORIES, INCOME_CATEGORIES, TYPE_EXPENSE, TYPE_INCOME,
     format_category_list, SUBCATEGORIES_MAP, get_time_context_hint,
+    get_ambiguous_options,
 )
 from services.banks import BANK_ALIASES_PROMPT
 
@@ -21,8 +22,7 @@ SYSTEM_PROMPT = f"""
 Текущий год: 2026. Часовой пояс: Астана (UTC+5).
 
 ТВОЯ ЛИЧНОСТЬ И ТОН:
-- Ты полноправный член семьи, не робот. Общайся естественно, с умеренной тёплой иронией и заботой.
-- Помни контекст разговора: отвечай прямо на то, о чем тебя спросили. Если Диана спрашивает «как дела?», не нужно придумывать несуществующие покупки.
+- Ты член семьи, не бездушный бот. Общайся естественно, с умеренной иронией и заботой.
 - reply ВСЕГДА на русском языке.
 
 ГРАФИК СЕМЬИ:
@@ -31,9 +31,9 @@ SYSTEM_PROMPT = f"""
 
 СТРОЖАЙШИЙ ЗАПРЕТ НА ГАЛЛЮЦИНАЦИИ ТРАТ:
 - Опирайся ТОЛЬКО на факты. Если в блоке [ТРАНЗАКЦИИ ЗА СЕГОДНЯ] пусто — значит СЕГОДНЯ ещё никто ничего не покупал!
-- Запрещено путать вчерашние покупки с сегодняшними. Если покупка была вчера — она в прошлом.
+- Запрещено путать вчерашние покупки с сегодняшними.
 
-КАТЕГОРИИ РАСХОДОВ (19 категорий для Power BI):
+КАТЕГОРИИ РАСХОДОВ:
 {format_category_list(EXPENSE_CATEGORIES)}
 
 КАТЕГОРИИ ДОХОДОВ:
@@ -44,18 +44,9 @@ SYSTEM_PROMPT = f"""
 
 {BANK_ALIASES_PROMPT}
 
-ПРАВИЛО ИНТЕРАКТИВНЫХ ПЛАШЕК:
-Если товар неоднозначен (сендвич, самса, пирожные, кофе, перекус):
-1. Если контекст понятен из фразы («сендвич на работу», «кофе в дорогу», «продукты домой») — сразу классифицируй без вопросов.
-2. Если контекст неясен («1500 на сендвич», «самса 3300») — верни intent: "need_clarification" и 2-3 кнопки в "clarification_options":
-[
-  {{"label": "🍔 Перекус на работе / кафе", "category": "Кафе, рестораны и доставка еды", "subcategory": "Перекус и фастфуд"}},
-  {{"label": "🏠 Еда домой", "category": "Еда и продукты", "subcategory": "Супермаркет и рынок"}}
-]
-
 ПРАВИЛА ИНТЕНТОВ:
 1. "transaction" — запись расхода/дохода
-2. "need_clarification" — запрос кнопок уточнения
+2. "need_clarification" — требуется выбор категории кнопками
 3. "correct_any_record" — исправление/удаление строки в таблице
 4. "split_transaction" — разделить трату
 5. "add_installment", "close_installment", "get_installments" — рассрочки
@@ -69,35 +60,14 @@ SYSTEM_PROMPT = f"""
 13. "get_weather" — погода
 14. "delete_transaction" — удаление операции
 15. "chat" — обычная беседа
-
-ФОРМАТ JSON ДЛЯ ТРАНЗАКЦИИ:
-{{
-  "intent": "transaction",
-  "reply": "Комментарий Ады с характером",
-  "transaction": {{
-    "amount": 1500,
-    "currency": "KZT",
-    "type": "РАСХОД",
-    "bank": "Не указан",
-    "source": "Основная карта",
-    "funds_type": "Собственные",
-    "resource": "Наличные",
-    "category": "Кафе, рестораны и доставка еды",
-    "subcategory": "Перекус и фастфуд",
-    "merchant": "",
-    "necessity": "Want",
-    "user_comment": "Сендвич на работу"
-  }}
-}}
 """
 
 
 def _format_history_compact(history: list) -> str:
-    """Сжимает 200 строк таблицы в читаемый текст без перегрузки токенов."""
     if not history:
         return "История пуста."
     lines = []
-    for t in history[-100:]:  # Оптимальные последние 100 операций для промпта
+    for t in history[-80:]:
         date_short = str(t.get("date", ""))[:16]
         u = t.get("user", "")
         tp = t.get("type", "РАСХОД")
@@ -119,7 +89,6 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
 
     time_hint = get_time_context_hint(now.hour, now.weekday())
 
-    # Делим историю на СЕГОДНЯ и ПРОШЛЫЕ ДНИ
     today_txs = []
     past_txs = []
     if history:
@@ -134,11 +103,8 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
     messages.append({"role": "system", "content": f"ТЕКУЩЕЕ ВРЕМЯ В АСТАНЕ: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}"})
     messages.append({"role": "system", "content": f"КОНТЕКСТ ДНЯ: {time_hint}"})
 
-    # Передаём операции за сегодня отдельным приоритетным блоком
     today_str = _format_history_compact(today_txs) if today_txs else "Сегодня покупок ещё НЕ БЫЛО."
     messages.append({"role": "system", "content": f"[ТРАНЗАКЦИИ ЗА СЕГОДНЯ ({today_prefix})]:\n{today_str}"})
-
-    # Передаём последние операции из архива
     past_str = _format_history_compact(past_txs[-40:])
     messages.append({"role": "system", "content": f"[АРХИВ ПРЕДЫДУЩИХ ОПЕРАЦИЙ]:\n{past_str}"})
 
@@ -155,12 +121,9 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
     if installments:
         messages.append({"role": "system", "content": f"[РАССРОЧКИ]:\n{json.dumps(installments, ensure_ascii=False)}"})
 
-    # Передаём до 50 последних сообщений чата (включая реплики Ады)
     if chat_history:
-        chat_lines = []
-        for m in chat_history[-50:]:
-            chat_lines.append(f"{m['sender']}: {m['text']}")
-        messages.append({"role": "system", "content": "[ИСТОРИЯ ЧАТА (ПОСЛЕДНИЕ СООБЩЕНИЯ)]:\n" + "\n".join(chat_lines)})
+        chat_lines = [f"{m['sender']}: {m['text']}" for m in chat_history[-50:]]
+        messages.append({"role": "system", "content": "[ИСТОРИЯ ЧАТА]:\n" + "\n".join(chat_lines)})
 
     messages.append({"role": "user", "content": f"{user_name}: {text_to_parse}"})
 
@@ -170,7 +133,32 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             messages=messages,
             response_format={"type": "json_object"}
         )
-        return json.loads(response.choices[0].message.content)
+        result = json.loads(response.choices[0].message.content)
+
+        # ── ГАРАНТИРОВАННЫЙ ПЕРЕХВАТ НЕОДНОЗНАЧНОСТИ ──
+        # Проверяем, есть ли в тексте неоднозначный товар без указания «домой» / «на работу»
+        ambig_options = get_ambiguous_options(text_to_parse)
+        if ambig_options:
+            tx = result.get("transaction") or {}
+            # Если DeepSeek не заполнил transaction, формируем базовый каркас
+            if not tx:
+                from services.money import parse_amount
+                tx = {
+                    "amount": parse_amount(text_to_parse),
+                    "currency": "KZT",
+                    "type": TYPE_EXPENSE,
+                    "bank": "Не указан",
+                    "source": "Основная карта",
+                    "resource": "Наличные" if "нал" in text_to_parse.lower() else "Карта",
+                    "user_comment": text_to_parse,
+                }
+            result["intent"] = "need_clarification"
+            result["transaction"] = tx
+            result["clarification_options"] = ambig_options
+            if not result.get("reply"):
+                result["reply"] = "Уточни, куда отнести эту покупку:"
+
+        return result
     except Exception as error:
         print(f"[DeepSeek] Ошибка запроса: {error}")
         return {"intent": "chat", "reply": "Я на связи, но немного задумалась. Повтори ещё раз!"}
