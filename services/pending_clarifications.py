@@ -1,4 +1,4 @@
-"""Хранилище ожидающих уточнений категории и подкатегории."""
+"""Хранилище транзакций, ожидающих уточнения категории (InlineKeyboard или текст)."""
 
 import datetime
 import threading
@@ -9,7 +9,13 @@ CLARIFICATION_TTL_MINUTES = 10
 
 
 def set_clarification(chat_id: int, transaction: dict, options: list[dict], message_id: int = None):
-    """options: list of dicts: [{"label": "🍽 В кафе / перекус", "category": "...", "subcategory": "..."}, ...]"""
+    """
+    options: список словарей вида:
+    [
+      {"label": "🍔 Перекус на работе", "category": "Кафе, рестораны и доставка еды", "subcategory": "Перекус и фастфуд"},
+      {"label": "🏠 Продукты домой", "category": "Еда и продукты", "subcategory": "Супермаркет и рынок"}
+    ]
+    """
     with _lock:
         _pending[chat_id] = {
             "transaction": transaction,
@@ -17,6 +23,17 @@ def set_clarification(chat_id: int, transaction: dict, options: list[dict], mess
             "created_at": datetime.datetime.utcnow(),
             "message_id": message_id,
         }
+
+
+def has_clarification(chat_id: int) -> bool:
+    with _lock:
+        if chat_id not in _pending:
+            return False
+        entry = _pending[chat_id]
+        if datetime.datetime.utcnow() - entry["created_at"] > datetime.timedelta(minutes=CLARIFICATION_TTL_MINUTES):
+            del _pending[chat_id]
+            return False
+        return True
 
 
 def get_clarification(chat_id: int) -> dict | None:
