@@ -96,6 +96,18 @@ def get_db():
         _cached_db = _cached_client.open_by_key(GOOGLE_SHEETS_KEY)
     return _cached_db
 
+def normalize_necessity(raw, category=None):
+    """Приводит necessity к стандартным Need / Want."""
+    if not raw:
+        return "Want"
+    s = str(raw).strip().lower()
+    if s in ("need", "нужно", "нужное", "обязательно", "must", "need"):
+        return "Need"
+    if s in ("want", "хочу", "необязательно", "optional", "luxury", "want"):
+        return "Want"
+    return "Want"
+
+
 # --- ТРАНЗАКЦИИ И АНАЛИТИКА ---
 def append_transaction(data: dict):
     now = datetime.datetime.now(ASTANA_TZ)
