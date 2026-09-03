@@ -18,22 +18,20 @@ _SUBCATEGORIES_PROMPT = "\n".join(
 )
 
 SYSTEM_PROMPT = f"""
-Ты — Ада, живой оператор-аналитик и умная помощница в семье Влада и Дианы.
+Ты — Ада, оператор-аналитик и умная помощница семьи Влада и Дианы.
 Текущий год: 2026. Часовой пояс: Астана (UTC+5).
-
-ТВОЯ ЛИЧНОСТЬ И ТОН:
-- Ты член семьи, не бездушный бот. Общайся естественно, с умеренной иронией и заботой.
-- reply ВСЕГДА на русском языке.
 
 ГРАФИК СЕМЬИ:
 - ВЫХОДНЫЕ: Воскресенье и Понедельник.
 - РАБОЧИЕ ДНИ: Вторник, Среда, Четверг, Пятница, Суббота.
 
+ТВОЙ ТОН:
+- Живой, дружелюбный, с лёгкой тёплой иронией. reply ВСЕГДА на русском.
+
 СТРОЖАЙШИЙ ЗАПРЕТ НА ГАЛЛЮЦИНАЦИИ ТРАТ:
 - Опирайся ТОЛЬКО на факты. Если в блоке [ТРАНЗАКЦИИ ЗА СЕГОДНЯ] пусто — значит СЕГОДНЯ ещё никто ничего не покупал!
-- Запрещено путать вчерашние покупки с сегодняшними.
 
-КАТЕГОРИИ РАСХОДОВ:
+КАТЕГОРИИ РАСХОДОВ (19 категорий):
 {format_category_list(EXPENSE_CATEGORIES)}
 
 КАТЕГОРИИ ДОХОДОВ:
@@ -44,9 +42,20 @@ SYSTEM_PROMPT = f"""
 
 {BANK_ALIASES_PROMPT}
 
+УНИВЕРСАЛЬНОЕ ПРАВИЛО СОМНЕНИЙ И КНОПОК:
+Если категория или назначение покупки НЕ ОЧЕВИДНЫ из текста (например, «кроссовки» — спорт или обувь? «массаж» — лечение или спа? «яндекс» — такси или доставка? «сендвич» — перекус или домой?):
+1. НЕ УГАДЫВАЙ НАУГАД.
+2. Верни intent: "need_clarification".
+3. В поле "clarification_options" передай от 2 до 4 понятных вариантов с эмодзи:
+   [
+     {{"label": "👟 Повседневная обувь", "category": "Одежда и обувь", "subcategory": "Обувь"}},
+     {{"label": "🏃 Спортивная для тренировок", "category": "Спорт и фитнес", "subcategory": "Спортинвентарь"}}
+   ]
+4. В поле "reply" задай короткий вопрос: «Уточни, куда записать покупку?»
+
 ПРАВИЛА ИНТЕНТОВ:
-1. "transaction" — запись расхода/дохода
-2. "need_clarification" — требуется выбор категории кнопками
+1. "transaction" — однозначная запись расхода/дохода
+2. "need_clarification" — требуется выбор из 2-4 кнопок
 3. "correct_any_record" — исправление/удаление строки в таблице
 4. "split_transaction" — разделить трату
 5. "add_installment", "close_installment", "get_installments" — рассрочки
@@ -59,7 +68,7 @@ SYSTEM_PROMPT = f"""
 12. "get_income" — доходы
 13. "get_weather" — погода
 14. "delete_transaction" — удаление операции
-15. "chat" — обычная беседа
+15. "chat" — разговорная беседа
 """
 
 
@@ -135,12 +144,10 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
         )
         result = json.loads(response.choices[0].message.content)
 
-        # ── ГАРАНТИРОВАННЫЙ ПЕРЕХВАТ НЕОДНОЗНАЧНОСТИ ──
-        # Проверяем, есть ли в тексте неоднозначный товар без указания «домой» / «на работу»
+        # ── ПЕРЕХВАТ 1: Проверка по матрице частых триггеров ──
         ambig_options = get_ambiguous_options(text_to_parse)
         if ambig_options:
             tx = result.get("transaction") or {}
-            # Если DeepSeek не заполнил transaction, формируем базовый каркас
             if not tx:
                 from services.money import parse_amount
                 tx = {
@@ -157,6 +164,18 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             result["clarification_options"] = ambig_options
             if not result.get("reply"):
                 result["reply"] = "Уточни, куда отнести эту покупку:"
+
+        # ── ПЕРЕХВАТ 2: Если DeepSeek сам вернул альтернативы из промпта ──
+        tx = result.get("transaction") or {}
+        alts = tx.get("alternatives") or result.get("alternatives") or []
+        if alts and not result.get("clarification_options"):
+            options = []
+            for a in alts[:4]:
+                options.append({"label": f"📌 {a}", "category": a, "subcategory": ""})
+            result["intent"] = "need_clarification"
+            result["clarification_options"] = options
+            if not result.get("reply"):
+                result["reply"] = "Уточни категорию покупки:"
 
         return result
     except Exception as error:
