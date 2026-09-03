@@ -221,7 +221,8 @@ def get_last_200_transactions():
             "date": r.get("date"), "user": r.get("user"),
             "type": r.get("type") or TYPE_EXPENSE,
             "amt": r.get("amount"),
-            "curr": r.get("currency"), "bank": r.get("bank"), "cat": r.get("category"), "comm": r.get("user_comment")
+            "curr": r.get("currency"), "bank": r.get("bank"), "cat": r.get("category"),
+            "subcat": r.get("subcategory"), "nec": r.get("necessity"), "comm": r.get("user_comment")
         } for r in non_empty[-200:]]
     except Exception as e:
         print(f"[Транзакции] Не удалось прочитать записи: {e}")
@@ -246,7 +247,8 @@ def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
                     "type": r.get("type") or TYPE_EXPENSE,
                     "amt": r.get("amount"),
                     "curr": r.get("currency"), "bank": r.get("bank"),
-                    "cat": r.get("category"), "comm": r.get("user_comment"),
+                    "cat": r.get("category"), "subcat": r.get("subcategory"),
+                    "nec": r.get("necessity"), "comm": r.get("user_comment"),
                 })
         return result
     except Exception as e:
