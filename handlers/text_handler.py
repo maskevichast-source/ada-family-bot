@@ -40,6 +40,7 @@ from services.pending_clarifications import (
 )
 from services.memory import get_chat_history, add_chat_message
 from services.voice import transcribe_voice
+from services.timezone import now_astana
 
 
 def _to_number_or_blank(value):
@@ -212,7 +213,21 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, report)
             return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ: ПОГОДА (СЕГОДНЯ, ЗАВТРА, ПОСЛЕЗАВТРА, НЕДЕЛЯ) ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ: ГРАФИКИ (ЛЮБЫЕ ВАРИАНТЫ СО СЛОВОМ ГРАФИК/ДАШБОРД) ──
+    if any(k in t_clean for k in ["график", "диаграмм", "чарт", "дашборд"]) or t_clean in {"/chart", "chart"}:
+        try:
+            image_bytes = await asyncio.to_thread(generate_expense_chart)
+            if image_bytes:
+                photo_file = BufferedInputFile(image_bytes, filename="chart.png")
+                await message.answer_photo(photo=photo_file, caption="📊 Финансовый дашборд за текущий месяц.")
+            else:
+                await safe_answer(message, "Нет данных для построения графика.")
+        except Exception as error:
+            print(f"[График] Ошибка: {error}")
+            await safe_answer(message, "Не удалось построить график.")
+        return
+
+    # ── ПРЯМОЙ ПЕРЕХВАТ: ПОГОДА ──
     if any(k in t_clean for k in ["погода", "погоду", "прогноз", "зонт"]):
         target = "today"
         if "недел" in t_clean or "5 дней" in t_clean or "выходн" in t_clean:
@@ -228,23 +243,10 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, res)
         return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ: СИСТЕМНЫЕ КОМАНДЫ ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ: ДИАГНОСТИКА ──
     if t_clean in {"debug", "/debug"}:
         debug_text = debug_transactions_snapshot()
         await safe_answer(message, f"```\n{debug_text}\n```")
-        return
-
-    if t_clean in {"график", "/chart", "chart"}:
-        try:
-            image_bytes = await asyncio.to_thread(generate_expense_chart)
-            if image_bytes:
-                photo_file = BufferedInputFile(image_bytes, filename="chart.png")
-                await message.answer_photo(photo=photo_file, caption="📊 Вот твой финансовый дашборд.")
-            else:
-                await safe_answer(message, "Нет данных для построения графика.")
-        except Exception as error:
-            print(f"[График] Ошибка: {error}")
-            await safe_answer(message, "Не удалось построить график.")
         return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ: РАЗДЕЛИТЬ ТРАНЗАКЦИЮ ──
@@ -277,7 +279,7 @@ async def _process_text_message(message: Message, text: str):
     except Exception:
         pass
 
-    # ── ЗАПРОС К DEEPSEEK ДЛЯ СЛОЖНЫХ СМЫСЛОВ И ТРАНЗАКЦИЙ ──
+    # ── ЗАПРОС К ИИ ──
     history = get_last_200_transactions()
     limits = get_category_limits()
     reminders = get_pending_reminders()
@@ -298,9 +300,13 @@ async def _process_text_message(message: Message, text: str):
     intent = parsed.get("intent", "chat")
     reply = parsed.get("reply", "")
 
-    # ПЕРЕХВАТ УТОЧНЕНИЙ И ВЫВОД КНОПОК
+    # ── ИСПРАВЛЕНИЕ: БЛОКИРОВКА КНОПОК ПРИ КОМАНДАХ УДАЛЕНИЯ ──
+    is_delete_or_edit_command = any(k in t_clean for k in ["удали", "удалить", "поменяй", "измени", "исправь", "замени", "отмени"])
+
     ambig_options = parsed.get("clarification_options") or get_ambiguous_options(text)
-    if ambig_options and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0):
+    
+    # Кнопки появляются ТОЛЬКО если это не команда удаления!
+    if ambig_options and not is_delete_or_edit_command and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0):
         tx = parsed.get("transaction") or {}
         if not tx.get("amount"):
             tx["amount"] = parse_amount(text)
@@ -330,6 +336,80 @@ async def _process_text_message(message: Message, text: str):
         set_clarification(chat_id, tx, ambig_options)
         add_chat_message(chat_id, "Ада", prompt_text)
         await message.answer(prompt_text, reply_markup=kb)
+        return
+
+    # ── УДАЛЕНИЕ И ПРАВКА ЗАПИСЕЙ ──
+    if intent in {"delete_transaction", "correct_any_record"} or is_delete_or_edit_command:
+        updates = parsed.get("updates", [])
+        
+        # Если ИИ отдал конкретные обновления
+        if updates:
+            results = []
+            for upd in updates:
+                worksheet = upd.get("worksheet", "Transactions")
+                search_query = upd.get("search_query", "")
+                action = upd.get("action", "update")
+                if action == "delete":
+                    deleted = delete_record_by_keyword(worksheet, search_query)
+                    results.append("удалила" if deleted else "не нашла")
+                else:
+                    column = upd.get("column_to_update", "")
+                    new_value = upd.get("new_value", "")
+                    updated = find_and_update_record(worksheet, search_query, column, new_value)
+                    results.append("обновила" if updated else "не нашла")
+            res = reply or f"Результат: {', '.join(results)}."
+            add_chat_message(chat_id, "Ада", res)
+            await safe_answer(message, res)
+            return
+
+        # Если прямое удаление транзакции
+        query = parsed.get("search_query", "") or text
+        deleted = delete_record_by_keyword("Transactions", query)
+        if deleted:
+            res = f"Удалила покупку: {deleted.get('category')} на {_format_currency(deleted.get('amount'))} тг ({deleted.get('user_comment')})."
+        else:
+            res = reply or "Не нашла такую запись в таблице для удаления."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
+        return
+
+    # ── СВОДКА И БАЛАНС ЗА МЕСЯЦ ──
+    if intent == "get_summary":
+        now = now_astana()
+        start = now.replace(day=1).strftime("%Y-%m-%d")
+        if now.month == 12:
+            end = now.replace(year=now.year + 1, month=1, day=1).strftime("%Y-%m-%d")
+        else:
+            end = now.replace(month=now.month + 1, day=1).strftime("%Y-%m-%d")
+
+        transactions = get_transactions_for_period(start, end)
+        total_income = 0.0
+        total_expense = 0.0
+        by_category = {}
+        for t in transactions:
+            amt = _to_number_or_blank(t.get("amt"))
+            t_type = str(t.get("type") or TYPE_EXPENSE)
+            if t_type == TYPE_INCOME:
+                total_income += amt
+            else:
+                total_expense += amt
+                cat = str(t.get("cat") or "Прочее")
+                by_category[cat] = by_category.get(cat, 0) + amt
+
+        lines = [f"📊 **Сводка за {now.strftime('%B %Y')}:**"]
+        lines.append(f"💰 Доходы: {_format_currency(total_income)} тг")
+        lines.append(f"💸 Расходы: {_format_currency(total_expense)} тг")
+        lines.append(f"📈 Баланс: {_format_currency(total_income - total_expense)} тг\n")
+        lines.append("📉 **По категориям:**")
+        if by_category:
+            for cat, amt in sorted(by_category.items(), key=lambda x: -x[1]):
+                lines.append(f"  - {cat}: {_format_currency(amt)} тг")
+        else:
+            lines.append("  _(В этом месяце расходов ещё не записано)_")
+
+        res = "\n".join(lines)
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
         return
 
     # ТРАНЗАКЦИЯ (ОДНОЗНАЧНАЯ)
@@ -369,41 +449,6 @@ async def _process_text_message(message: Message, text: str):
         report = _format_confirmation_report(tx, reply)
         add_chat_message(chat_id, "Ада", report)
         await safe_answer(message, report)
-        return
-
-    # ИСПРАВЛЕНИЕ ЗАПИСЕЙ
-    if intent == "correct_any_record":
-        updates = parsed.get("updates", [])
-        if not updates:
-            await safe_answer(message, reply or "Не поняла, что исправлять.")
-            return
-        results = []
-        for upd in updates:
-            worksheet = upd.get("worksheet", "Transactions")
-            search_query = upd.get("search_query", "")
-            column = upd.get("column_to_update", "")
-            new_value = upd.get("new_value", "")
-            action = upd.get("action", "update")
-            if action == "delete":
-                deleted = delete_record_by_keyword(worksheet, search_query)
-                results.append("удалено" if deleted else "не найдено")
-            else:
-                if column == "category":
-                    new_value = normalize_category(new_value, EXPENSE_CATEGORIES + INCOME_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
-                if column == "subcategory":
-                    ws_data = get_last_200_transactions()
-                    for r in ws_data:
-                        if search_query.lower() in str(r).lower():
-                            cat = r.get("cat", "")
-                            _, new_value = validate_transaction_category_subcategory(cat, new_value)
-                            break
-                if column == "necessity":
-                    new_value = normalize_necessity(new_value)
-                updated = find_and_update_record(worksheet, search_query, column, new_value)
-                results.append("обновлено" if updated else "не найдено")
-        msg = reply or f"Результат: {', '.join(results)}."
-        add_chat_message(chat_id, "Ада", msg)
-        await safe_answer(message, msg)
         return
 
     # РАССРОЧКИ
@@ -592,40 +637,15 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, res)
         return
 
-    # СВОДКА И ДОХОДЫ
-    if intent == "get_summary":
-        now = datetime.datetime.now()
-        start = now.replace(day=1).strftime("%Y-%m-%d")
-        end = (now.replace(day=1) + datetime.timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
-        transactions = get_transactions_for_period(start, end)
-        total_income = 0.0
-        total_expense = 0.0
-        by_category = {}
-        for t in transactions:
-            amt = _to_number_or_blank(t.get("amt"))
-            t_type = str(t.get("type") or TYPE_EXPENSE)
-            if t_type == TYPE_INCOME:
-                total_income += amt
-            else:
-                total_expense += amt
-                cat = str(t.get("cat") or "Прочее")
-                by_category[cat] = by_category.get(cat, 0) + amt
-        lines = [f"📊 **Сводка за {now.strftime('%B %Y')}:**"]
-        lines.append(f"💰 Доходы: {_format_currency(total_income)} тг")
-        lines.append(f"💸 Расходы: {_format_currency(total_expense)} тг")
-        lines.append(f"📈 Баланс: {_format_currency(total_income - total_expense)} тг\n")
-        lines.append("📉 **По категориям:**")
-        for cat, amt in sorted(by_category.items(), key=lambda x: -x[1]):
-            lines.append(f"  - {cat}: {_format_currency(amt)} тг")
-        res = "\n".join(lines)
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
+    # ДОХОДЫ
     if intent == "get_income":
-        now = datetime.datetime.now()
+        now = now_astana()
         start = now.replace(day=1).strftime("%Y-%m-%d")
-        end = (now.replace(day=1) + datetime.timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
+        if now.month == 12:
+            end = now.replace(year=now.year + 1, month=1, day=1).strftime("%Y-%m-%d")
+        else:
+            end = now.replace(month=now.month + 1, day=1).strftime("%Y-%m-%d")
+
         transactions = get_transactions_for_period(start, end)
         incomes = [t for t in transactions if str(t.get("type")) == TYPE_INCOME]
         total = sum(_to_number_or_blank(t.get("amt")) for t in incomes)
@@ -633,16 +653,6 @@ async def _process_text_message(message: Message, text: str):
         for t in incomes:
             lines.append(f"  - {t.get('cat')}: {_format_currency(t.get('amt'))} тг ({t.get('comm')})")
         res = "\n".join(lines)
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    # УДАЛЕНИЕ
-    if intent == "delete_transaction":
-        query = parsed.get("search_query", "")
-        if query:
-            delete_record_by_keyword("Transactions", query)
-        res = reply or "Удалила запись."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
