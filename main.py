@@ -13,9 +13,10 @@ from handlers.text_handler import (
 )
 from handlers.media_handler import handle_media
 from services.sheets import (
-    get_pending_reminders, mark_reminder_done, get_active_subscriptions,
-    add_or_update_subscription, append_transaction, ensure_power_bi_dimension_table,
+    get_pending_reminders, mark_reminder_done, append_transaction,
+    ensure_power_bi_dimension_table, process_due_subscriptions,
 )
+from services.categories import FALLBACK_EXPENSE_CATEGORY
 from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
 from services.pending_clarifications import sweep_expired_clarifications
@@ -42,12 +43,12 @@ async def cmd_start(message: types.Message):
         "Что я умею:\n"
         "• Учёт трат и доходов (текстом, фото чеков, PDF)\n"
         "• Лимиты бюджета по категориям\n"
-        "• Напоминания (разовые и ежедневные)\n"
+        "• Напоминания (разовые, ежедневные, ежемесячные)\n"
         "• Список покупок\n"
         "• Рассрочки и Kaspi Red\n"
         "• Подписки и регулярные платежи\n"
         "• Планирование поездок\n"
-        "• Прогноз погоды\n"
+        "• Прогноз погоды (на сегодня, завтра или неделю)\n"
         "• Графики расходов (/chart)\n"
         "• Голосовые сообщения\n\n"
         "Просто напиши мне о покупке или доходе — я всё запишу!"
@@ -65,10 +66,11 @@ async def cmd_help(message: types.Message):
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
         "• 'Зарплата 300000'\n"
+        "• 'Погода на завтра'\n"
+        "• 'Прогноз на неделю'\n"
         "• 'Напомни мне в 21:00 выпить витамины'\n"
         "• 'Добавь в список: молоко, хлеб'\n"
-        "• 'Покажи лимиты'\n"
-        "• 'Какая погода?'"
+        "• 'Покажи лимиты'"
     )
 
 
@@ -115,7 +117,6 @@ async def handle_all_messages(message: types.Message):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def check_reminders():
-    """Проверка и отправка напоминаний каждую минуту с устойчивым парсингом дат."""
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
@@ -145,39 +146,15 @@ async def check_reminders():
 
 
 async def check_subscriptions():
-    """Проверка подписок — автоматическое списание в начале месяца."""
+    """Проверка подписок — исключает пропуск месяца при рестартах."""
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
-            if now.hour == 0 and now.minute == 5:
-                subs = get_active_subscriptions()
-                for sub in subs:
-                    try:
-                        day = int(sub.get("day_of_month", 1))
-                        if now.day == day:
-                            append_transaction({
-                                "type": "РАСХОД",
-                                "amount": float(sub.get("amount", 0)),
-                                "currency": "KZT",
-                                "bank": str(sub.get("bank", "Не указан")),
-                                "source": "Основная карта",
-                                "funds_type": "Собственные",
-                                "resource": "Карта",
-                                "category": "Связь и подписки",
-                                "subcategory": "Цифровые подписки и сервисы",
-                                "merchant": str(sub.get("name", "")),
-                                "necessity": "Want",
-                                "user_comment": f"Автосписание: {sub.get('name')}",
-                                "ai_comment": f"Ежемесячное списание: {sub.get('name')}",
-                            })
-                            add_or_update_subscription(
-                                str(sub.get("name")),
-                                float(sub.get("amount", 0)),
-                                str(sub.get("bank", "Не указан")),
-                                day,
-                            )
-                    except Exception as e:
-                        print(f"[Подписки] Ошибка обработки {sub}: {e}")
+            # Проверяем в начале каждого часа или в 00:05
+            if now.minute == 5:
+                due = process_due_subscriptions(now)
+                if due:
+                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=f"💳 Автосписание подписок: {', '.join(due)}.")
         except Exception as e:
             print(f"[Подписки] Ошибка цикла: {e}")
         await asyncio.sleep(60)
@@ -193,15 +170,15 @@ async def weather_scheduler():
             now = datetime.datetime.now(ASTANA_TZ)
             today_str = now.strftime("%Y-%m-%d")
 
-            # 08:30 — утренний прогноз (окно с 08:30 до 09:00)
+            # 08:30 — утренний прогноз
             if (now.hour == 8 and now.minute >= 30) or (now.hour == 9 and now.minute == 0):
                 if sent_morning_today != today_str:
-                    forecast = await get_weather_forecast()
+                    forecast = await get_weather_forecast(target="today")
                     if forecast:
                         await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
                         sent_morning_today = today_str
 
-            # 22:30 — вечерний прогноз на завтра (окно с 22:30 до 23:00)
+            # 22:30 — вечерний прогноз на завтра
             if (now.hour == 22 and now.minute >= 30) or (now.hour == 23 and now.minute == 0):
                 if sent_evening_today != today_str:
                     forecast = await get_tomorrow_forecast()
@@ -216,7 +193,6 @@ async def weather_scheduler():
 
 
 async def sweep_pending_receipts():
-    """Очистка просроченных чеков каждую минуту."""
     while True:
         try:
             expired = sweep_expired()
@@ -238,16 +214,22 @@ async def sweep_pending_receipts():
 
 
 async def sweep_clarifications():
-    """Очистка просроченных уточнений категории."""
+    """Очистка просроченных уточнений — теперь подставляет первую категорию, а не оставляет пустую."""
     while True:
         try:
             expired = sweep_expired_clarifications()
             for chat_id, tx in expired:
+                # ИСПРАВЛЕНИЕ: гарантируем валидную категорию вместо пустой строки
+                if not tx.get("category"):
+                    tx["category"] = FALLBACK_EXPENSE_CATEGORY
+                comm = tx.get("user_comment", "")
+                tx["user_comment"] = f"{comm} (автосохранение: {tx['category']})".strip()
+
                 append_transaction(tx)
                 try:
                     await safe_send_message(
                         bot, chat_id=chat_id,
-                        text=f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category', '...')} (не дождалась ответа)"
+                        text=f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category')} (не дождалась ответа)"
                     )
                 except Exception:
                     pass
