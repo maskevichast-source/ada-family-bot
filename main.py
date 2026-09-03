@@ -14,7 +14,7 @@ from handlers.text_handler import (
 from handlers.media_handler import handle_media
 from services.sheets import (
     get_pending_reminders, mark_reminder_done, get_active_subscriptions,
-    add_or_update_subscription, append_transaction,
+    add_or_update_subscription, append_transaction, ensure_power_bi_dimension_table,
 )
 from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
@@ -195,19 +195,21 @@ async def weather_scheduler():
             now = datetime.datetime.now(ASTANA_TZ)
             today_str = now.strftime("%Y-%m-%d")
 
-            # 08:30 — Утренний прогноз на сегодня
-            if now.hour == 8 and now.minute == 30 and sent_morning_today != today_str:
-                forecast = await get_weather_forecast()
-                if forecast:
-                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
-                    sent_morning_today = today_str
+            # 08:30 — утренний прогноз (окно с 08:30 до 09:00)
+            if (now.hour == 8 and now.minute >= 30) or (now.hour == 9 and now.minute == 0):
+                if sent_morning_today != today_str:
+                    forecast = await get_weather_forecast()
+                    if forecast:
+                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
+                        sent_morning_today = today_str
 
-            # 22:30 — Вечерний прогноз на завтра
-            if now.hour == 22 and now.minute == 30 and sent_evening_today != today_str:
-                forecast = await get_tomorrow_forecast()
-                if forecast:
-                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
-                    sent_evening_today = today_str
+            # 22:30 — вечерний прогноз на завтра (окно с 22:30 до 23:00)
+            if (now.hour == 22 and now.minute >= 30) or (now.hour == 23 and now.minute == 0):
+                if sent_evening_today != today_str:
+                    forecast = await get_tomorrow_forecast()
+                    if forecast:
+                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
+                        sent_evening_today = today_str
 
         except Exception as e:
             print(f"[Погода-Шедулер] Ошибка: {e}")
@@ -247,7 +249,7 @@ async def sweep_clarifications():
                 try:
                     await safe_send_message(
                         bot, chat_id=chat_id,
-                        text=f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category', '...')} (не дождалась уточнения)"
+                        text=f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category', '...')} (не дождалась ответа)"
                     )
                 except Exception:
                     pass
@@ -257,6 +259,9 @@ async def sweep_clarifications():
 
 
 async def main():
+    # Создаём лист-справочник категорий для Power BI
+    await asyncio.to_thread(ensure_power_bi_dimension_table)
+
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
     asyncio.create_task(weather_scheduler())
