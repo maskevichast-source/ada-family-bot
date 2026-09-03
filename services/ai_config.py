@@ -16,3 +16,4 @@ DeepSeek (https://api-docs.deepseek.com/) и при необходимости
 import os
 
 DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
+
