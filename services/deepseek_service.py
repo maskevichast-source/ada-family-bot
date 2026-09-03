@@ -11,11 +11,10 @@ from services.categories import (
 )
 from services.banks import BANK_ALIASES_PROMPT
 
-# Жёсткий таймаут 20 секунд, чтобы бот никогда не зависал на несколько минут
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
     base_url="https://api.deepseek.com",
-    timeout=20.0,
+    timeout=15.0,
     max_retries=1
 )
 
@@ -48,34 +47,38 @@ SYSTEM_PROMPT = f"""
 
 {BANK_ALIASES_PROMPT}
 
+ПРАВИЛО ПОГОДЫ:
+Если пользователь спрашивает о погоде:
+- "какая погода", "погода сейчас" -> intent: "get_weather", "weather_target": "today"
+- "погода на завтра", "завтра нужен зонт" -> intent: "get_weather", "weather_target": "tomorrow"
+- "погода на послезавтра" -> intent: "get_weather", "weather_target": "after_tomorrow"
+- "погода на неделю", "прогноз на 5 дней", "на выходные" -> intent: "get_weather", "weather_target": "week"
+
 УНИВЕРСАЛЬНОЕ ПРАВИЛО СОМНЕНИЙ И КНОПОК:
-Если категория или назначение покупки НЕ ОЧЕВИДНЫ из текста (например, «кроссовки» — спорт или обувь? «массаж» — лечение или спа? «яндекс» — такси или доставка? «сендвич» — перекус или домой?):
-1. НЕ УГАДЫВАЙ НАУГАД.
-2. Верни intent: "need_clarification".
-3. В поле "clarification_options" передай от 2 до 4 понятных вариантов с эмодзи:
-   [
-     {{"label": "👟 Повседневная обувь", "category": "Одежда и обувь", "subcategory": "Обувь"}},
-     {{"label": "🏃 Спортивная для тренировок", "category": "Спорт и фитнес", "subcategory": "Спортинвентарь"}}
-   ]
-4. В поле "reply" задай короткий живой вопрос.
+Если категория покупки неоднозначна:
+1. Верни intent: "need_clarification".
+2. В поле "clarification_options" передай от 2 до 4 понятных вариантов с эмодзи.
+3. В поле "reply" задай короткий вопрос: «Куда запишем покупку?»
 
 ПРАВИЛА ИНТЕНТОВ:
-1. "transaction" — однозначная запись расхода/дохода
-2. "need_clarification" — требуется выбор из 2-4 кнопок
-3. "correct_any_record" — исправление/удаление строки в таблице
-4. "split_transaction" — разделить трату
-5. "add_installment", "close_installment", "get_installments" — рассрочки
-6. "cancel_subscription", "get_subscriptions" — подписки
-7. "add_reminder", "delete_reminder", "get_reminders" — напоминания
-8. "add_shopping", "clear_shopping", "get_shopping" — список покупок
-9. "add_trip", "get_trips" — поездки
-10. "get_limits", "generate_limits" — лимиты
-11. "get_summary" — сводка за месяц
-12. "get_income" — доходы
-13. "get_weather" — погода
-14. "delete_transaction" — удаление операции
-15. "chat" — разговорная беседа
+"transaction", "need_clarification", "correct_any_record", "split_transaction",
+"add_installment", "close_installment", "get_installments", "cancel_subscription",
+"get_subscriptions", "add_reminder", "delete_reminder", "get_reminders",
+"add_shopping", "clear_shopping", "get_shopping", "add_trip", "get_trips",
+"get_limits", "generate_limits", "get_summary", "get_income", "get_weather",
+"delete_transaction", "chat".
 """
+
+
+def _clean_json_content(content: str) -> dict:
+    """Надёжное извлечение JSON без падения от markdown-тегов ```json."""
+    if not isinstance(content, str):
+        return {}
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.removeprefix("```json").removeprefix("```").strip()
+        cleaned = cleaned.removesuffix("```").strip()
+    return json.loads(cleaned)
 
 
 def _format_history_compact(history: list) -> str:
@@ -148,9 +151,9 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             messages=messages,
             response_format={"type": "json_object"}
         )
-        result = json.loads(response.choices[0].message.content)
+        result = _clean_json_content(response.choices[0].message.content)
 
-        # ── ПЕРЕХВАТ 1: Проверка по матрице триггеров ──
+        # Перехват триггеров кнопок
         ambig_options = get_ambiguous_options(text_to_parse)
         if ambig_options:
             tx = result.get("transaction") or {}
@@ -169,31 +172,18 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             result["transaction"] = tx
             result["clarification_options"] = ambig_options
             if not result.get("reply"):
-                result["reply"] = "Уточни, куда записать эту покупку:"
-
-        # ── ПЕРЕХВАТ 2: Альтернативы от DeepSeek ──
-        tx = result.get("transaction") or {}
-        alts = tx.get("alternatives") or result.get("alternatives") or []
-        if alts and not result.get("clarification_options"):
-            options = []
-            for a in alts[:4]:
-                options.append({"label": f"📌 {a}", "category": a, "subcategory": ""})
-            result["intent"] = "need_clarification"
-            result["clarification_options"] = options
-            if not result.get("reply"):
-                result["reply"] = "Уточни категорию покупки:"
+                result["reply"] = "Куда запишем эту покупку?"
 
         return result
     except Exception as error:
-        print(f"[DeepSeek] Ошибка запроса или таймаут: {error}")
-        # Если в запросе была финансовая трата с неоднозначным товаром — не отдаём ошибку, а сразу выводим кнопки!
+        print(f"[DeepSeek] Ошибка или таймаут: {error}")
         from services.money import parse_amount
         amt = parse_amount(text_to_parse)
         ambig_options = get_ambiguous_options(text_to_parse)
         if ambig_options and amt > 0:
             return {
                 "intent": "need_clarification",
-                "reply": "Уточни, куда отнести эту покупку:",
+                "reply": "Куда запишем эту покупку?",
                 "clarification_options": ambig_options,
                 "transaction": {
                     "amount": amt,
