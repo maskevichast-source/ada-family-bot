@@ -1,643 +1,556 @@
+"""Обработка текстовых сообщений от пользователя."""
+
 import asyncio
 import datetime
 import json
-import traceback
-from collections import defaultdict
-from aiogram import Router, types, F
-from aiogram.types import FSInputFile
-from openai import AsyncOpenAI
+import re
+
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram import types
+
+from services.categories import (
+    TYPE_EXPENSE, TYPE_INCOME,
+    EXPENSE_CATEGORIES, INCOME_CATEGORIES,
+    FALLBACK_EXPENSE_CATEGORY, FALLBACK_INCOME_CATEGORY,
+    normalize_category, normalize_subcategory,
+    validate_transaction_category_subcategory,
+    get_time_context_hint,
+)
+from services.money import parse_amount, to_clean_number
+from services.banks import normalize_bank_source
 from services.deepseek_service import parse_and_analyze
 from services.sheets import (
-    append_transaction, get_last_200_transactions, get_transactions_for_period,
+    append_transaction, get_last_200_transactions, get_category_limits,
+    get_pending_reminders, add_reminder, mark_reminder_done,
     add_shopping_items, get_shopping_items, mark_shopping_items_done,
-    add_reminder, get_pending_reminders, add_or_update_subscription, get_active_subscriptions,
-    deactivate_subscription,
-    get_category_limits, get_current_month_spending_by_category, save_category_limits,
-    add_trip_plan, get_planned_trips, find_and_update_record, delete_record_by_keyword,
-    split_last_transaction_by_amount, get_installments, add_installment, close_installment,
-    find_recent_duplicate_transaction, debug_transactions_snapshot
+    add_trip_plan, get_planned_trips,
+    add_or_update_subscription, get_active_subscriptions, deactivate_subscription,
+    add_installment, get_installments, close_installment,
+    split_last_transaction_by_amount, find_and_update_record, delete_record_by_keyword,
+    get_transactions_for_period, find_recent_duplicate_transaction,
+    debug_transactions_snapshot,
 )
-from services.categories import (
-    TYPE_EXPENSE, TYPE_INCOME, EXPENSE_CATEGORIES, INCOME_CATEGORIES,
-    FALLBACK_EXPENSE_CATEGORY, FALLBACK_INCOME_CATEGORY, normalize_category,
-)
-from services.limits_ai import generate_ai_limits
-from services.charts import generate_spending_chart, generate_income_chart
-from services.memory import add_chat_message, get_chat_history
-from services.timezone import now_astana
+from services.charts import generate_expense_chart
+from services.limits_ai import generate_limits_from_history
 from services.weather import get_weather_forecast
-from services.money import parse_amount, to_clean_number
-from services.pending_receipts import has_pending, pop_pending
-from services.telegram_safe import safe_answer
-from config import get_authorized_user_name, DEEPSEEK_API_KEY
-
-router = Router()
-ai_client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
-
-
-def _to_float(value) -> float:
-    return parse_amount(value)
-
-
-def _to_number(value):
-    """Как _to_float, но возвращает int, если число целое — для красивого вывода сумм."""
-    return to_clean_number(value)
+from services.telegram_safe import safe_answer, safe_send_message
+from services.pending_receipts import set_pending, has_pending, pop_pending
+from services.pending_clarifications import (
+    set_clarification, has_clarification, pop_clarification, sweep_expired_clarifications,
+)
+from services.memory import get_chat_history, add_chat_message
 
 
 def _to_number_or_blank(value):
-    """Как _to_number, но пустое/отсутствующее значение остаётся пустой строкой,
-    а не превращается в 0 (чтобы в таблице и в выводе не путать "не указано" с нулём)."""
-    if value in (None, ""):
-        return ""
-    return _to_number(value)
-
-
-def _normalize_reminder_time(raw: str | None, now: datetime.datetime) -> str | None:
-    """Привести время напоминания к формату YYYY-MM-DD HH:MM:SS.
-
-    Промпт просит ИИ всегда присылать полную дату, но это подстраховка на
-    случай, если модель всё же пришлёт голое "14:00" — раньше такое время
-    либо тихо ломало напоминание (падало на sheet как есть и не срабатывало
-    в планировщике), либо вовсе не доходило до сохранения.
-    """
-    raw = (raw or "").strip()
-    if not raw:
-        return None
+    if value is None:
+        return 0
     try:
-        datetime.datetime.strptime(raw, "%Y-%m-%d %H:%M:%S")
-        return raw
-    except ValueError:
-        pass
+        return float(value)
+    except (ValueError, TypeError):
+        return 0
+
+
+def _format_currency(value):
     try:
-        parsed = datetime.datetime.strptime(raw, "%Y-%m-%d %H:%M")
-        return parsed.strftime("%Y-%m-%d %H:%M:%S")
-    except ValueError:
-        pass
-    for fmt in ("%H:%M:%S", "%H:%M"):
-        try:
-            time_only = datetime.datetime.strptime(raw, fmt).time()
-            candidate = now.replace(hour=time_only.hour, minute=time_only.minute, second=0, microsecond=0)
-            if candidate <= now:
-                candidate += datetime.timedelta(days=1)
-            return candidate.strftime("%Y-%m-%d %H:%M:%S")
-        except ValueError:
-            continue
-    return None
+        return f"{float(value):,.0f}".replace(",", " ")
+    except (ValueError, TypeError):
+        return str(value)
 
 
-def _format_time_short(full_datetime: str) -> str:
-    """"2026-08-27 14:00:00" -> "14:00" для короткого текста в ответе."""
-    try:
-        return datetime.datetime.strptime(full_datetime, "%Y-%m-%d %H:%M:%S").strftime("%H:%M")
-    except ValueError:
-        return full_datetime
+def _is_debug_command(text: str) -> bool:
+    return text.strip().lower() in {"debug", "/debug"}
 
 
-def _month_bounds(now: datetime.datetime) -> tuple[str, str]:
-    """Границы [начало_месяца, начало_следующего_месяца) в формате YYYY-MM-DD."""
-    start = now.replace(day=1)
-    if start.month == 12:
-        end = start.replace(year=start.year + 1, month=1)
-    else:
-        end = start.replace(month=start.month + 1)
-    return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
+def _is_chart_command(text: str) -> bool:
+    return text.strip().lower() in {"график", "/chart", "chart"}
 
 
-@router.message(F.text)
-async def handle_text_message(message: types.Message, text_override: str | None = None):
-    user_name = get_authorized_user_name(message.from_user.id)
-    if not user_name:
+def _is_split_command(text: str) -> bool:
+    return "раздели" in text.lower() and "транзакцию" in text.lower()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ИНТЕРАКТИВНОЕ УТОЧНЕНИЕ КАТЕГОРИИ (InlineKeyboard)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _build_category_clarification_keyboard(alternatives: list[str], tx_data: dict) -> InlineKeyboardMarkup:
+    """Создать клавиатуру с вариантами категорий."""
+    buttons = []
+    for alt in alternatives:
+        # callback_data ограничен 64 байтами
+        callback = f"clarify_cat:{alt[:20]}"
+        buttons.append([InlineKeyboardButton(text=alt, callback_data=callback)])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+async def _send_category_clarification(message: Message, tx: dict, alternatives: list[str], reply_text: str):
+    """Отправить сообщение с кнопками для уточнения категории."""
+    kb = _build_category_clarification_keyboard(alternatives, tx)
+    sent = await message.answer(reply_text, reply_markup=kb)
+    set_clarification(message.chat.id, tx, alternatives, sent.message_id)
+
+
+async def handle_category_clarification_callback(callback: types.CallbackQuery):
+    """Обработчик нажатия кнопки уточнения категории."""
+    chat_id = callback.message.chat.id
+    data = callback.data
+
+    if not data.startswith("clarify_cat:"):
         return
-    chat_id = message.chat.id
-    text = (text_override if text_override is not None else message.text or "").strip()
 
-    # Если бот ждёт комментарий к недавно распознанному чеку без подписи —
-    # это сообщение (или расшифровка голосового) и есть тот комментарий.
+    chosen_category = data.replace("clarify_cat:", "")
+    clarification = pop_clarification(chat_id)
+
+    if not clarification:
+        await callback.answer("Уточнение устарело. Запиши заново.", show_alert=True)
+        return
+
+    tx = clarification["transaction"]
+    tx["category"] = chosen_category
+
+    # Валидация подкатегории для новой категории
+    _, valid_sub = validate_transaction_category_subcategory(chosen_category, tx.get("subcategory"))
+    tx["subcategory"] = valid_sub or normalize_subcategory(None, chosen_category, "")
+
+    # Обновляем necessity
+    from services.sheets import normalize_necessity
+    tx["necessity"] = normalize_necessity(tx.get("necessity"), chosen_category)
+
+    # Записываем
+    append_transaction(tx)
+
+    await callback.message.edit_text(
+        f"✅ Записала: {_format_currency(tx.get('amount', 0))} тг → {chosen_category}\n"
+        f"_{tx.get('user_comment', '')}_"
+    )
+    await callback.answer("Записано!")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ОСНОВНОЙ ОБРАБОТЧИК
+# ═══════════════════════════════════════════════════════════════════════════════
+
+async def handle_text(message: Message):
+    text = message.text or ""
+    user_name = message.from_user.first_name or "Пользователь"
+    user_id = message.from_user.id
+    chat_id = message.chat.id
+
+    # Сохраняем сообщение в историю чата
+    add_chat_message(chat_id, user_name, text)
+
+    # ── Обработка ожидающего чека ──
     if has_pending(chat_id):
-        popped = pop_pending(chat_id)
-        if popped:
-            pending_transactions, pending_user_name = popped
-            comment = "" if text.strip() == "-" else text
-            for t in pending_transactions:
-                if isinstance(t, dict):
-                    t["user_comment"] = comment
-            from handlers.media_handler import build_and_save_transactions
-            body = build_and_save_transactions(pending_transactions, pending_user_name)
-            tail = "Записано с комментарием." if comment else "Записано без комментария."
-            resp = f"{body}\n\n💬 {tail}"
-            add_chat_message(chat_id, user_name, text)
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
+        pending = pop_pending(chat_id)
+        if pending:
+            transactions, receipt_user = pending
+            for tx in transactions:
+                tx["user_comment"] = text
+                tx["user"] = receipt_user
+                append_transaction(tx)
+            await safe_answer(message, f"Записала {len(transactions)} покупок с комментарием. Спасибо!")
             return
 
-    normalized_text = text.lower().strip()
-
-    if normalized_text == "/chatid":
-        await safe_answer(message, f"ID этого чата: `{chat_id}`", parse_mode="Markdown")
+    # ── Голосовые ──
+    if message.voice or message.audio:
+        await safe_answer(message, "Голосовые пока не поддерживаются. Пришли текстом.")
         return
 
-    if normalized_text == "/debug":
-        diagnostic = await asyncio.to_thread(debug_transactions_snapshot)
-        await safe_answer(message, diagnostic)
+    # ── /debug ──
+    if _is_debug_command(text):
+        debug_text = debug_transactions_snapshot()
+        await safe_answer(message, f"```\n{debug_text}\n```")
         return
 
-    if (
-        normalized_text.startswith("/chart")
-        or "график" in normalized_text
-        or "диаграмм" in normalized_text
-    ):
+    # ── /chart ──
+    if _is_chart_command(text):
         try:
-            transactions = await asyncio.to_thread(get_last_200_transactions)
-            if "доход" in normalized_text:
-                chart_path = await asyncio.to_thread(generate_income_chart, transactions)
-                caption = "📊 Доходы за текущий месяц."
+            image_bytes = await asyncio.to_thread(generate_expense_chart)
+            if image_bytes:
+                await message.answer_photo(photo=image_bytes, caption="Вот твоя диаграмма расходов за текущий месяц.")
             else:
-                chart_path = await asyncio.to_thread(generate_spending_chart, transactions)
-                caption = "📊 Расходы за текущий месяц."
-            await message.answer_photo(FSInputFile(chart_path), caption=caption)
+                await safe_answer(message, "Нет данных для построения графика.")
         except Exception as error:
-            print(f"[График] Не удалось построить диаграмму: {error}")
-            await safe_answer(message, "⚠️ Не удалось построить график.")
+            print(f"[График] Ошибка: {error}")
+            await safe_answer(message, "Не удалось построить график.")
         return
 
-    try:
-        history_sheets = get_last_200_transactions()
-        active_shopping = get_shopping_items()
-        limits = get_category_limits()
-        pending_rems = get_pending_reminders()
-        planned_trips = get_planned_trips()
-        active_subs = get_active_subscriptions()
-        active_installments = get_installments()
-        current_chat_history = get_chat_history(chat_id)
-
-        data = await parse_and_analyze(
-            user_text=text,
-            user_name=user_name,
-            history=history_sheets,
-            chat_history=current_chat_history,
-            shopping_list=active_shopping,
-            limits=limits,
-            reminders=pending_rems,
-            trips=planned_trips,
-            subscriptions=active_subs,
-            installments=active_installments
+    # ── Разделить транзакцию ──
+    if _is_split_command(text):
+        match = re.search(
+            r"раздели\s+транзакцию\s+(\d+)[\s:]*(.+?)[\s]*\|\s*(.+?)",
+            text, re.IGNORECASE
         )
-
-        add_chat_message(chat_id, user_name, text)
-        intent = data.get("intent", "chat")
-
-        if intent == "get_limits":
-            if not limits:
-                resp = "📊 Лимиты в таблице пока не заданы."
-            else:
-                resp = "📊 **Текущие лимиты на месяц:**\n\n"
-                for c, v in limits.items():
-                    resp += f"• **{c}**: {v:,.0f} ₸\n"
-            if data.get("reply"):
-                resp += f"\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "get_reminders":
-            rems = get_pending_reminders()
-            if not rems:
-                resp = "📌 Активных напоминаний нет."
-            else:
-                resp = "📌 **Активные напоминания:**\n\n"
-                for r in rems:
-                    rec_str = " (ежедневно)" if str(r.get("recurrence")) == "daily" else ""
-                    resp += f"• **{r.get('target_user')}**: {r.get('text')} — ⏰ {r.get('remind_at')}{rec_str}\n"
-            if data.get("reply"):
-                resp += f"\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "delete_reminder":
-            query = data.get("search_query") or data.get("reminder_text") or ""
-            deleted = delete_record_by_keyword("Reminders", query) if query else None
-            if deleted:
-                what = deleted.get("text") or "напоминание"
-                when = deleted.get("remind_at") or ""
-                reply_text = data.get("reply") or f"🗑 Удалила напоминание «{what}»{f' ({when})' if when else ''}."
-            else:
-                reply_text = f"⚠️ Не нашла напоминание по запросу «{query}»." if query else "⚠️ Не поняла, какое напоминание удалить."
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
-
-        elif intent == "get_shopping":
-            items = get_shopping_items()
-            if not items:
-                resp = "🛒 Список покупок пуст!"
-            else:
-                resp = "🛒 **Список покупок:**\n" + "\n".join([f"• {i['item']} (добавил: {i['added_by']})" for i in items])
-            if data.get("reply"):
-                resp += f"\n\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "get_trips":
-            trips = get_planned_trips()
-            if not trips:
-                resp = "🏕 Запланированных поездок пока нет."
-            else:
-                resp = "🏕 **Запланированные поездки:**\n" + "\n".join([f"• **{t['destination']}** ({t['dates']}) — Бюджет: {t['budget']} ₸ | {t['notes']}" for t in trips])
-            if data.get("reply"):
-                resp += f"\n\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "get_weather":
-            forecast_message = await get_weather_forecast()
-            reply_text = forecast_message or "⚠️ Не удалось получить прогноз погоды, попробуй чуть позже."
-            if data.get("reply"):
-                reply_text += f"\n\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
-
-        elif intent == "get_subscriptions":
-            subs = active_subs
-            if not subs:
-                resp = "📋 Активных подписок и регулярных платежей нет."
-            else:
-                resp = "📋 **Активные подписки и регулярные платежи:**\n\n"
-                for s in subs:
-                    resp += f"• **{s.get('name')}** — {s.get('amount')} ₸, {s.get('day_of_month')} числа месяца ({s.get('bank', 'банк не указан')})\n"
-            if data.get("reply"):
-                resp += f"\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "cancel_subscription":
-            name = data.get("subscription_name") or data.get("merchant") or ""
-            cancelled = deactivate_subscription(name) if name else None
-            if cancelled:
-                real_name = cancelled.get("name", name)
-                amount = cancelled.get("amount", "")
-                reply_text = data.get("reply") or f"🗑 Отменила подписку «{real_name}»{f' ({amount} ₸)' if amount else ''}."
-            else:
-                reply_text = f"⚠️ Не нашла активную подписку «{name}»." if name else "⚠️ Не поняла, какую подписку отменить."
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
-
-        elif intent == "get_income":
-            now = now_astana()
-            start_date, end_date = _month_bounds(now)
-            period_transactions = await asyncio.to_thread(get_transactions_for_period, start_date, end_date)
-            total_income = 0.0
-            income_by_cat: dict[str, float] = defaultdict(float)
-            for t in period_transactions:
-                if str(t.get("type") or TYPE_EXPENSE) != TYPE_INCOME:
-                    continue
-                amt = _to_float(t.get("amt"))
-                total_income += amt
-                income_by_cat[t.get("cat") or "Прочее"] += amt
-
-            if total_income == 0:
-                resp = f"💰 В {now.strftime('%m.%Y')} доходов пока не записано."
-            else:
-                resp = f"💰 **Доходы за {now.strftime('%m.%Y')}: {total_income:,.0f} ₸**\n\n"
-                for c, v in sorted(income_by_cat.items(), key=lambda item: -item[1]):
-                    resp += f"• {c}: {v:,.0f} ₸\n"
-            if data.get("reply"):
-                resp += f"\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "get_summary":
-            now = now_astana()
-            start_date, end_date = _month_bounds(now)
-            period_transactions = await asyncio.to_thread(get_transactions_for_period, start_date, end_date)
-            total_income = 0.0
-            total_expense = 0.0
-            expense_by_cat: dict[str, float] = defaultdict(float)
-            for t in period_transactions:
-                amt = _to_float(t.get("amt"))
-                if str(t.get("type") or TYPE_EXPENSE) == TYPE_INCOME:
-                    total_income += amt
-                else:
-                    total_expense += amt
-                    expense_by_cat[t.get("cat") or "Прочее"] += amt
-
-            balance = total_income - total_expense
-            balance_icon = "📈" if balance >= 0 else "📉"
-            resp = (
-                f"📊 **Сводка за {now.strftime('%m.%Y')}:**\n\n"
-                f"💰 Доходы: {total_income:,.0f} ₸\n"
-                f"💸 Расходы: {total_expense:,.0f} ₸\n"
-                f"{balance_icon} Баланс: {balance:,.0f} ₸\n"
-            )
-            if expense_by_cat:
-                resp += "\n**Топ категорий расходов:**\n"
-                for c, v in sorted(expense_by_cat.items(), key=lambda item: -item[1])[:5]:
-                    resp += f"• {c}: {v:,.0f} ₸\n"
-            if data.get("reply"):
-                resp += f"\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "split_transaction":
-            t_amt = _to_float(data.get("target_amount", 0))
-            p1_amt = _to_float(data.get("part1_amount", 0))
-            p1_cat = normalize_category(data.get("part1_category"), EXPENSE_CATEGORIES, "Еда и продукты")
-            p1_comm = data.get("part1_comment", "")
-            p2_amt = _to_float(data.get("part2_amount", 0))
-            p2_cat = normalize_category(data.get("part2_category"), EXPENSE_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
-            p2_comm = data.get("part2_comment", "")
-
-            success = split_last_transaction_by_amount(t_amt, p1_amt, p1_cat, p1_comm, p2_amt, p2_cat, p2_comm)
-            reply_text = data.get("reply", "Транзакция разделена.")
-
-            if not success:
-                reply_text = "Не смогла найти транзакцию на эту сумму в таблице."
-
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
-
-        elif intent == "delete_transaction":
-            query = data.get("search_query") or data.get("merchant") or data.get("user_comment") or ""
-            deleted = delete_record_by_keyword("Transactions", query) if query else None
-            if deleted:
-                amt = deleted.get("amount", "")
-                dcat = deleted.get("category", "")
-                merchant = deleted.get("merchant") or deleted.get("user_comment") or ""
-                details = f"{amt} ₸ | {dcat}" + (f" | {merchant}" if merchant else "")
-                reply_text = data.get("reply") or f"🗑 Удалила запись: {details}."
-            else:
-                reply_text = f"⚠️ Не нашла операцию по запросу «{query}»." if query else "⚠️ Не поняла, какую запись удалить."
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
-
-        elif intent == "correct_any_record":
-            raw_updates = data.get("updates", [])
-            if isinstance(raw_updates, dict):
-                raw_updates = [raw_updates]
-            elif not isinstance(raw_updates, list):
-                raw_updates = []
-            updates = [u for u in raw_updates if isinstance(u, dict)]
-
-            if not updates and data.get("worksheet") and data.get("search_query") and data.get("new_value") is not None:
-                updates = [{
-                    "worksheet": data.get("worksheet"),
-                    "search_query": data.get("search_query"),
-                    "column_to_update": data.get("column_to_update", "amount"),
-                    "new_value": data.get("new_value"),
-                    "action": data.get("action", "update"),
-                }]
-
-            if not updates:
-                reply_text = data.get("reply") or "Не поняла, что и на что исправить — уточни, пожалуйста."
-                add_chat_message(chat_id, "Ада", reply_text)
-                await safe_answer(message, reply_text)
-            else:
-                result_lines = []
-                limits_touched = False
-
-                for upd in updates:
-                    ws_name = upd.get("worksheet")
-                    query = upd.get("search_query")
-                    col = upd.get("column_to_update", "amount")
-                    val = upd.get("new_value")
-                    action = upd.get("action", "update")
-
-                    if not ws_name or not query:
-                        continue
-
-                    if action == "update" and val is not None and ws_name == "Limits":
-                        current_limits = get_category_limits()
-                        found_key = next((k for k in current_limits if str(query).lower() in k.lower()), query)
-                        current_limits[found_key] = _to_float(val)
-                        save_category_limits(current_limits)
-                        limits_touched = True
-                    elif action == "update" and val is not None:
-                        clean_val = str(_to_number(val)) if str(col).lower() in ("amount", "сумма") else val
-                        old_record = find_and_update_record(ws_name, query, col, clean_val)
-                        if old_record:
-                            old_val = old_record.get(col, "—") if isinstance(col, str) else "—"
-                            result_lines.append(f"✏️ {ws_name}: «{query}» — {col}: {old_val} → {clean_val}")
-                        else:
-                            result_lines.append(
-                                f"⚠️ Не нашла «{query}» в {ws_name}. Если это была НОВАЯ покупка, "
-                                f"а не правка старой записи — напиши её ещё раз явно как покупку, "
-                                f"например: «Записать {clean_val} тенге, [на что]»."
-                            )
-                    elif action == "delete":
-                        deleted = delete_record_by_keyword(ws_name, query)
-                        if deleted:
-                            result_lines.append(f"🗑 Удалила запись из {ws_name}")
-                        else:
-                            result_lines.append(f"⚠️ Не нашла «{query}» для удаления в {ws_name}")
-
-                if limits_touched:
-                    updated_limits = get_category_limits()
-                    resp = "📊 **БЮДЖЕТ СКОРРЕКТИРОВАН:**\n\n"
-                    for c, v in updated_limits.items():
-                        resp += f"• **{c}**: {v:,.0f} ₸\n"
-                    if result_lines:
-                        resp += "\n" + "\n".join(result_lines)
-                elif result_lines:
-                    resp = "\n".join(result_lines)
-                else:
-                    resp = "⚠️ Не удалось выполнить обновление в таблице."
-
-                if data.get("reply"):
-                    resp += f"\n\n💬 {data['reply']}"
-
-                add_chat_message(chat_id, "Ада", resp)
-                await safe_answer(message, resp)
-
-        elif intent == "generate_limits":
-            await safe_answer(message, "⏳ Анализирую прошлые траты и утверждаю лимиты на новый месяц...")
-            new_limits = await generate_ai_limits(history_sheets)
-            save_category_limits(new_limits)
-
-            resp = "📊 **БЮДЖЕТ УТВЕРЖДЕН:**\n\nТаблица обновлена, лимиты проставлены:\n\n"
-            for cat, val in new_limits.items():
-                resp += f"• **{cat}**: {val:,.0f} ₸\n"
-            if data.get("reply"):
-                resp += f"\n💬 {data['reply']}"
-
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "get_installments":
-            if not active_installments:
-                resp = "💳 Активных рассрочек и Kaspi Red пока нет."
-            else:
-                lines = ["💳 **Активные рассрочки и Kaspi Red:**", ""]
-                for item in active_installments:
-                    description = item.get("description") or item.get("name") or "Без описания"
-                    lines.append(
-                        f"• **{description}** ({item.get('bank', 'Банк не указан')}) — "
-                        f"всего {item.get('total_amount', '—')} ₸, "
-                        f"платёж {item.get('monthly_payment', '—')} ₸, "
-                        f"следующий: {item.get('next_payment', 'дата не указана')}"
-                    )
-                resp = "\n".join(lines)
-            if data.get("reply"):
-                resp += f"\n\n💬 {data['reply']}"
-            add_chat_message(chat_id, "Ада", resp)
-            await safe_answer(message, resp)
-
-        elif intent == "add_installment":
-            installment = add_installment(
-                {
-                    "user": user_name,
-                    "bank": data.get("bank", "Kaspi"),
-                    "kind": data.get("kind", "Рассрочка"),
-                    "description": data.get("description") or data.get("merchant", "Рассрочка"),
-                    "total_amount": _to_number_or_blank(data.get("total_amount", data.get("amount", ""))),
-                    "monthly_payment": _to_number_or_blank(data.get("monthly_payment", "")),
-                    "payments_count": data.get("payments_count", ""),
-                    "next_payment": data.get("next_payment", ""),
-                }
-            )
-            if installment:
-                reply_text = data.get("reply", "💳 Рассрочку записала в таблицу.")
-            else:
-                reply_text = "⚠️ Не удалось сохранить рассрочку в таблицу."
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
-
-        elif intent == "close_installment":
-            query = data.get("search_query") or data.get("description") or data.get("merchant") or ""
-            closed = close_installment(query) if query else None
-            if closed:
-                what = closed.get("description") or query
-                reply_text = data.get("reply") or f"✅ Отметила рассрочку «{what}» как закрытую."
-            else:
-                reply_text = f"⚠️ Не нашла рассрочку по запросу «{query}»." if query else "⚠️ Не поняла, какую рассрочку закрыть."
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
-
-        elif intent == "transaction":
-            now = now_astana()
-            amt = to_clean_number(data.get("amount", 0))
-
-            if not amt or amt <= 0:
-                reply_text = data.get("reply") or (
-                    "Не поняла сумму. Уточни, пожалуйста, сколько было потрачено или получено?"
+        if match:
+            target_amount = float(match.group(1))
+            part1_desc = match.group(2).strip()
+            part2_desc = match.group(3).strip()
+            p1_match = re.match(r"(.+?)\s*[-—]\s*(\d+)", part1_desc)
+            p2_match = re.match(r"(.+?)\s*[-—]\s*(\d+)", part2_desc)
+            if p1_match and p2_match:
+                part1_cat = p1_match.group(1).strip()
+                part1_amt = float(p1_match.group(2))
+                part2_cat = p2_match.group(1).strip()
+                part2_amt = float(p2_match.group(2))
+                part1_cat = normalize_category(part1_cat, EXPENSE_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
+                part2_cat = normalize_category(part2_cat, EXPENSE_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
+                _, part1_sub = validate_transaction_category_subcategory(part1_cat, "")
+                _, part2_sub = validate_transaction_category_subcategory(part2_cat, "")
+                success = split_last_transaction_by_amount(
+                    target_amount, part1_amt, part1_cat, part1_desc,
+                    part2_amt, part2_cat, part2_desc
                 )
-                add_chat_message(chat_id, "Ада", reply_text)
-                await safe_answer(message, reply_text)
-            else:
-                data["amount"] = amt
-                tx_type = str(data.get("type") or "").strip().upper()
-                if tx_type not in (TYPE_EXPENSE, TYPE_INCOME):
-                    tx_type = TYPE_EXPENSE
-                data["type"] = tx_type
-                data["transaction_id"] = f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_{amt}"
-                data["date"] = now.strftime("%Y-%m-%d %H:%M:%S")
-                data["user"] = user_name
-
-                valid_categories = INCOME_CATEGORIES if tx_type == TYPE_INCOME else EXPENSE_CATEGORIES
-                fallback_cat = FALLBACK_INCOME_CATEGORY if tx_type == TYPE_INCOME else FALLBACK_EXPENSE_CATEGORY
-                raw_cat = data.get("category")
-                cat = normalize_category(raw_cat, valid_categories, fallback_cat)
-                data["category"] = cat
-                if raw_cat and cat != str(raw_cat).strip():
-                    note = f" (категория уточнена: «{raw_cat}» → «{cat}»)"
-                    data["ai_comment"] = f"{data.get('ai_comment', '')}{note}".strip()
-
-                duplicate = find_recent_duplicate_transaction(amt)
-
-                append_transaction(data)
-
-                if tx_type == TYPE_EXPENSE and limits and cat in limits:
-                    limit_val = limits[cat]
-                    spent_val = get_current_month_spending_by_category(cat)
-                    pct = (spent_val / limit_val) * 100 if limit_val > 0 else 0
-                    if pct >= 80:
-                        data["ai_comment"] = f"⚠️ Внимание! По категории «{cat}» потрачено {spent_val:,.0f} из {limit_val:,.0f} ₸ ({int(pct)}% лимита). {data.get('ai_comment', '')}"
-
-                if tx_type == TYPE_EXPENSE and data.get("is_recurring"):
-                    sub_name = data.get("subscription_name") or data.get("merchant") or "Подписка"
-                    day = data.get("day_of_month") or now.day
-                    add_or_update_subscription(sub_name, amt, data.get("bank", "BCC"), day)
-
-                ai_comment = data.get("ai_comment", "Записано!")
-                if tx_type == TYPE_INCOME:
-                    icon, label = "💰", "Доход записан"
+                if success:
+                    await safe_answer(message, f"Разделила: {part1_cat} — {part1_amt} тг, {part2_cat} — {part2_amt} тг.")
                 else:
-                    icon, label = "✅", "Записано"
-                resp = f"{icon} **{label}:** {amt} {data.get('currency', 'KZT')} | {data.get('bank', 'BCC')} | {cat}\n\n💬 {ai_comment}"
-                if duplicate:
-                    dup_merchant = duplicate.get("merchant") or duplicate.get("user_comment") or ""
-                    resp += (
-                        f"\n\n⚠️ Похоже, такую же сумму ({amt} ₸{f', {dup_merchant}' if dup_merchant else ''}) "
-                        f"я уже записывала несколько минут назад — если это дубль, скажи «удали последнюю запись»."
-                    )
-                add_chat_message(chat_id, "Ада", resp)
-                await safe_answer(message, resp)
+                    await safe_answer(message, "Не нашла такую транзакцию.")
+                return
+        await safe_answer(message, "Формат: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>")
+        return
 
-        elif intent == "add_reminder":
-            target = data.get("reminder_target", user_name)
-            rem_text = data.get("reminder_text", "Напоминание")
-            recurrence = data.get("recurrence", "once")
+    # ── Запрос к DeepSeek ──
+    history = get_last_200_transactions()
+    limits = get_category_limits()
+    reminders = get_pending_reminders()
+    shopping_list = get_shopping_items()
+    trips = get_planned_trips()
+    subscriptions = get_active_subscriptions()
+    installments = get_installments()
+    chat_history = get_chat_history(chat_id)
 
-            raw_times = data.get("reminder_times")
-            if not raw_times:
-                single = data.get("reminder_time")
-                raw_times = [single] if single else []
+    parsed = await parse_and_analyze(
+        user_text=text, user_name=user_name,
+        history=history, chat_history=chat_history,
+        shopping_list=shopping_list, limits=limits,
+        reminders=reminders, trips=trips,
+        subscriptions=subscriptions, installments=installments,
+    )
 
-            now = now_astana()
-            normalized_times = [t for t in (_normalize_reminder_time(rt, now) for rt in raw_times) if t]
+    intent = parsed.get("intent", "chat")
+    reply = parsed.get("reply", "")
 
-            if normalized_times:
-                for rt in normalized_times:
-                    add_reminder(target, rt, rem_text, recurrence)
-                if data.get("reply"):
-                    reply_text = data["reply"]
-                elif len(normalized_times) > 1:
-                    times_str = ", ".join(_format_time_short(t) for t in normalized_times)
-                    reply_text = f"Запомнила! Поставила {target} {len(normalized_times)} напоминания на {times_str}."
-                else:
-                    reply_text = f"Запомнила! Напомню {target} в {_format_time_short(normalized_times[0])}."
-            else:
-                reply_text = data.get("reply") or (
-                    "Не совсем поняла, на какое время поставить напоминание. "
-                    "Уточни, например: «в 14:00» или «завтра в 9 утра»."
-                )
+    # ── ТРАНЗАКЦИЯ ──
+    if intent == "transaction":
+        tx = parsed.get("transaction", {})
+        if not tx:
+            await safe_answer(message, reply or "Не поняла, что записывать.")
+            return
 
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
+        # Проверяем confidence — нужно ли уточнение?
+        confidence = float(tx.get("confidence", 1.0))
+        alternatives = tx.get("alternatives", [])
 
-        elif intent == "add_shopping":
-            items = data.get("shopping_items", [])
-            if items:
-                add_shopping_items(items, user_name)
-                reply_text = data.get("reply", "Закинула в список!")
-            else:
-                reply_text = data.get("reply") or "Не поняла, что добавить в список покупок."
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
+        if confidence < 0.8 and alternatives:
+            # Показываем интерактивные кнопки
+            await _send_category_clarification(message, tx, alternatives, 
+                                               reply or "Не уверена в категории. Выбери:")
+            return
 
-        elif intent == "clear_shopping":
-            items = data.get("shopping_items", [])
-            if items:
-                mark_shopping_items_done(items)
-                reply_text = data.get("reply", "Вычеркнула.")
-            else:
-                reply_text = data.get("reply") or "Не поняла, что вычеркнуть из списка."
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
+        # Определяем тип
+        tx_type = str(tx.get("type") or TYPE_EXPENSE).strip().upper()
+        valid_categories = INCOME_CATEGORIES if tx_type == TYPE_INCOME else EXPENSE_CATEGORIES
+        fallback_cat = FALLBACK_INCOME_CATEGORY if tx_type == TYPE_INCOME else FALLBACK_EXPENSE_CATEGORY
 
-        elif intent == "add_trip":
-            add_trip_plan(
-                destination=data.get("trip_destination", "Поездка"),
-                dates=data.get("trip_dates", "Даты не указаны"),
-                budget=_to_number(data.get("trip_budget", 0)),
-                notes=data.get("trip_notes", "")
+        # Нормализация
+        raw_cat = tx.get("category")
+        cat = normalize_category(raw_cat, valid_categories, fallback_cat)
+        tx["category"] = cat
+        raw_sub = tx.get("subcategory")
+        _, valid_sub = validate_transaction_category_subcategory(cat, raw_sub)
+        tx["subcategory"] = valid_sub or normalize_subcategory(None, cat, "")
+        from services.sheets import normalize_necessity
+        tx["necessity"] = normalize_necessity(tx.get("necessity"), cat)
+        tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
+        if not tx.get("bank"):
+            tx["bank"] = "Не указан"
+        if not tx.get("currency"):
+            tx["currency"] = "KZT"
+        if not tx.get("funds_type"):
+            tx["funds_type"] = "Собственные"
+        if not tx.get("resource"):
+            tx["resource"] = "Карта"
+        if not tx.get("user"):
+            tx["user"] = user_name
+        if not tx.get("merchant"):
+            tx["merchant"] = ""
+        if not tx.get("user_comment"):
+            tx["user_comment"] = ""
+        if not tx.get("ai_comment"):
+            tx["ai_comment"] = reply or ""
+
+        # Проверка на дубли
+        amount = parse_amount(tx.get("amount", 0))
+        duplicate = find_recent_duplicate_transaction(amount)
+        if duplicate:
+            await safe_answer(
+                message,
+                f"⚠️ Похожая операция на {_format_currency(amount)} тг уже была записана "
+                f"({duplicate.get('category')} — {duplicate.get('date')}). Записать ещё раз?",
             )
-            reply_text = data.get("reply", "План поездки сохранен!")
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
+            return
 
+        append_transaction(tx)
+        await safe_answer(message, reply or "Записала.")
+        return
+
+    # ── ИСПРАВЛЕНИЕ ЗАПИСИ ──
+    if intent == "correct_any_record":
+        updates = parsed.get("updates", [])
+        if not updates:
+            await safe_answer(message, reply or "Не поняла, что исправлять.")
+            return
+        results = []
+        for upd in updates:
+            worksheet = upd.get("worksheet", "Transactions")
+            search_query = upd.get("search_query", "")
+            column = upd.get("column_to_update", "")
+            new_value = upd.get("new_value", "")
+            action = upd.get("action", "update")
+            if action == "delete":
+                deleted = delete_record_by_keyword(worksheet, search_query)
+                results.append("удалено" if deleted else "не найдено")
+            else:
+                if column == "category":
+                    new_value = normalize_category(new_value, EXPENSE_CATEGORIES + INCOME_CATEGORIES, 
+                                                   FALLBACK_EXPENSE_CATEGORY)
+                if column == "subcategory":
+                    ws_data = get_last_200_transactions()
+                    for r in ws_data:
+                        if search_query.lower() in str(r).lower():
+                            cat = r.get("cat", "")
+                            _, new_value = validate_transaction_category_subcategory(cat, new_value)
+                            break
+                if column == "necessity":
+                    from services.sheets import normalize_necessity
+                    new_value = normalize_necessity(new_value)
+                updated = find_and_update_record(worksheet, search_query, column, new_value)
+                results.append("обновлено" if updated else "не найдено")
+        await safe_answer(message, reply or f"Результат: {', '.join(results)}.")
+        return
+
+    # ── РАССРОЧКИ ──
+    if intent == "add_installment":
+        data = parsed.get("installment", {})
+        if data:
+            add_installment(data)
+        await safe_answer(message, reply or "Записала рассрочку.")
+        return
+
+    if intent == "close_installment":
+        query = parsed.get("search_query", "")
+        if query:
+            close_installment(query)
+        await safe_answer(message, reply or "Закрыла рассрочку.")
+        return
+
+    if intent == "get_installments":
+        items = get_installments()
+        if items:
+            lines = ["📋 Активные рассрочки:"]
+            for item in items:
+                lines.append(
+                    f"- {item.get('description')} ({item.get('bank')}): "
+                    f"{_format_currency(item.get('total_amount'))} тг, "
+                    f"{_format_currency(item.get('monthly_payment'))} тг/мес"
+                )
+            await safe_answer(message, "\n".join(lines))
         else:
-            reply_text = data.get("reply", "Принято.")
-            add_chat_message(chat_id, "Ада", reply_text)
-            await safe_answer(message, reply_text)
+            await safe_answer(message, "Нет активных рассрочек.")
+        return
 
-    except Exception as e:
-        print(f"[Обработка текста] Ошибка: {e}")
-        traceback.print_exc()
-        await safe_answer(message, "Ошибка связи, попробуй позже.")
+    # ── ПОДПИСКИ ──
+    if intent == "cancel_subscription":
+        name = parsed.get("subscription_name", "")
+        if name:
+            deactivate_subscription(name)
+        await safe_answer(message, reply or "Отменила подписку.")
+        return
+
+    if intent == "get_subscriptions":
+        items = get_active_subscriptions()
+        if items:
+            lines = ["📋 Активные подписки:"]
+            for item in items:
+                lines.append(
+                    f"- {item.get('name')}: {_format_currency(item.get('amount'))} тг/мес "
+                    f"({item.get('bank')})"
+                )
+            await safe_answer(message, "\n".join(lines))
+        else:
+            await safe_answer(message, "Нет активных подписок.")
+        return
+
+    # ── НАПОМИНАНИЯ ──
+    if intent == "add_reminder":
+        target = parsed.get("reminder_target", user_name)
+        times = parsed.get("reminder_times", [])
+        text_rem = parsed.get("reminder_text", "")
+        recurrence = parsed.get("recurrence", "once")
+        if not times:
+            await safe_answer(message, reply or "Во сколько поставить напоминание?")
+            return
+        for time_str in times:
+            add_reminder(target, time_str, text_rem, recurrence)
+        await safe_answer(message, reply or "Поставила напоминание.")
+        return
+
+    if intent == "delete_reminder":
+        query = parsed.get("search_query", "")
+        if query:
+            delete_record_by_keyword("Reminders", query)
+        await safe_answer(message, reply or "Удалила напоминание.")
+        return
+
+    if intent == "get_reminders":
+        items = get_pending_reminders()
+        if items:
+            lines = ["📋 Активные напоминания:"]
+            for item in items:
+                lines.append(
+                    f"- {item.get('target_user')}: {item.get('text')} "
+                    f"({item.get('remind_at')})"
+                )
+            await safe_answer(message, "\n".join(lines))
+        else:
+            await safe_answer(message, "Нет активных напоминаний.")
+        return
+
+    # ── СПИСОК ПОКУПОК ──
+    if intent == "add_shopping":
+        items = parsed.get("shopping_items", [])
+        if items:
+            add_shopping_items(items, user_name)
+        await safe_answer(message, reply or "Добавила в список покупок.")
+        return
+
+    if intent == "clear_shopping":
+        items = parsed.get("shopping_items", [])
+        if items:
+            mark_shopping_items_done(items)
+        await safe_answer(message, reply or "Убрала из списка.")
+        return
+
+    if intent == "get_shopping":
+        items = get_shopping_items()
+        if items:
+            lines = ["🛒 Список покупок:"]
+            for item in items:
+                lines.append(f"- {item.get('item')}")
+            await safe_answer(message, "\n".join(lines))
+        else:
+            await safe_answer(message, "Список покупок пуст.")
+        return
+
+    # ── ПОЕЗДКИ ──
+    if intent == "add_trip":
+        destination = parsed.get("destination", "")
+        dates = parsed.get("dates", "")
+        budget = _to_number_or_blank(parsed.get("budget", 0))
+        notes = parsed.get("notes", "")
+        if destination:
+            add_trip_plan(destination, dates, budget, notes)
+        await safe_answer(message, reply or "Записала поездку.")
+        return
+
+    if intent == "get_trips":
+        items = get_planned_trips()
+        if items:
+            lines = ["✈️ Запланированные поездки:"]
+            for item in items:
+                lines.append(
+                    f"- {item.get('destination')} ({item.get('dates')}): "
+                    f"{_format_currency(item.get('budget'))} тг"
+                )
+            await safe_answer(message, "\n".join(lines))
+        else:
+            await safe_answer(message, "Нет запланированных поездок.")
+        return
+
+    # ── ЛИМИТЫ ──
+    if intent == "get_limits":
+        current_limits = get_category_limits()
+        if current_limits:
+            lines = ["📊 Текущие лимиты:"]
+            for cat, limit in current_limits.items():
+                lines.append(f"- {cat}: {_format_currency(limit)} тг")
+            await safe_answer(message, "\n".join(lines))
+        else:
+            await safe_answer(message, "Лимиты не заданы.")
+        return
+
+    if intent == "generate_limits":
+        try:
+            new_limits = await generate_limits_from_history()
+            if new_limits:
+                lines = ["📊 Сгенерированные лимиты:"]
+                for cat, limit in new_limits.items():
+                    lines.append(f"- {cat}: {_format_currency(limit)} тг")
+                await safe_answer(message, "\n".join(lines))
+            else:
+                await safe_answer(message, "Недостаточно данных для генерации лимитов.")
+        except Exception as error:
+            print(f"[Лимиты] Ошибка генерации: {error}")
+            await safe_answer(message, "Не удалось сгенерировать лимиты.")
+        return
+
+    # ── СВОДКА И ДОХОДЫ ──
+    if intent == "get_summary":
+        now = datetime.datetime.now()
+        start = now.replace(day=1).strftime("%Y-%m-%d")
+        end = (now.replace(day=1) + datetime.timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
+        transactions = get_transactions_for_period(start, end)
+        total_income = 0.0
+        total_expense = 0.0
+        by_category = {}
+        for t in transactions:
+            amt = _to_number_or_blank(t.get("amt"))
+            t_type = str(t.get("type") or TYPE_EXPENSE)
+            if t_type == TYPE_INCOME:
+                total_income += amt
+            else:
+                total_expense += amt
+                cat = str(t.get("cat") or "Прочее")
+                by_category[cat] = by_category.get(cat, 0) + amt
+        lines = [f"📊 Сводка за {now.strftime('%B %Y')}:"]
+        lines.append(f"💰 Доходы: {_format_currency(total_income)} тг")
+        lines.append(f"💸 Расходы: {_format_currency(total_expense)} тг")
+        lines.append(f"📈 Баланс: {_format_currency(total_income - total_expense)} тг")
+        lines.append("")
+        lines.append("📉 По категориям:")
+        for cat, amt in sorted(by_category.items(), key=lambda x: -x[1]):
+            lines.append(f"  - {cat}: {_format_currency(amt)} тг")
+        await safe_answer(message, "\n".join(lines))
+        return
+
+    if intent == "get_income":
+        now = datetime.datetime.now()
+        start = now.replace(day=1).strftime("%Y-%m-%d")
+        end = (now.replace(day=1) + datetime.timedelta(days=32)).replace(day=1).strftime("%Y-%m-%d")
+        transactions = get_transactions_for_period(start, end)
+        incomes = [t for t in transactions if str(t.get("type")) == TYPE_INCOME]
+        total = sum(_to_number_or_blank(t.get("amt")) for t in incomes)
+        lines = [f"💰 Доходы за {now.strftime('%B %Y')}: {_format_currency(total)} тг"]
+        for t in incomes:
+            lines.append(f"  - {t.get('cat')}: {_format_currency(t.get('amt'))} тг ({t.get('comm')})")
+        await safe_answer(message, "\n".join(lines))
+        return
+
+    # ── ПОГОДА ──
+    if intent == "get_weather":
+        forecast = await get_weather_forecast()
+        if forecast:
+            await safe_answer(message, forecast)
+        else:
+            await safe_answer(message, "Не удалось получить прогноз погоды.")
+        return
+
+    # ── УДАЛЕНИЕ ТРАНЗАКЦИИ ──
+    if intent == "delete_transaction":
+        query = parsed.get("search_query", "")
+        if query:
+            delete_record_by_keyword("Transactions", query)
+        await safe_answer(message, reply or "Удалила запись.")
+        return
+
+    # ── ОБЫЧНЫЙ ЧАТ ──
+    await safe_answer(message, reply or "Чем могу помочь?")
