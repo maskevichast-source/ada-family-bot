@@ -75,7 +75,7 @@ def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
         "✍️ **Записано:**",
         f"• {amt} {curr} | {bank_source} | {cat}{comm_str}",
     ]
-    if ai_comment:
+    if ai_comment and "задумалась" not in ai_comment.lower():
         lines.append(f"\n💬 {ai_comment}")
     return "\n".join(lines)
 
@@ -247,6 +247,12 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, "Формат: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>")
         return
 
+    # Индикатор «Ада печатает...»
+    try:
+        await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+    except Exception:
+        pass
+
     # 6. Запрос к DeepSeek
     history = get_last_200_transactions()
     limits = get_category_limits()
@@ -289,9 +295,18 @@ async def _process_text_message(message: Message, text: str):
         tx["user"] = user_name
         tx["user_comment"] = text
 
+        # Санитарная очистка текста над кнопками (убираем аварийные фразы)
+        amt_str = _format_currency(tx.get("amount", 0))
+        curr = tx.get("currency", "KZT")
+        res_label = ", наличные" if tx.get("resource") == "Наличные" else ""
+
+        if not reply or any(bad in reply.lower() for bad in ["задумалась", "повтори", "на связи", "ошибка"]):
+            prompt_text = f"Куда запишем эту покупку ({amt_str} {curr}{res_label})?"
+        else:
+            prompt_text = reply
+
         kb = _build_clarification_keyboard(ambig_options)
         set_clarification(chat_id, tx, ambig_options)
-        prompt_text = reply or "Уточни, куда записать эту покупку:"
         add_chat_message(chat_id, "Ада", prompt_text)
         await message.answer(prompt_text, reply_markup=kb)
         return
