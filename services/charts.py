@@ -13,7 +13,6 @@ from services.categories import TYPE_EXPENSE, TYPE_INCOME
 
 
 def _parse_date(date_str: str) -> datetime:
-    """Парсинг даты из строки таблицы."""
     try:
         return datetime.strptime(str(date_str), "%Y-%m-%d %H:%M:%S")
     except (ValueError, TypeError):
@@ -24,7 +23,6 @@ def _parse_date(date_str: str) -> datetime:
 
 
 def _group_by_day(transactions: list) -> dict:
-    """Группировка расходов по дням."""
     daily = defaultdict(float)
     for t in transactions:
         if str(t.get("type")) != TYPE_EXPENSE:
@@ -39,7 +37,6 @@ def _group_by_day(transactions: list) -> dict:
 
 
 def _group_by_category(transactions: list) -> dict:
-    """Группировка расходов по категориям."""
     cats = defaultdict(float)
     for t in transactions:
         if str(t.get("type")) != TYPE_EXPENSE:
@@ -53,23 +50,7 @@ def _group_by_category(transactions: list) -> dict:
     return dict(sorted(cats.items(), key=lambda x: -x[1]))
 
 
-def _group_by_subcategory(transactions: list) -> dict:
-    """Группировка расходов по подкатегориям."""
-    subs = defaultdict(float)
-    for t in transactions:
-        if str(t.get("type")) != TYPE_EXPENSE:
-            continue
-        try:
-            amt = float(str(t.get("amt", 0)).replace(",", "."))
-            sub = str(t.get("subcat") or "Прочее")
-            subs[sub] += amt
-        except (ValueError, TypeError):
-            pass
-    return dict(sorted(subs.items(), key=lambda x: -x[1]))
-
-
 def _group_by_necessity(transactions: list) -> dict:
-    """Need vs Want."""
     nec = defaultdict(float)
     for t in transactions:
         if str(t.get("type")) != TYPE_EXPENSE:
@@ -84,7 +65,6 @@ def _group_by_necessity(transactions: list) -> dict:
 
 
 def _group_by_user(transactions: list) -> dict:
-    """Расходы по пользователям."""
     users = defaultdict(float)
     for t in transactions:
         if str(t.get("type")) != TYPE_EXPENSE:
@@ -99,7 +79,6 @@ def _group_by_user(transactions: list) -> dict:
 
 
 def _income_vs_expense(transactions: list) -> tuple[float, float]:
-    """Сумма доходов и расходов."""
     income = 0.0
     expense = 0.0
     for t in transactions:
@@ -115,7 +94,6 @@ def _income_vs_expense(transactions: list) -> tuple[float, float]:
 
 
 def _get_month_range(year: int, month: int) -> tuple[str, str]:
-    """Вернуть начало и конец месяца в формате YYYY-MM-DD."""
     start = datetime(year, month, 1)
     if month == 12:
         end = datetime(year + 1, 1, 1)
@@ -125,9 +103,6 @@ def _get_month_range(year: int, month: int) -> tuple[str, str]:
 
 
 def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
-    """Создать комплексный дашборд расходов (6 графиков на одном изображении).
-    Размер: 1600x1200 px — оптимально для Telegram и Power BI.
-    """
     now = datetime.now()
     year = year or now.year
     month = month or now.month
@@ -171,7 +146,7 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
         fontsize=18, fontweight='bold', color=COLORS['text'], y=0.98
     )
 
-    # 1. Круговая диаграмма по категориям (топ-8)
+    # 1. Круговая диаграмма по категориям (Защита от нулевой суммы)
     ax1 = fig.add_subplot(2, 3, 1)
     ax1.set_facecolor(COLORS['bg'])
     top_cats = list(by_cat.items())[:8]
@@ -183,10 +158,13 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
     values1 = [v for _, v in top_cats]
     colors1 = COLORS['primary'][:len(labels1)]
 
-    ax1.pie(
-        values1, labels=labels1, autopct=lambda pct: f'{pct:.1f}%' if pct > 3 else '',
-        colors=colors1, startangle=90, textprops={'color': COLORS['text'], 'fontsize': 8}
-    )
+    if sum(values1) > 0:
+        ax1.pie(
+            values1, labels=labels1, autopct=lambda pct: f'{pct:.1f}%' if pct > 3 else '',
+            colors=colors1, startangle=90, textprops={'color': COLORS['text'], 'fontsize': 8}
+        )
+    else:
+        ax1.text(0.5, 0.5, "Трат пока нет", color=COLORS['text'], ha='center', va='center')
     ax1.set_title('Расходы по категориям', color=COLORS['text'], fontsize=12, pad=10)
 
     # 2. Столбчатая диаграмма по дням
@@ -236,7 +214,7 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
             color=COLORS['text'], fontsize=9, fontweight='bold'
         )
 
-    # 4. Сравнение с лимитами (горизонтальные столбцы)
+    # 4. Сравнение с лимитами
     ax4 = fig.add_subplot(2, 3, 4)
     ax4.set_facecolor(COLORS['bg'])
     limit_data = []
@@ -300,7 +278,7 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
         color=balance_color, fontsize=11, fontweight='bold'
     )
 
-    # 6. Расходы по пользователям
+    # 6. Расходы по пользователям (Защита от нулевой суммы)
     ax6 = fig.add_subplot(2, 3, 6)
     ax6.set_facecolor(COLORS['bg'])
     if by_user:
@@ -308,10 +286,13 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
         user_vals = list(by_user.values())
         colors6 = COLORS['primary'][:len(user_names)]
 
-        ax6.pie(
-            user_vals, labels=user_names, autopct='%1.1f%%',
-            colors=colors6, startangle=90, textprops={'color': COLORS['text'], 'fontsize': 9}
-        )
+        if sum(user_vals) > 0:
+            ax6.pie(
+                user_vals, labels=user_names, autopct='%1.1f%%',
+                colors=colors6, startangle=90, textprops={'color': COLORS['text'], 'fontsize': 9}
+            )
+        else:
+            ax6.text(0.5, 0.5, "Трат пока нет", color=COLORS['text'], ha='center', va='center')
         ax6.set_title('Кто сколько потратил', color=COLORS['text'], fontsize=12, pad=10)
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
@@ -324,7 +305,6 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
 
 
 def generate_trend_chart(months_back: int = 3) -> bytes | None:
-    """График тренда расходов по месяцам."""
     now = datetime.now()
     monthly_data = defaultdict(float)
 
