@@ -39,6 +39,7 @@ from services.pending_clarifications import (
     set_clarification, has_clarification, pop_clarification, sweep_expired_clarifications,
 )
 from services.memory import get_chat_history, add_chat_message
+from services.voice import transcribe_voice
 
 
 def _to_number_or_blank(value):
@@ -131,9 +132,53 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def handle_text(message: Message):
-    text = message.text or ""
+    """Точка входа для обычных текстовых сообщений."""
+    await _process_text_message(message, message.text or "")
+
+
+async def handle_voice(message: Message):
+    """Голосовые и аудио-сообщения.
+
+    Сначала расшифровка через Whisper (services/voice.py), затем обработка
+    ТОЧНО как обычный текст — те же интенты, тот же флоу (см. dialogi-ada.md,
+    раздел 12 «Чеки, фото, голосовые»).
+    """
+    voice = message.voice or message.audio
+    if not voice:
+        return
+
+    try:
+        file = await message.bot.get_file(voice.file_id)
+        downloaded = await message.bot.download_file(file.file_path)
+        file_bytes = downloaded.read()
+    except Exception as e:
+        print(f"[Голос] Не удалось скачать файл: {e}")
+        await safe_answer(message, "Не удалось скачать голосовое сообщение. Попробуй ещё раз.")
+        return
+
+    # Telegram обычно отдаёт .oga — но берём реальное расширение файла,
+    # если оно есть, чтобы Whisper правильно определил формат.
+    ext = "oga"
+    if file.file_path and "." in file.file_path:
+        ext = file.file_path.rsplit(".", 1)[-1]
+
+    text = await transcribe_voice(file_bytes, filename=f"voice.{ext}")
+    if not text:
+        await safe_answer(
+            message,
+            "Не удалось распознать голосовое сообщение — попробуй ещё раз или напиши текстом."
+        )
+        return
+
+    # Показываем, что расшифровали — чтобы было видно, если Whisper понял не то
+    await safe_answer(message, f"🎤 «{text}»")
+    await _process_text_message(message, text)
+
+
+async def _process_text_message(message: Message, text: str):
+    """Общая логика обработки текста — используется и для текстовых, и для
+    расшифрованных голосовых сообщений."""
     user_name = message.from_user.first_name or "Пользователь"
-    user_id = message.from_user.id
     chat_id = message.chat.id
 
     # Сохраняем сообщение в историю чата
@@ -150,11 +195,6 @@ async def handle_text(message: Message):
                 append_transaction(tx)
             await safe_answer(message, f"Записала {len(transactions)} покупок с комментарием. Спасибо!")
             return
-
-    # ── Голосовые ──
-    if message.voice or message.audio:
-        await safe_answer(message, "Голосовые пока не поддерживаются. Пришли текстом.")
-        return
 
     # ── /debug ──
     if _is_debug_command(text):
@@ -542,6 +582,17 @@ async def handle_text(message: Message):
             await safe_answer(message, forecast)
         else:
             await safe_answer(message, "Не удалось получить прогноз погоды.")
+        return
+
+    # ── РАЗДЕЛИТЬ ТРАНЗАКЦИЮ (интент от ИИ) ──
+    if intent == "split_transaction":
+        # ИИ распознаёт намерение, но сам не считает части — просим точный
+        # формат команды (её парсит _is_split_command выше в этой функции).
+        await safe_answer(
+            message,
+            reply or "Чтобы разделить операцию, напиши: раздели транзакцию "
+            "<сумма>: <категория> — <сумма> | <категория> — <сумма>"
+        )
         return
 
     # ── УДАЛЕНИЕ ТРАНЗАКЦИИ ──
