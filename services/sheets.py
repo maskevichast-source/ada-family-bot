@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import gspread
+from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
 from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE
 from services.categories import TYPE_EXPENSE
@@ -28,7 +29,7 @@ def _table_range(num_columns: int) -> str:
     ширину таблицы, и все последующие append_row начинали писать со
     сдвигом вправо, а не с колонки A.
     """
-    return f"A1:{gspread.utils.rowcol_to_a1(1, num_columns)}"
+    return f"A1:{gspread_utils.rowcol_to_a1(1, num_columns)}"
 
 
 def _get_all_records_safe(ws):
