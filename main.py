@@ -7,8 +7,8 @@ import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
 
-from config import TELEGRAM_BOT_TOKEN
-from handlers.text_handler import handle_text, handle_category_clarification_callback
+from config import TELEGRAM_BOT_TOKEN, FAMILY_CHAT_ID
+from handlers.text_handler import handle_text, handle_voice, handle_category_clarification_callback
 from handlers.media_handler import handle_media
 from services.sheets import (
     get_pending_reminders, mark_reminder_done, get_active_subscriptions,
@@ -108,10 +108,12 @@ async def process_category_clarification(callback: types.CallbackQuery):
 async def handle_all_messages(message: types.Message):
     if message.photo or message.document:
         await handle_media(message)
+    elif message.voice or message.audio:
+        await handle_voice(message)
     elif message.text:
         await handle_text(message)
     else:
-        await safe_answer(message, "Я понимаю только текст, фото и PDF.")
+        await safe_answer(message, "Я понимаю текст, фото, PDF и голосовые.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -130,12 +132,18 @@ async def check_reminders():
                         str(rem.get("remind_at")), "%Y-%m-%d %H:%M:%S"
                     ).replace(tzinfo=ASTANA_TZ)
                     if now >= rem_time:
-                        target_user = str(rem.get("target_user", ""))
+                        target_user = str(rem.get("target_user", "")) or "Семья"
                         text = str(rem.get("text", ""))
                         recurrence = str(rem.get("recurrence", "once"))
                         remind_at = str(rem.get("remind_at", ""))
                         row_idx = rem.get("row_idx", 0)
-                        # TODO: реализовать mapping user_name -> chat_id для отправки
+                        try:
+                            await safe_send_message(
+                                bot, chat_id=FAMILY_CHAT_ID,
+                                text=f"⏰ Напоминание для {target_user}: {text}"
+                            )
+                        except Exception as send_err:
+                            print(f"[Напоминания] Не удалось отправить: {send_err}")
                         mark_reminder_done(row_idx, recurrence, remind_at)
                 except Exception as e:
                     print(f"[Напоминания] Ошибка обработки: {e}")
