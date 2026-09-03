@@ -123,7 +123,6 @@ def append_transaction(data: dict):
 
 
 def ensure_power_bi_dimension_table():
-    """Создаёт лист Dim_Categories со строго уникальными категориями (связь 1:* для Power BI)."""
     try:
         db = get_db()
         try:
@@ -199,7 +198,6 @@ def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
 
 
 def find_recent_duplicate_transaction(amount, comment: str = "", minutes: int = 5):
-    """Ищет дубли только при совпадении суммы И похожего комментария за последние 5 минут."""
     try:
         target = to_clean_number(amount)
         if not target:
@@ -229,7 +227,7 @@ def find_recent_duplicate_transaction(amount, comment: str = "", minutes: int = 
 
 
 def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from_recent: bool = True):
-    """Умное удаление: понимает фразы 'последняя', 'крайняя' и удаляет именно последнюю строку."""
+    """Точное удаление: all() для всех ключевых слов, защита от удаления чужих записей."""
     try:
         ws = get_db().worksheet(worksheet_name)
         records = _get_all_records_safe(ws)
@@ -251,7 +249,9 @@ def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from
         for idx, r in reversed(indexed_records):
             row_values = [str(v) for v in r.values()]
             row_str = " ".join(row_values).lower()
-            matched = any(k in row_str for k in specific_keywords) if specific_keywords else False
+
+            # ИСПРАВЛЕНИЕ: строго all(), чтобы совпадали ВСЕ уточнения (например "такси" И "2500")
+            matched = all(k in row_str for k in specific_keywords) if specific_keywords else False
             if not matched and query_digits:
                 matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
             if matched:
@@ -299,7 +299,7 @@ def find_and_update_record(worksheet_name: str, search_query, field, new_value, 
         for idx, r in reversed(indexed_records):
             row_values = [str(v) for v in r.values()]
             row_str = " ".join(row_values).lower()
-            matched = any(k in row_str for k in specific_keywords) if specific_keywords else False
+            matched = all(k in row_str for k in specific_keywords) if specific_keywords else False
             if not matched and query_digits:
                 matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
             if matched:
@@ -312,7 +312,6 @@ def find_and_update_record(worksheet_name: str, search_query, field, new_value, 
 
 
 def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = ""):
-    """Переносит не только daily, но и monthly напоминания ровно на месяц вперёд."""
     try:
         ws = get_db().worksheet("Reminders")
         rec_norm = str(recurrence or "once").lower()
@@ -395,6 +394,105 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
         return False
 
 
+# --- ПОДПИСКИ С ЗАЩИТОЙ ОТ ПРОПУСКОВ И ЗАДВОЕНИЙ ---
+def process_due_subscriptions(now: datetime.datetime) -> list:
+    """Проверяет и списывает подписки с проверкой last_paid — исключает пропуск месяца при рестартах."""
+    due_processed = []
+    try:
+        ws = get_db().worksheet("Subscriptions")
+        records = _get_all_records_safe(ws)
+        current_month_prefix = now.strftime("%Y-%m")
+        today_str = now.strftime("%Y-%m-%d")
+
+        for idx, r in enumerate(records, start=2):
+            if str(r.get("status")).lower() != "active":
+                continue
+
+            try:
+                day = int(parse_amount(r.get("day_of_month", 1)))
+                last_paid = str(r.get("last_paid", ""))
+
+                # Если день оплаты уже наступил, а в этом месяце списания ещё не было
+                if now.day >= day and not last_paid.startswith(current_month_prefix):
+                    amt = parse_amount(r.get("amount", 0))
+                    name = str(r.get("name", "Подписка"))
+                    bank = str(r.get("bank", "Не указан"))
+
+                    append_transaction({
+                        "type": "РАСХОД",
+                        "amount": amt,
+                        "currency": "KZT",
+                        "bank": bank,
+                        "source": "Основная карта",
+                        "funds_type": "Собственные",
+                        "resource": "Карта",
+                        "category": "Связь и подписки",
+                        "subcategory": "Цифровые подписки и сервисы",
+                        "merchant": name,
+                        "necessity": "Want",
+                        "user_comment": f"Автосписание: {name}",
+                        "ai_comment": f"Ежемесячная подписка {name}",
+                    })
+
+                    ws.update_cell(idx, 6, today_str)
+                    due_processed.append(name)
+            except Exception as e:
+                print(f"[Подписки] Ошибка строки {idx}: {e}")
+
+    except Exception as e:
+        print(f"[Подписки] Ошибка цикла: {e}")
+    return due_processed
+
+
+def get_category_limits():
+    """Безопасное чтение лимитов с очисткой любых пробелов и запятых."""
+    try:
+        ws = get_db().worksheet("Limits")
+        records = _get_all_records_safe(ws)
+        limits = {}
+        for r in records:
+            cat = str(r.get("category", "")).strip()
+            if cat:
+                # ИСПРАВЛЕНИЕ: parse_amount вместо сырого float()
+                limits[cat] = parse_amount(r.get("limit_amount", 0))
+        return limits
+    except Exception as e:
+        print(f"[Лимиты] Ошибка: {e}")
+        return {}
+
+
+def save_category_limits(new_limits: dict):
+    try:
+        db = get_db()
+        try:
+            ws = db.worksheet("Limits")
+        except Exception:
+            ws = db.add_worksheet(title="Limits", rows=20, cols=2)
+            ws.append_row(["category", "limit_amount"])
+        ws.clear()
+        ws.append_row(["category", "limit_amount"])
+        for cat, limit in new_limits.items():
+            ws.append_row([str(cat), parse_amount(limit)], table_range=_table_range(2))
+    except Exception as e:
+        print(f"[Лимиты] Ошибка сохранения: {e}")
+
+
+def get_installments():
+    try:
+        ws = _get_or_create_installments_sheet()
+        records = _get_all_records_safe(ws)
+        items = []
+        for r in records:
+            if str(r.get("status", "active")).lower() not in {"closed", "done", "завершена"}:
+                r["total_amount"] = parse_amount(r.get("total_amount", 0))
+                r["monthly_payment"] = parse_amount(r.get("monthly_payment", 0))
+                items.append(r)
+        return items
+    except Exception as error:
+        print(f"[Рассрочки] Ошибка: {error}")
+        return []
+
+
 INSTALLMENT_COLUMNS = ["id", "date", "user", "bank", "kind", "description", "total_amount", "monthly_payment", "payments_count", "next_payment", "status"]
 INSTALLMENT_STATUS_COLUMN = INSTALLMENT_COLUMNS.index("status") + 1
 
@@ -410,15 +508,6 @@ def _get_or_create_installments_sheet():
         ws.append_row(INSTALLMENT_COLUMNS)
     return ws
 
-def get_installments():
-    try:
-        ws = _get_or_create_installments_sheet()
-        records = _get_all_records_safe(ws)
-        return [r for r in records if str(r.get("status", "active")).lower() not in {"closed", "done", "завершена"}]
-    except Exception as error:
-        print(f"[Рассрочки] Ошибка: {error}")
-        return []
-
 def add_installment(data: dict | None = None, **kwargs):
     payload = dict(data or {})
     payload.update(kwargs)
@@ -432,8 +521,8 @@ def add_installment(data: dict | None = None, **kwargs):
             "bank": payload.get("bank") or "Kaspi",
             "kind": payload.get("kind") or payload.get("type") or "Рассрочка",
             "description": payload.get("description") or payload.get("merchant") or "Рассрочка",
-            "total_amount": payload.get("total_amount", payload.get("amount", "")),
-            "monthly_payment": payload.get("monthly_payment", ""),
+            "total_amount": parse_amount(payload.get("total_amount", payload.get("amount", 0))),
+            "monthly_payment": parse_amount(payload.get("monthly_payment", 0)),
             "payments_count": payload.get("payments_count", ""),
             "next_payment": payload.get("next_payment", ""),
             "status": payload.get("status") or "active",
@@ -447,30 +536,6 @@ def add_installment(data: dict | None = None, **kwargs):
 def close_installment(search_query: str) -> bool:
     return find_and_update_record("Installments", search_query, INSTALLMENT_STATUS_COLUMN, "closed", search_from_recent=True)
 
-def get_category_limits():
-    try:
-        ws = get_db().worksheet("Limits")
-        records = _get_all_records_safe(ws)
-        return {str(r.get("category")).strip(): float(r.get("limit_amount", 0)) for r in records if r.get("category")}
-    except Exception as e:
-        print(f"[Лимиты] Ошибка: {e}")
-        return {}
-
-def save_category_limits(new_limits: dict):
-    try:
-        db = get_db()
-        try:
-            ws = db.worksheet("Limits")
-        except Exception:
-            ws = db.add_worksheet(title="Limits", rows=20, cols=2)
-            ws.append_row(["category", "limit_amount"])
-        ws.clear()
-        ws.append_row(["category", "limit_amount"])
-        for cat, limit in new_limits.items():
-            ws.append_row([str(cat), float(limit)], table_range=_table_range(2))
-    except Exception as e:
-        print(f"[Лимиты] Ошибка сохранения: {e}")
-
 def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month: int):
     try:
         ws = get_db().worksheet("Subscriptions")
@@ -479,13 +544,13 @@ def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month
         today_str = now.strftime("%Y-%m-%d")
         for idx, r in enumerate(records, start=2):
             if str(r.get("name")).lower() == name.lower():
-                ws.update_cell(idx, 3, amount)
+                ws.update_cell(idx, 3, parse_amount(amount))
                 ws.update_cell(idx, 5, day_of_month)
                 ws.update_cell(idx, 6, today_str)
                 ws.update_cell(idx, 7, "active")
                 return
         sub_id = f"SUB_{now.strftime('%Y%m%d_%H%M%S')}"
-        ws.append_row([sub_id, name, amount, bank, day_of_month, today_str, "active"], table_range=_table_range(7))
+        ws.append_row([sub_id, name, parse_amount(amount), bank, day_of_month, today_str, "active"], table_range=_table_range(7))
     except Exception as e:
         print(f"[Подписки] Ошибка: {e}")
 
@@ -517,7 +582,7 @@ def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
         ws = get_db().worksheet("Trips")
         now = datetime.datetime.now(ASTANA_TZ)
         trip_id = f"TRIP_{now.strftime('%Y%m%d_%H%M%S')}"
-        ws.append_row([trip_id, destination, dates, budget, notes, "planned"], table_range=_table_range(6))
+        ws.append_row([trip_id, destination, dates, parse_amount(budget), notes, "planned"], table_range=_table_range(6))
     except Exception as e:
         print(f"[Поездки] Ошибка: {e}")
 
