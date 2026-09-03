@@ -5,13 +5,15 @@ import gspread
 from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
 from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE
-from services.categories import TYPE_EXPENSE
+from services.categories import TYPE_EXPENSE, SUBCATEGORIES_MAP
 from services.money import parse_amount, to_clean_number
 from services.banks import normalize_bank_source
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-
 ASTANA_TZ = datetime.timezone(datetime.timedelta(hours=5), name="Asia/Astana")
+
+_cached_client = None
+_cached_db = None
 
 
 def _digits_only(text) -> str:
@@ -19,32 +21,10 @@ def _digits_only(text) -> str:
 
 
 def _table_range(num_columns: int) -> str:
-    """"A1:<last_col>1" для заданного числа колонок.
-
-    Передаётся в append_row(..., table_range=...), чтобы Google Sheets
-    API не пытался сам "угадывать" границы таблицы. Без этого при
-    определённых обстоятельствах (например, если в какой-то строке
-    случайно оказались данные в колонках правее ожидаемых — как один
-    раз уже случилось с Transactions) API мог "расширить" определяемую
-    ширину таблицы, и все последующие append_row начинали писать со
-    сдвигом вправо, а не с колонки A.
-    """
     return f"A1:{gspread_utils.rowcol_to_a1(1, num_columns)}"
 
 
 def _get_all_records_safe(ws):
-    """Как ws.get_all_records(), но без строгой проверки заголовков на дубли/пустоту.
-
-    Подтверждённая причина бага "графики всегда пустые": ws.get_all_records()
-    требует, чтобы ВСЕ заголовки в строке 1 были уникальными и непустыми, и
-    кидает исключение, если это не так. Однажды в таблицу попали лишние
-    данные правее нужных 16 колонок (баг с "уехавшей" таблицей), из-за чего
-    строка заголовков получила несколько пустых ячеек — и ЛЮБОЕ чтение
-    таблицы стало падать целиком, включая графики, сводки, поиск дублей и
-    саму диагностику /debug. Эта функция просто сопоставляет строку 1 с
-    остальными строками как есть, без такой проверки, и не ломается от
-    лишних/пустых заголовков правее нужных колонок.
-    """
     all_values = ws.get_all_values()
     if not all_values:
         return []
@@ -55,28 +35,15 @@ def _get_all_records_safe(ws):
         records.append(dict(zip(headers, padded)))
     return records
 
-_cached_client = None
-_cached_db = None
 
 def _load_google_credentials():
-    """Загрузить сервисный ключ Google — из переменной окружения (для облачного
-    хостинга вроде Railway, где нет удобной загрузки файлов) или из файла
-    (для Replit/локального запуска, как раньше).
-
-    Приоритет: если задана переменная окружения GOOGLE_CREDENTIALS_JSON
-    (весь credentials.json одной строкой) — используем её. Иначе — старое
-    поведение, файл по пути CREDENTIALS_FILE.
-    """
     raw_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
     if raw_json:
         try:
             info = json.loads(raw_json)
             return ServiceAccountCredentials.from_json_keyfile_dict(info, scope)
-        except (json.JSONDecodeError, ValueError) as error:
-            raise RuntimeError(
-                "GOOGLE_CREDENTIALS_JSON задан, но не разбирается как JSON — "
-                "проверь, что скопирован весь файл credentials.json целиком."
-            ) from error
+        except Exception as error:
+            raise RuntimeError("GOOGLE_CREDENTIALS_JSON задан некорректно.") from error
     return ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
 
 
@@ -90,28 +57,24 @@ def get_db():
         else:
             _cached_db.title
     except Exception as e:
-        print(f"[Google Таблицы] Ошибка переподключения: {e}")
+        print(f"[Google Таблицы] Переподключение: {e}")
         creds = _load_google_credentials()
         _cached_client = gspread.authorize(creds)
         _cached_db = _cached_client.open_by_key(GOOGLE_SHEETS_KEY)
     return _cached_db
 
+
 def normalize_necessity(raw, category=None):
-    """Приводит necessity к стандартным Need / Want."""
     if not raw:
         return "Want"
     s = str(raw).strip().lower()
-    if s in ("need", "нужно", "нужное", "обязательно", "must", "need"):
+    if s in ("need", "нужно", "нужное", "обязательно", "must"):
         return "Need"
-    if s in ("want", "хочу", "необязательно", "optional", "luxury", "want"):
-        return "Want"
     return "Want"
 
 
-# --- ТРАНЗАКЦИИ И АНАЛИТИКА ---
 def append_transaction(data: dict):
     now = datetime.datetime.now(ASTANA_TZ)
-
     raw_amount = data.get("amount", 0)
     amount = parse_amount(raw_amount)
     if amount == int(amount):
@@ -127,24 +90,17 @@ def append_transaction(data: dict):
     if not data.get("type") or str(data.get("type")).strip() == "":
         data["type"] = TYPE_EXPENSE
 
-    # Раньше эти поля молча оставались пустыми, если ИИ их не прислал —
-    # отсюда пустые ячейки валюты/банка на части записей.
     if not data.get("currency"):
         data["currency"] = "KZT"
 
-    # Частая путаница у ИИ: "Наличные" — это способ оплаты (resource),
-    # а не банк. Если "Наличные" всё же попало в bank, переносим его в
-    # resource и не оставляем как есть в bank.
     bank_value = str(data.get("bank") or "").strip()
     if bank_value.lower() in ("наличные", "нал", "cash"):
-        if not data.get("resource"):
-            data["resource"] = "Наличные"
-        data["bank"] = ""
+        data["resource"] = "Наличные"
+        data["bank"] = "Не указан"
 
     if not data.get("bank"):
         data["bank"] = "Не указан"
-    # Ловит случаи вроде source="Kaspi.kz" (название магазина из текста
-    # пользователя, а не способ оплаты) — приводит к нормальному "Kaspi Gold".
+
     data["source"] = normalize_bank_source(data.get("bank"), data.get("source"))
     if not data.get("funds_type"):
         data["funds_type"] = "Собственные"
@@ -164,58 +120,49 @@ def append_transaction(data: dict):
     except Exception as e:
         print(f"[Транзакции] Не удалось добавить запись: {e}")
 
-def debug_transactions_snapshot(limit: int = 6) -> str:
-    """Диагностический снимок листа Transactions — для команды /debug.
 
-    Показывает то, что РЕАЛЬНО видит код: сколько всего строк, сколько
-    из них считаются "настоящими" (есть transaction_id), заголовки и
-    сырые значения последних записей — включая ТИП значения даты
-    (str/datetime), потому что именно скрытая смена типа/формата ячейки
-    один раз уже ломала фильтрацию по месяцу молча, без единой ошибки.
-    """
+def ensure_power_bi_dimension_table():
+    """Создаёт или обновляет лист Dim_Categories для связи в Power BI (Звезда)."""
+    try:
+        db = get_db()
+        try:
+            ws = db.worksheet("Dim_Categories")
+        except Exception:
+            ws = db.add_worksheet(title="Dim_Categories", rows=100, cols=3)
+
+        rows = [["category", "subcategory", "full_key"]]
+        for cat, subs in SUBCATEGORIES_MAP.items():
+            for sub in subs:
+                rows.append([cat, sub, f"{cat} - {sub}"])
+
+        ws.clear()
+        ws.update("A1", rows)
+    except Exception as e:
+        print(f"[PowerBI Dimension] Ошибка создания справочника: {e}")
+
+
+def debug_transactions_snapshot(limit: int = 6) -> str:
     try:
         ws = get_db().worksheet("Transactions")
-        all_values = ws.get_all_values()
         records = _get_all_records_safe(ws)
         non_empty = [r for r in records if str(r.get("transaction_id", "")).strip()]
-        now = datetime.datetime.now(ASTANA_TZ)
-        current_month = now.strftime("%Y-%m")
-
         lines = [
-            f"Всего строк в get_all_records(): {len(records)}",
-            f"Из них с непустым transaction_id: {len(non_empty)}",
-            f"Текущий месяц (фильтр графика/сводки): {current_month}",
-            f"Заголовки (строка 1): {all_values[0] if all_values else '—'}",
+            f"Всего строк в таблице: {len(records)}",
+            f"Непустых записей: {len(non_empty)}",
             "",
-            "Последние записи (что реально прочитано):",
+            "Последние записи:",
         ]
         for r in non_empty[-limit:]:
-            date_val = r.get("date")
-            lines.append(
-                f"- id={r.get('transaction_id')!r}\n"
-                f"  date={date_val!r} (тип: {type(date_val).__name__})\n"
-                f"  type={r.get('type')!r} amount={r.get('amount')!r} (тип: {type(r.get('amount')).__name__})\n"
-                f"  category={r.get('category')!r}"
-            )
+            lines.append(f"- {r.get('date')} | {r.get('user')} | {r.get('amount')} KZT | {r.get('category')} ({r.get('subcategory')})")
         return "\n".join(lines)
     except Exception as e:
-        return f"Ошибка при снятии диагностики: {e}"
+        return f"Ошибка снятия диагностики: {e}"
+
 
 def get_last_200_transactions():
-    """Последние 200 операций (расходы и доходы) — для контекста ИИ, графика и чата.
-
-    Для точных денежных подсчётов за конкретный период (месяц/неделя)
-    используйте get_transactions_for_period — здесь возможна потеря
-    старых записей при очень высокой активности (>200 операций за период).
-    """
     try:
         ws = get_db().worksheet("Transactions")
         records = _get_all_records_safe(ws)
-        # Google Sheets по умолчанию резервирует куда больше строк, чем реально
-        # используется — get_all_records() возвращает и эти пустые "хвостовые"
-        # строки тоже. Без фильтра срез "последние 200" мог целиком состоять
-        # из пустых строк вместо настоящих последних операций (из-за чего
-        # график/сводки показывали "данных нет" при полной таблице).
         non_empty = [r for r in records if str(r.get("transaction_id", "")).strip()]
         return [{
             "date": r.get("date"), "user": r.get("user"),
@@ -225,16 +172,11 @@ def get_last_200_transactions():
             "subcat": r.get("subcategory"), "nec": r.get("necessity"), "comm": r.get("user_comment")
         } for r in non_empty[-200:]]
     except Exception as e:
-        print(f"[Транзакции] Не удалось прочитать записи: {e}")
+        print(f"[Транзакции] Ошибка чтения: {e}")
         return []
 
-def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
-    """Все операции с датой в диапазоне [start_date, end_date) в формате YYYY-MM-DD.
 
-    В отличие от get_last_200_transactions читает ВСЮ таблицу и не
-    ограничена 200 последними строками — используйте для точных
-    сумм за месяц/неделю (сводки, дайджесты, лимиты).
-    """
+def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
     try:
         ws = get_db().worksheet("Transactions")
         records = _get_all_records_safe(ws)
@@ -252,16 +194,18 @@ def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
                 })
         return result
     except Exception as e:
-        print(f"[Транзакции] Не удалось прочитать период {start_date}–{end_date}: {e}")
+        print(f"[Транзакции] Ошибка чтения периода: {e}")
         return []
 
-# --- РАССРОЧКИ И KASPI RED ---
+
+# --- РАССРОЧКИ ---
 INSTALLMENT_COLUMNS = [
     "id", "date", "user", "bank", "kind", "description",
     "total_amount", "monthly_payment", "payments_count",
     "next_payment", "status",
 ]
-INSTALLMENT_STATUS_COLUMN = INSTALLMENT_COLUMNS.index("status") + 1  # 1-индексация для gspread
+INSTALLMENT_STATUS_COLUMN = INSTALLMENT_COLUMNS.index("status") + 1
+
 
 def _get_or_create_installments_sheet():
     db = get_db()
@@ -271,10 +215,10 @@ def _get_or_create_installments_sheet():
         ws = db.add_worksheet(title="Installments", rows=100, cols=len(INSTALLMENT_COLUMNS))
         ws.append_row(INSTALLMENT_COLUMNS)
         return ws
-
     if not ws.row_values(1):
         ws.append_row(INSTALLMENT_COLUMNS)
     return ws
+
 
 def get_installments():
     try:
@@ -285,8 +229,9 @@ def get_installments():
             if str(record.get("status", "active")).lower() not in {"closed", "done", "завершена"}
         ]
     except Exception as error:
-        print(f"[Рассрочки] Не удалось получить данные: {error}")
+        print(f"[Рассрочки] Ошибка: {error}")
         return []
+
 
 def add_installment(data: dict | None = None, **kwargs):
     payload = dict(data or {})
@@ -307,26 +252,29 @@ def add_installment(data: dict | None = None, **kwargs):
             "next_payment": payload.get("next_payment", ""),
             "status": payload.get("status") or "active",
         }
-        ws.append_row([str(values[column] or "") for column in INSTALLMENT_COLUMNS], table_range=_table_range(len(INSTALLMENT_COLUMNS)))
+        ws.append_row([str(values[c] or "") for c in INSTALLMENT_COLUMNS], table_range=_table_range(len(INSTALLMENT_COLUMNS)))
         return values
     except Exception as error:
-        print(f"[Рассрочки] Не удалось добавить запись: {error}")
+        print(f"[Рассрочки] Ошибка записи: {error}")
         return None
 
+
 def close_installment(search_query: str) -> bool:
-    """Отметить рассрочку/Kaspi Red как закрытую (выплаченную) по ключевому слову."""
     return find_and_update_record(
         "Installments", search_query, INSTALLMENT_STATUS_COLUMN, "closed", search_from_recent=True
     )
 
+
+# --- ЛИМИТЫ ---
 def get_category_limits():
     try:
         ws = get_db().worksheet("Limits")
         records = _get_all_records_safe(ws)
         return {str(r.get("category")).strip(): float(r.get("limit_amount", 0)) for r in records if r.get("category")}
     except Exception as e:
-        print(f"[Лимиты] Не удалось прочитать лимиты: {e}")
+        print(f"[Лимиты] Ошибка: {e}")
         return {}
+
 
 def save_category_limits(new_limits: dict):
     try:
@@ -336,51 +284,15 @@ def save_category_limits(new_limits: dict):
         except Exception:
             ws = db.add_worksheet(title="Limits", rows=20, cols=2)
             ws.append_row(["category", "limit_amount"])
-
         ws.clear()
         ws.append_row(["category", "limit_amount"])
-
         for cat, limit in new_limits.items():
             ws.append_row([str(cat), float(limit)], table_range=_table_range(2))
     except Exception as e:
-        print(f"[Лимиты] Не удалось сохранить лимиты: {e}")
+        print(f"[Лимиты] Ошибка сохранения: {e}")
 
-def get_current_month_spending_by_category(category_name: str) -> float:
-    """Сумма РАСХОДОВ (не доходов) по категории за текущий месяц."""
-    try:
-        ws = get_db().worksheet("Transactions")
-        records = _get_all_records_safe(ws)
-        now = datetime.datetime.now(ASTANA_TZ)
-        current_year_month = now.strftime("%Y-%m")
-
-        total = 0.0
-        for r in records:
-            date_str = str(r.get("date", ""))
-            if not date_str.startswith(current_year_month):
-                continue
-            if str(r.get("type") or TYPE_EXPENSE) != TYPE_EXPENSE:
-                continue
-            cat = str(r.get("category", "")).strip()
-            if cat.lower() == category_name.lower():
-                try:
-                    total += float(r.get("amount", 0))
-                except ValueError:
-                    pass
-        return total
-    except Exception as e:
-        print(f"[Лимиты] Не удалось посчитать расходы за месяц: {e}")
-        return 0.0
 
 def find_recent_duplicate_transaction(amount, minutes: int = 10):
-    """Проверить, не записывали ли уже такую же сумму совсем недавно.
-
-    Не блокирует запись — только предупреждает. Пригодится, когда одну и
-    ту же покупку записали дважды разными путями (например, сначала
-    текстом пуш-уведомления, потом тем же чеком-скриншотом) — раньше это
-    тихо создавало два ряда в таблице без единого намёка пользователю.
-
-    Возвращает похожую запись (dict) или None.
-    """
     try:
         target = to_clean_number(amount)
         if not target:
@@ -389,7 +301,6 @@ def find_recent_duplicate_transaction(amount, minutes: int = 10):
         records = _get_all_records_safe(ws)
         non_empty = [r for r in records if str(r.get("transaction_id", "")).strip()]
         now = datetime.datetime.now(ASTANA_TZ)
-
         for r in reversed(non_empty[-50:]):
             try:
                 r_amount = to_clean_number(r.get("amount"))
@@ -402,15 +313,15 @@ def find_recent_duplicate_transaction(amount, minutes: int = 10):
                 continue
         return None
     except Exception as e:
-        print(f"[Транзакции] Не удалось проверить на дубли: {e}")
+        print(f"[Транзакции] Ошибка поиска дублей: {e}")
         return None
 
-# --- РАЗДЕЛЕНИЕ ТРАНЗАКЦИИ СО СДВИГОМ ВНИЗ ---
+
+# --- РАЗДЕЛЕНИЕ ТРАНЗАКЦИЙ ---
 def split_last_transaction_by_amount(target_amount: float, part1_amt: float, part1_cat: str, part1_comm: str, part2_amt: float, part2_cat: str, part2_comm: str):
     try:
         ws = get_db().worksheet("Transactions")
         records = _get_all_records_safe(ws)
-
         target_idx = -1
         target_record = None
 
@@ -453,37 +364,18 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
         ws.insert_row(row2, target_idx + 2)
         return True
     except Exception as e:
-        print(f"[Транзакции] Не удалось разделить запись: {e}")
+        print(f"[Транзакции] Ошибка разделения: {e}")
         return False
 
-# --- УНИВЕРСАЛЬНЫЕ ПРАВКИ ---
+
+# --- УНИВЕРСАЛЬНЫЕ ПРАВКИ И УДАЛЕНИЕ ---
 def find_and_update_record(worksheet_name: str, search_query, field, new_value, search_from_recent: bool = True):
-    """Найти строку по ключевому слову/сумме и обновить одну ячейку.
-
-    'field' — это ИМЯ поля из заголовка листа (например "amount",
-    "category", "bank"), а не номер колонки: номер определяется САМ по
-    первой строке листа, чтобы ИИ не приходилось угадывать/хардкодить
-    номера столбцов. Можно передать и число напрямую — тогда оно
-    используется как есть.
-
-    По умолчанию ищет от САМОЙ СВЕЖЕЙ записи к самой старой
-    (search_from_recent=True), потому что в чате "исправь"/"удали" почти
-    всегда означает "то, что я только что записал". Если текстовое
-    совпадение не нашлось, а запрос похож на число — дополнительно
-    пробуем сравнить только цифры (устойчивее к разнице в форматировании
-    сумм, например "8,000" против "8000").
-
-    Возвращает НАЙДЕННУЮ (до правки) строку в виде dict, либо None, если
-    совпадений не найдено или колонку не удалось определить.
-    """
     try:
         ws = get_db().worksheet(worksheet_name)
         all_values = ws.get_all_values()
         if not all_values or len(all_values) <= 1:
             return None
-
         headers_lower = [str(h).strip().lower() for h in all_values[0]]
-
         col_idx = None
         if isinstance(field, int):
             col_idx = field
@@ -492,18 +384,14 @@ def find_and_update_record(worksheet_name: str, search_query, field, new_value, 
             if field_str.isdigit():
                 col_idx = int(field_str)
             else:
-                field_lower = field_str.lower()
-                if field_lower in headers_lower:
-                    col_idx = headers_lower.index(field_lower) + 1
-
+                if field_str.lower() in headers_lower:
+                    col_idx = headers_lower.index(field_str.lower()) + 1
         if not col_idx:
-            print(f"[Таблицы] Не удалось определить колонку «{field}» в {worksheet_name} (заголовки: {headers_lower})")
             return None
 
         records = _get_all_records_safe(ws)
-        search_query_lower = str(search_query).strip().lower()
-        query_digits = _digits_only(search_query_lower)
-
+        search_lower = str(search_query).strip().lower()
+        query_digits = _digits_only(search_lower)
         indexed_records = list(enumerate(records, start=2))
         if search_from_recent:
             indexed_records = list(reversed(indexed_records))
@@ -511,7 +399,7 @@ def find_and_update_record(worksheet_name: str, search_query, field, new_value, 
         for idx, r in indexed_records:
             row_values = [str(v) for v in r.values()]
             row_str = " ".join(row_values).lower()
-            matched = search_query_lower in row_str
+            matched = search_lower in row_str
             if not matched and query_digits:
                 matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
             if matched:
@@ -519,19 +407,16 @@ def find_and_update_record(worksheet_name: str, search_query, field, new_value, 
                 return r
         return None
     except Exception as e:
-        print(f"[Таблицы] Не удалось обновить запись в {worksheet_name}: {e}")
+        print(f"[Таблицы] Ошибка правки: {e}")
         return None
 
+
 def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from_recent: bool = True):
-    """Найти строку по ключевому слову (или по сумме) и удалить её. См. find_and_update_record
-    про порядок поиска, цифровое сравнение и про то, что возвращается удалённая строка
-    (или None), а не просто True/False."""
     try:
         ws = get_db().worksheet(worksheet_name)
         records = _get_all_records_safe(ws)
-        search_query_lower = str(search_query).strip().lower()
-        query_digits = _digits_only(search_query_lower)
-
+        search_lower = str(search_query).strip().lower()
+        query_digits = _digits_only(search_lower)
         indexed_records = list(enumerate(records, start=2))
         if search_from_recent:
             indexed_records = list(reversed(indexed_records))
@@ -539,7 +424,7 @@ def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from
         for idx, r in indexed_records:
             row_values = [str(v) for v in r.values()]
             row_str = " ".join(row_values).lower()
-            matched = search_query_lower in row_str
+            matched = search_lower in row_str
             if not matched and query_digits:
                 matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
             if matched:
@@ -547,17 +432,17 @@ def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from
                 return r
         return None
     except Exception as e:
-        print(f"[Таблицы] Не удалось удалить запись в {worksheet_name}: {e}")
+        print(f"[Таблицы] Ошибка удаления: {e}")
         return None
 
-# --- РЕГУЛЯРНЫЕ ПЛАТЕЖИ ---
+
+# --- ПОДПИСКИ ---
 def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month: int):
     try:
         ws = get_db().worksheet("Subscriptions")
         records = _get_all_records_safe(ws)
         now = datetime.datetime.now(ASTANA_TZ)
         today_str = now.strftime("%Y-%m-%d")
-
         for idx, r in enumerate(records, start=2):
             if str(r.get("name")).lower() == name.lower():
                 ws.update_cell(idx, 3, amount)
@@ -565,11 +450,11 @@ def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month
                 ws.update_cell(idx, 6, today_str)
                 ws.update_cell(idx, 7, "active")
                 return
-
         sub_id = f"SUB_{now.strftime('%Y%m%d_%H%M%S')}"
         ws.append_row([sub_id, name, amount, bank, day_of_month, today_str, "active"], table_range=_table_range(7))
     except Exception as e:
-        print(f"[Подписки] Не удалось обновить подписку: {e}")
+        print(f"[Подписки] Ошибка: {e}")
+
 
 def get_active_subscriptions():
     try:
@@ -577,15 +462,11 @@ def get_active_subscriptions():
         records = _get_all_records_safe(ws)
         return [r for r in records if str(r.get("status")).lower() == "active"]
     except Exception as e:
-        print(f"[Подписки] Не удалось прочитать подписки: {e}")
+        print(f"[Подписки] Ошибка чтения: {e}")
         return []
 
-def deactivate_subscription(name: str):
-    """Отметить подписку/регулярный платёж как отменённые (без удаления истории).
 
-    Возвращает найденную запись (dict) или None, если активной подписки
-    с таким именем не нашлось.
-    """
+def deactivate_subscription(name: str):
     try:
         ws = get_db().worksheet("Subscriptions")
         records = _get_all_records_safe(ws)
@@ -596,8 +477,9 @@ def deactivate_subscription(name: str):
                 return r
         return None
     except Exception as e:
-        print(f"[Подписки] Не удалось отменить подписку: {e}")
+        print(f"[Подписки] Ошибка отмены: {e}")
         return None
+
 
 # --- ПОЕЗДКИ ---
 def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
@@ -607,7 +489,8 @@ def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
         trip_id = f"TRIP_{now.strftime('%Y%m%d_%H%M%S')}"
         ws.append_row([trip_id, destination, dates, budget, notes, "planned"], table_range=_table_range(6))
     except Exception as e:
-        print(f"[Поездки] Не удалось добавить поездку: {e}")
+        print(f"[Поездки] Ошибка: {e}")
+
 
 def get_planned_trips():
     try:
@@ -615,10 +498,11 @@ def get_planned_trips():
         records = _get_all_records_safe(ws)
         return [r for r in records if str(r.get("status")).lower() == "planned"]
     except Exception as e:
-        print(f"[Поездки] Не удалось прочитать поездки: {e}")
+        print(f"[Поездки] Ошибка: {e}")
         return []
 
-# --- СПИСОК ПОКУПОК И НАПОМИНАНИЯ ---
+
+# --- СПИСОК ПОКУПОК ---
 def add_shopping_items(items: list, user_name: str):
     try:
         ws = get_db().worksheet("ShoppingList")
@@ -628,7 +512,8 @@ def add_shopping_items(items: list, user_name: str):
             item_id = f"SHOP_{now.strftime('%Y%m%d_%H%M%S')}"
             ws.append_row([item_id, now_str, user_name, item, "active"], table_range=_table_range(5))
     except Exception as e:
-        print(f"[Покупки] Не удалось добавить товары: {e}")
+        print(f"[Покупки] Ошибка: {e}")
+
 
 def get_shopping_items():
     try:
@@ -636,8 +521,9 @@ def get_shopping_items():
         records = _get_all_records_safe(ws)
         return [r for r in records if str(r.get("status")).lower() == "active"]
     except Exception as e:
-        print(f"[Покупки] Не удалось прочитать список: {e}")
+        print(f"[Покупки] Ошибка чтения: {e}")
         return []
+
 
 def mark_shopping_items_done(items_to_remove: list):
     try:
@@ -649,8 +535,10 @@ def mark_shopping_items_done(items_to_remove: list):
                     if item_name.lower() in str(r.get("item")).lower():
                         ws.update_cell(idx, 5, "done")
     except Exception as e:
-        print(f"[Покупки] Не удалось обновить список: {e}")
+        print(f"[Покупки] Ошибка отметки: {e}")
 
+
+# --- НАПОМИНАНИЯ ---
 def add_reminder(target_user: str, remind_at_str: str, text: str, recurrence: str = "once"):
     try:
         ws = get_db().worksheet("Reminders")
@@ -663,6 +551,7 @@ def add_reminder(target_user: str, remind_at_str: str, text: str, recurrence: st
     rem_id = f"REM_{now.strftime('%Y%m%d_%H%M%S')}"
     ws.append_row([rem_id, now_str, target_user, remind_at_str, text, "pending", recurrence], table_range=_table_range(7))
 
+
 def get_pending_reminders():
     try:
         ws = get_db().worksheet("Reminders")
@@ -674,8 +563,9 @@ def get_pending_reminders():
                 pending.append(r)
         return pending
     except Exception as e:
-        print(f"[Напоминания] Не удалось прочитать напоминания: {e}")
+        print(f"[Напоминания] Ошибка чтения: {e}")
         return []
+
 
 def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = ""):
     try:
@@ -686,9 +576,9 @@ def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = 
                 next_dt = old_dt + datetime.timedelta(days=1)
                 ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
             except Exception as dt_err:
-                print(f"[Напоминания] Не удалось перенести ежедневное напоминание: {dt_err}")
+                print(f"[Напоминания] Ошибка переноса: {dt_err}")
                 ws.update_cell(row_idx, 6, "sent")
         else:
             ws.update_cell(row_idx, 6, "sent")
     except Exception as e:
-        print(f"[Напоминания] Не удалось отметить напоминание: {e}")
+        print(f"[Напоминания] Ошибка завершения: {e}")
