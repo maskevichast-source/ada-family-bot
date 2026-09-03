@@ -1,6 +1,7 @@
 import datetime
 import json
 import os
+import re
 import gspread
 from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
@@ -122,7 +123,7 @@ def append_transaction(data: dict):
 
 
 def ensure_power_bi_dimension_table():
-    """Создаёт чистый лист Dim_Categories со строго УНИКАЛЬНЫМИ категориями для связи 1:* в Power BI."""
+    """Создаёт лист Dim_Categories со строго уникальными категориями (связь 1:* для Power BI)."""
     try:
         db = get_db()
         try:
@@ -217,7 +218,6 @@ def find_recent_duplicate_transaction(amount, comment: str = "", minutes: int = 
                 r_date = datetime.datetime.strptime(str(r.get("date")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=ASTANA_TZ)
                 if (now - r_date).total_seconds() <= minutes * 60:
                     r_comm = str(r.get("user_comment", "")).lower()
-                    # Если комментарий пустой или слова совпадают — это дубль
                     if not comm_clean or comm_clean in r_comm or r_comm in comm_clean:
                         return r
             except (ValueError, TypeError):
@@ -239,7 +239,6 @@ def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from
         search_lower = str(search_query or "").strip().lower()
         indexed_records = list(enumerate(records, start=2))
 
-        # Если пользователь просит удалить «последнюю/крайнюю» без конкретных слов
         is_generic_last = any(w in search_lower for w in ["последн", "крайн", "предыдущ", "last"]) or not search_lower
         specific_keywords = [w for w in re.findall(r'\w+', search_lower) if w not in ["удали", "удалить", "последнюю", "последний", "запись", "трату", "покупку"]]
 
@@ -248,7 +247,6 @@ def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from
             ws.delete_rows(last_idx)
             return last_rec
 
-        # Ищем совпадение снизу вверх (от самых свежих)
         query_digits = _digits_only(search_lower)
         for idx, r in reversed(indexed_records):
             row_values = [str(v) for v in r.values()]
@@ -289,7 +287,6 @@ def find_and_update_record(worksheet_name: str, search_query, field, new_value, 
         search_lower = str(search_query or "").strip().lower()
         indexed_records = list(enumerate(records, start=2))
 
-        # Проверка на «последнюю»
         is_generic_last = any(w in search_lower for w in ["последн", "крайн", "предыдущ", "last"]) or not search_lower
         specific_keywords = [w for w in re.findall(r'\w+', search_lower) if w not in ["поменяй", "измени", "последнюю", "последний", "запись", "трату"]]
 
@@ -315,7 +312,7 @@ def find_and_update_record(worksheet_name: str, search_query, field, new_value, 
 
 
 def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = ""):
-    """Корректно переносит не только daily, но и monthly напоминания на месяц вперёд."""
+    """Переносит не только daily, но и monthly напоминания ровно на месяц вперёд."""
     try:
         ws = get_db().worksheet("Reminders")
         rec_norm = str(recurrence or "once").lower()
@@ -331,7 +328,6 @@ def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = 
         elif rec_norm == "monthly" and remind_at:
             try:
                 old_dt = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M:%S")
-                # Перенос на 1 месяц вперед
                 new_month = old_dt.month + 1 if old_dt.month < 12 else 1
                 new_year = old_dt.year if old_dt.month < 12 else old_dt.year + 1
                 next_dt = old_dt.replace(year=new_year, month=new_month)
@@ -345,7 +341,6 @@ def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = 
         print(f"[Напоминания] Ошибка завершения: {e}")
 
 
-# --- РАЗДЕЛЕНИЕ ТРАНЗАКЦИЙ ---
 def split_last_transaction_by_amount(target_amount: float, part1_amt: float, part1_cat: str, part1_comm: str, part2_amt: float, part2_cat: str, part2_comm: str):
     try:
         ws = get_db().worksheet("Transactions")
@@ -377,7 +372,6 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
         base_merchant = target_record.get("merchant", "")
         base_necessity = target_record.get("necessity", "Want")
 
-        # Заполняем валидные подкатегории по умолчанию, чтобы не ломать Power BI
         from services.categories import validate_transaction_category_subcategory
         _, p1_sub = validate_transaction_category_subcategory(part1_cat, "")
         _, p2_sub = validate_transaction_category_subcategory(part2_cat, "")
@@ -401,7 +395,6 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
         return False
 
 
-# Оставшиеся служебные методы (рассрочки, лимиты, поездки)
 INSTALLMENT_COLUMNS = ["id", "date", "user", "bank", "kind", "description", "total_amount", "monthly_payment", "payments_count", "next_payment", "status"]
 INSTALLMENT_STATUS_COLUMN = INSTALLMENT_COLUMNS.index("status") + 1
 
