@@ -1,24 +1,27 @@
-"""Family Finance Bot — Ада."""
+"""Family Finance Bot — Ада (Main)."""
 
 import asyncio
 import datetime
-import os
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
+from aiogram.types import BufferedInputFile
 
 from config import TELEGRAM_BOT_TOKEN, FAMILY_CHAT_ID
-from handlers.text_handler import handle_text, handle_voice, handle_category_clarification_callback
+from handlers.text_handler import (
+    handle_text, handle_voice, handle_category_clarification_callback
+)
 from handlers.media_handler import handle_media
 from services.sheets import (
     get_pending_reminders, mark_reminder_done, get_active_subscriptions,
-    add_or_update_subscription, get_installments, get_transactions_for_period,
-    append_transaction, get_db,
+    add_or_update_subscription, append_transaction,
 )
 from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
 from services.pending_clarifications import sweep_expired_clarifications
 from services.timezone import ASTANA_TZ
+from services.weather import get_weather_forecast, get_tomorrow_forecast
+from services.charts import generate_expense_chart
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -71,12 +74,11 @@ async def cmd_help(message: types.Message):
 
 @dp.message(Command("chart"))
 async def cmd_chart(message: types.Message):
-    from services.charts import generate_expense_chart
-    import asyncio
     try:
         image_bytes = await asyncio.to_thread(generate_expense_chart)
         if image_bytes:
-            await message.answer_photo(photo=image_bytes, caption="📊 Вот твой финансовый дашборд.")
+            photo = BufferedInputFile(image_bytes, filename="chart.png")
+            await message.answer_photo(photo=photo, caption="📊 Вот твой финансовый дашборд.")
         else:
             await safe_answer(message, "Нет данных для построения графика.")
     except Exception as error:
@@ -91,18 +93,10 @@ async def cmd_debug(message: types.Message):
     await safe_answer(message, f"```\n{debug_text}\n```")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# INLINE KEYBOARD CALLBACK — уточнение категории
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@dp.callback_query(F.data.startswith("clarify_cat:"))
+@dp.callback_query(F.data.startswith("clarify_opt:"))
 async def process_category_clarification(callback: types.CallbackQuery):
     await handle_category_clarification_callback(callback)
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ОСНОВНОЙ ОБРАБОТЧИК СООБЩЕНИЙ
-# ═══════════════════════════════════════════════════════════════════════════════
 
 @dp.message()
 async def handle_all_messages(message: types.Message):
@@ -172,7 +166,7 @@ async def check_subscriptions():
                                 "funds_type": "Собственные",
                                 "resource": "Карта",
                                 "category": "Связь и подписки",
-                                "subcategory": "Цифровые подписки",
+                                "subcategory": "Цифровые подписки и сервисы",
                                 "merchant": str(sub.get("name", "")),
                                 "necessity": "Want",
                                 "user_comment": f"Автосписание: {sub.get('name')}",
@@ -189,6 +183,36 @@ async def check_subscriptions():
         except Exception as e:
             print(f"[Подписки] Ошибка цикла: {e}")
         await asyncio.sleep(60)
+
+
+async def weather_scheduler():
+    """Отправка утреннего прогноза в 08:30 и вечернего на завтра в 22:30."""
+    sent_morning_today = None
+    sent_evening_today = None
+
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            today_str = now.strftime("%Y-%m-%d")
+
+            # 08:30 — Утренний прогноз на сегодня
+            if now.hour == 8 and now.minute == 30 and sent_morning_today != today_str:
+                forecast = await get_weather_forecast()
+                if forecast:
+                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
+                    sent_morning_today = today_str
+
+            # 22:30 — Вечерний прогноз на завтра
+            if now.hour == 22 and now.minute == 30 and sent_evening_today != today_str:
+                forecast = await get_tomorrow_forecast()
+                if forecast:
+                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
+                    sent_evening_today = today_str
+
+        except Exception as e:
+            print(f"[Погода-Шедулер] Ошибка: {e}")
+
+        await asyncio.sleep(30)
 
 
 async def sweep_pending_receipts():
@@ -235,6 +259,7 @@ async def sweep_clarifications():
 async def main():
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
+    asyncio.create_task(weather_scheduler())
     asyncio.create_task(sweep_pending_receipts())
     asyncio.create_task(sweep_clarifications())
     await dp.start_polling(bot)
