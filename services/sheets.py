@@ -5,7 +5,7 @@ import gspread
 from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
 from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE
-from services.categories import TYPE_EXPENSE, SUBCATEGORIES_MAP
+from services.categories import TYPE_EXPENSE, SUBCATEGORIES_MAP, DEFAULT_EXPENSE_LIMITS
 from services.money import parse_amount, to_clean_number
 from services.banks import normalize_bank_source
 
@@ -122,18 +122,17 @@ def append_transaction(data: dict):
 
 
 def ensure_power_bi_dimension_table():
-    """Создаёт или обновляет лист Dim_Categories для связи в Power BI (Звезда)."""
+    """Создаёт чистый лист Dim_Categories со строго УНИКАЛЬНЫМИ категориями для связи 1:* в Power BI."""
     try:
         db = get_db()
         try:
             ws = db.worksheet("Dim_Categories")
         except Exception:
-            ws = db.add_worksheet(title="Dim_Categories", rows=100, cols=3)
+            ws = db.add_worksheet(title="Dim_Categories", rows=30, cols=3)
 
-        rows = [["category", "subcategory", "full_key"]]
-        for cat, subs in SUBCATEGORIES_MAP.items():
-            for sub in subs:
-                rows.append([cat, sub, f"{cat} - {sub}"])
+        rows = [["category", "default_limit", "type"]]
+        for cat, limit in DEFAULT_EXPENSE_LIMITS.items():
+            rows.append([cat, limit, "РАСХОД"])
 
         ws.clear()
         ws.update("A1", rows)
@@ -198,101 +197,8 @@ def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
         return []
 
 
-# --- РАССРОЧКИ ---
-INSTALLMENT_COLUMNS = [
-    "id", "date", "user", "bank", "kind", "description",
-    "total_amount", "monthly_payment", "payments_count",
-    "next_payment", "status",
-]
-INSTALLMENT_STATUS_COLUMN = INSTALLMENT_COLUMNS.index("status") + 1
-
-
-def _get_or_create_installments_sheet():
-    db = get_db()
-    try:
-        ws = db.worksheet("Installments")
-    except Exception:
-        ws = db.add_worksheet(title="Installments", rows=100, cols=len(INSTALLMENT_COLUMNS))
-        ws.append_row(INSTALLMENT_COLUMNS)
-        return ws
-    if not ws.row_values(1):
-        ws.append_row(INSTALLMENT_COLUMNS)
-    return ws
-
-
-def get_installments():
-    try:
-        ws = _get_or_create_installments_sheet()
-        records = _get_all_records_safe(ws)
-        return [
-            record for record in records
-            if str(record.get("status", "active")).lower() not in {"closed", "done", "завершена"}
-        ]
-    except Exception as error:
-        print(f"[Рассрочки] Ошибка: {error}")
-        return []
-
-
-def add_installment(data: dict | None = None, **kwargs):
-    payload = dict(data or {})
-    payload.update(kwargs)
-    now = datetime.datetime.now(ASTANA_TZ)
-    try:
-        ws = _get_or_create_installments_sheet()
-        values = {
-            "id": payload.get("id") or f"INST_{now.strftime('%Y%m%d_%H%M%S')}",
-            "date": payload.get("date") or now.strftime("%Y-%m-%d %H:%M:%S"),
-            "user": payload.get("user") or "Влад",
-            "bank": payload.get("bank") or "Kaspi",
-            "kind": payload.get("kind") or payload.get("type") or "Рассрочка",
-            "description": payload.get("description") or payload.get("merchant") or "Рассрочка",
-            "total_amount": payload.get("total_amount", payload.get("amount", "")),
-            "monthly_payment": payload.get("monthly_payment", ""),
-            "payments_count": payload.get("payments_count", ""),
-            "next_payment": payload.get("next_payment", ""),
-            "status": payload.get("status") or "active",
-        }
-        ws.append_row([str(values[c] or "") for c in INSTALLMENT_COLUMNS], table_range=_table_range(len(INSTALLMENT_COLUMNS)))
-        return values
-    except Exception as error:
-        print(f"[Рассрочки] Ошибка записи: {error}")
-        return None
-
-
-def close_installment(search_query: str) -> bool:
-    return find_and_update_record(
-        "Installments", search_query, INSTALLMENT_STATUS_COLUMN, "closed", search_from_recent=True
-    )
-
-
-# --- ЛИМИТЫ ---
-def get_category_limits():
-    try:
-        ws = get_db().worksheet("Limits")
-        records = _get_all_records_safe(ws)
-        return {str(r.get("category")).strip(): float(r.get("limit_amount", 0)) for r in records if r.get("category")}
-    except Exception as e:
-        print(f"[Лимиты] Ошибка: {e}")
-        return {}
-
-
-def save_category_limits(new_limits: dict):
-    try:
-        db = get_db()
-        try:
-            ws = db.worksheet("Limits")
-        except Exception:
-            ws = db.add_worksheet(title="Limits", rows=20, cols=2)
-            ws.append_row(["category", "limit_amount"])
-        ws.clear()
-        ws.append_row(["category", "limit_amount"])
-        for cat, limit in new_limits.items():
-            ws.append_row([str(cat), float(limit)], table_range=_table_range(2))
-    except Exception as e:
-        print(f"[Лимиты] Ошибка сохранения: {e}")
-
-
-def find_recent_duplicate_transaction(amount, minutes: int = 10):
+def find_recent_duplicate_transaction(amount, comment: str = "", minutes: int = 5):
+    """Ищет дубли только при совпадении суммы И похожего комментария за последние 5 минут."""
     try:
         target = to_clean_number(amount)
         if not target:
@@ -301,20 +207,142 @@ def find_recent_duplicate_transaction(amount, minutes: int = 10):
         records = _get_all_records_safe(ws)
         non_empty = [r for r in records if str(r.get("transaction_id", "")).strip()]
         now = datetime.datetime.now(ASTANA_TZ)
-        for r in reversed(non_empty[-50:]):
+        comm_clean = comment.strip().lower()
+
+        for r in reversed(non_empty[-30:]):
             try:
                 r_amount = to_clean_number(r.get("amount"))
                 if r_amount != target:
                     continue
                 r_date = datetime.datetime.strptime(str(r.get("date")), "%Y-%m-%d %H:%M:%S").replace(tzinfo=ASTANA_TZ)
                 if (now - r_date).total_seconds() <= minutes * 60:
-                    return r
+                    r_comm = str(r.get("user_comment", "")).lower()
+                    # Если комментарий пустой или слова совпадают — это дубль
+                    if not comm_clean or comm_clean in r_comm or r_comm in comm_clean:
+                        return r
             except (ValueError, TypeError):
                 continue
         return None
     except Exception as e:
         print(f"[Транзакции] Ошибка поиска дублей: {e}")
         return None
+
+
+def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from_recent: bool = True):
+    """Умное удаление: понимает фразы 'последняя', 'крайняя' и удаляет именно последнюю строку."""
+    try:
+        ws = get_db().worksheet(worksheet_name)
+        records = _get_all_records_safe(ws)
+        if not records:
+            return None
+
+        search_lower = str(search_query or "").strip().lower()
+        indexed_records = list(enumerate(records, start=2))
+
+        # Если пользователь просит удалить «последнюю/крайнюю» без конкретных слов
+        is_generic_last = any(w in search_lower for w in ["последн", "крайн", "предыдущ", "last"]) or not search_lower
+        specific_keywords = [w for w in re.findall(r'\w+', search_lower) if w not in ["удали", "удалить", "последнюю", "последний", "запись", "трату", "покупку"]]
+
+        if is_generic_last and not specific_keywords:
+            last_idx, last_rec = indexed_records[-1]
+            ws.delete_rows(last_idx)
+            return last_rec
+
+        # Ищем совпадение снизу вверх (от самых свежих)
+        query_digits = _digits_only(search_lower)
+        for idx, r in reversed(indexed_records):
+            row_values = [str(v) for v in r.values()]
+            row_str = " ".join(row_values).lower()
+            matched = any(k in row_str for k in specific_keywords) if specific_keywords else False
+            if not matched and query_digits:
+                matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
+            if matched:
+                ws.delete_rows(idx)
+                return r
+        return None
+    except Exception as e:
+        print(f"[Таблицы] Ошибка удаления: {e}")
+        return None
+
+
+def find_and_update_record(worksheet_name: str, search_query, field, new_value, search_from_recent: bool = True):
+    try:
+        ws = get_db().worksheet(worksheet_name)
+        all_values = ws.get_all_values()
+        if not all_values or len(all_values) <= 1:
+            return None
+        headers_lower = [str(h).strip().lower() for h in all_values[0]]
+        col_idx = None
+        if isinstance(field, int):
+            col_idx = field
+        else:
+            field_str = str(field).strip()
+            if field_str.isdigit():
+                col_idx = int(field_str)
+            else:
+                if field_str.lower() in headers_lower:
+                    col_idx = headers_lower.index(field_str.lower()) + 1
+        if not col_idx:
+            return None
+
+        records = _get_all_records_safe(ws)
+        search_lower = str(search_query or "").strip().lower()
+        indexed_records = list(enumerate(records, start=2))
+
+        # Проверка на «последнюю»
+        is_generic_last = any(w in search_lower for w in ["последн", "крайн", "предыдущ", "last"]) or not search_lower
+        specific_keywords = [w for w in re.findall(r'\w+', search_lower) if w not in ["поменяй", "измени", "последнюю", "последний", "запись", "трату"]]
+
+        if is_generic_last and not specific_keywords:
+            last_idx, last_rec = indexed_records[-1]
+            ws.update_cell(last_idx, col_idx, new_value)
+            return last_rec
+
+        query_digits = _digits_only(search_lower)
+        for idx, r in reversed(indexed_records):
+            row_values = [str(v) for v in r.values()]
+            row_str = " ".join(row_values).lower()
+            matched = any(k in row_str for k in specific_keywords) if specific_keywords else False
+            if not matched and query_digits:
+                matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
+            if matched:
+                ws.update_cell(idx, col_idx, new_value)
+                return r
+        return None
+    except Exception as e:
+        print(f"[Таблицы] Ошибка правки: {e}")
+        return None
+
+
+def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = ""):
+    """Корректно переносит не только daily, но и monthly напоминания на месяц вперёд."""
+    try:
+        ws = get_db().worksheet("Reminders")
+        rec_norm = str(recurrence or "once").lower()
+
+        if rec_norm == "daily" and remind_at:
+            try:
+                old_dt = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M:%S")
+                next_dt = old_dt + datetime.timedelta(days=1)
+                ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                return
+            except Exception:
+                pass
+        elif rec_norm == "monthly" and remind_at:
+            try:
+                old_dt = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M:%S")
+                # Перенос на 1 месяц вперед
+                new_month = old_dt.month + 1 if old_dt.month < 12 else 1
+                new_year = old_dt.year if old_dt.month < 12 else old_dt.year + 1
+                next_dt = old_dt.replace(year=new_year, month=new_month)
+                ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
+                return
+            except Exception:
+                pass
+
+        ws.update_cell(row_idx, 6, "sent")
+    except Exception as e:
+        print(f"[Напоминания] Ошибка завершения: {e}")
 
 
 # --- РАЗДЕЛЕНИЕ ТРАНЗАКЦИЙ ---
@@ -349,15 +377,20 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
         base_merchant = target_record.get("merchant", "")
         base_necessity = target_record.get("necessity", "Want")
 
+        # Заполняем валидные подкатегории по умолчанию, чтобы не ломать Power BI
+        from services.categories import validate_transaction_category_subcategory
+        _, p1_sub = validate_transaction_category_subcategory(part1_cat, "")
+        _, p2_sub = validate_transaction_category_subcategory(part2_cat, "")
+
         ws.delete_rows(target_idx + 1)
 
         row1 = [
             f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_1", base_date, base_user, base_type, part1_amt, "KZT",
-            base_bank, base_source, base_funds, base_resource, part1_cat, "", base_merchant, base_necessity, part1_comm, "Разделено по запросу."
+            base_bank, base_source, base_funds, base_resource, part1_cat, p1_sub, base_merchant, base_necessity, part1_comm, "Разделено по запросу."
         ]
         row2 = [
             f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_2", base_date, base_user, base_type, part2_amt, "KZT",
-            base_bank, base_source, base_funds, base_resource, part2_cat, "", base_merchant, base_necessity, part2_comm, "Разделено по запросу."
+            base_bank, base_source, base_funds, base_resource, part2_cat, p2_sub, base_merchant, base_necessity, part2_comm, "Разделено по запросу."
         ]
 
         ws.insert_row(row1, target_idx + 1)
@@ -368,75 +401,83 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
         return False
 
 
-# --- УНИВЕРСАЛЬНЫЕ ПРАВКИ И УДАЛЕНИЕ ---
-def find_and_update_record(worksheet_name: str, search_query, field, new_value, search_from_recent: bool = True):
+# Оставшиеся служебные методы (рассрочки, лимиты, поездки)
+INSTALLMENT_COLUMNS = ["id", "date", "user", "bank", "kind", "description", "total_amount", "monthly_payment", "payments_count", "next_payment", "status"]
+INSTALLMENT_STATUS_COLUMN = INSTALLMENT_COLUMNS.index("status") + 1
+
+def _get_or_create_installments_sheet():
+    db = get_db()
     try:
-        ws = get_db().worksheet(worksheet_name)
-        all_values = ws.get_all_values()
-        if not all_values or len(all_values) <= 1:
-            return None
-        headers_lower = [str(h).strip().lower() for h in all_values[0]]
-        col_idx = None
-        if isinstance(field, int):
-            col_idx = field
-        else:
-            field_str = str(field).strip()
-            if field_str.isdigit():
-                col_idx = int(field_str)
-            else:
-                if field_str.lower() in headers_lower:
-                    col_idx = headers_lower.index(field_str.lower()) + 1
-        if not col_idx:
-            return None
+        ws = db.worksheet("Installments")
+    except Exception:
+        ws = db.add_worksheet(title="Installments", rows=100, cols=len(INSTALLMENT_COLUMNS))
+        ws.append_row(INSTALLMENT_COLUMNS)
+        return ws
+    if not ws.row_values(1):
+        ws.append_row(INSTALLMENT_COLUMNS)
+    return ws
 
-        records = _get_all_records_safe(ws)
-        search_lower = str(search_query).strip().lower()
-        query_digits = _digits_only(search_lower)
-        indexed_records = list(enumerate(records, start=2))
-        if search_from_recent:
-            indexed_records = list(reversed(indexed_records))
-
-        for idx, r in indexed_records:
-            row_values = [str(v) for v in r.values()]
-            row_str = " ".join(row_values).lower()
-            matched = search_lower in row_str
-            if not matched and query_digits:
-                matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
-            if matched:
-                ws.update_cell(idx, col_idx, new_value)
-                return r
-        return None
-    except Exception as e:
-        print(f"[Таблицы] Ошибка правки: {e}")
-        return None
-
-
-def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from_recent: bool = True):
+def get_installments():
     try:
-        ws = get_db().worksheet(worksheet_name)
+        ws = _get_or_create_installments_sheet()
         records = _get_all_records_safe(ws)
-        search_lower = str(search_query).strip().lower()
-        query_digits = _digits_only(search_lower)
-        indexed_records = list(enumerate(records, start=2))
-        if search_from_recent:
-            indexed_records = list(reversed(indexed_records))
+        return [r for r in records if str(r.get("status", "active")).lower() not in {"closed", "done", "завершена"}]
+    except Exception as error:
+        print(f"[Рассрочки] Ошибка: {error}")
+        return []
 
-        for idx, r in indexed_records:
-            row_values = [str(v) for v in r.values()]
-            row_str = " ".join(row_values).lower()
-            matched = search_lower in row_str
-            if not matched and query_digits:
-                matched = any(_digits_only(v) == query_digits for v in row_values if _digits_only(v))
-            if matched:
-                ws.delete_rows(idx)
-                return r
+def add_installment(data: dict | None = None, **kwargs):
+    payload = dict(data or {})
+    payload.update(kwargs)
+    now = datetime.datetime.now(ASTANA_TZ)
+    try:
+        ws = _get_or_create_installments_sheet()
+        values = {
+            "id": payload.get("id") or f"INST_{now.strftime('%Y%m%d_%H%M%S')}",
+            "date": payload.get("date") or now.strftime("%Y-%m-%d %H:%M:%S"),
+            "user": payload.get("user") or "Влад",
+            "bank": payload.get("bank") or "Kaspi",
+            "kind": payload.get("kind") or payload.get("type") or "Рассрочка",
+            "description": payload.get("description") or payload.get("merchant") or "Рассрочка",
+            "total_amount": payload.get("total_amount", payload.get("amount", "")),
+            "monthly_payment": payload.get("monthly_payment", ""),
+            "payments_count": payload.get("payments_count", ""),
+            "next_payment": payload.get("next_payment", ""),
+            "status": payload.get("status") or "active",
+        }
+        ws.append_row([str(values[c] or "") for c in INSTALLMENT_COLUMNS], table_range=_table_range(len(INSTALLMENT_COLUMNS)))
+        return values
+    except Exception as error:
+        print(f"[Рассрочки] Ошибка записи: {error}")
         return None
+
+def close_installment(search_query: str) -> bool:
+    return find_and_update_record("Installments", search_query, INSTALLMENT_STATUS_COLUMN, "closed", search_from_recent=True)
+
+def get_category_limits():
+    try:
+        ws = get_db().worksheet("Limits")
+        records = _get_all_records_safe(ws)
+        return {str(r.get("category")).strip(): float(r.get("limit_amount", 0)) for r in records if r.get("category")}
     except Exception as e:
-        print(f"[Таблицы] Ошибка удаления: {e}")
-        return None
+        print(f"[Лимиты] Ошибка: {e}")
+        return {}
 
+def save_category_limits(new_limits: dict):
+    try:
+        db = get_db()
+        try:
+            ws = db.worksheet("Limits")
+        except Exception:
+            ws = db.add_worksheet(title="Limits", rows=20, cols=2)
+            ws.append_row(["category", "limit_amount"])
+        ws.clear()
+        ws.append_row(["category", "limit_amount"])
+        for cat, limit in new_limits.items():
+            ws.append_row([str(cat), float(limit)], table_range=_table_range(2))
+    except Exception as e:
+        print(f"[Лимиты] Ошибка сохранения: {e}")
 
-# --- ПОДПИСКИ ---
 def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month: int):
     try:
         ws = get_db().worksheet("Subscriptions")
@@ -455,7 +496,6 @@ def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month
     except Exception as e:
         print(f"[Подписки] Ошибка: {e}")
 
-
 def get_active_subscriptions():
     try:
         ws = get_db().worksheet("Subscriptions")
@@ -464,7 +504,6 @@ def get_active_subscriptions():
     except Exception as e:
         print(f"[Подписки] Ошибка чтения: {e}")
         return []
-
 
 def deactivate_subscription(name: str):
     try:
@@ -480,8 +519,6 @@ def deactivate_subscription(name: str):
         print(f"[Подписки] Ошибка отмены: {e}")
         return None
 
-
-# --- ПОЕЗДКИ ---
 def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
     try:
         ws = get_db().worksheet("Trips")
@@ -490,7 +527,6 @@ def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
         ws.append_row([trip_id, destination, dates, budget, notes, "planned"], table_range=_table_range(6))
     except Exception as e:
         print(f"[Поездки] Ошибка: {e}")
-
 
 def get_planned_trips():
     try:
@@ -501,8 +537,6 @@ def get_planned_trips():
         print(f"[Поездки] Ошибка: {e}")
         return []
 
-
-# --- СПИСОК ПОКУПОК ---
 def add_shopping_items(items: list, user_name: str):
     try:
         ws = get_db().worksheet("ShoppingList")
@@ -514,7 +548,6 @@ def add_shopping_items(items: list, user_name: str):
     except Exception as e:
         print(f"[Покупки] Ошибка: {e}")
 
-
 def get_shopping_items():
     try:
         ws = get_db().worksheet("ShoppingList")
@@ -523,7 +556,6 @@ def get_shopping_items():
     except Exception as e:
         print(f"[Покупки] Ошибка чтения: {e}")
         return []
-
 
 def mark_shopping_items_done(items_to_remove: list):
     try:
@@ -537,8 +569,6 @@ def mark_shopping_items_done(items_to_remove: list):
     except Exception as e:
         print(f"[Покупки] Ошибка отметки: {e}")
 
-
-# --- НАПОМИНАНИЯ ---
 def add_reminder(target_user: str, remind_at_str: str, text: str, recurrence: str = "once"):
     try:
         ws = get_db().worksheet("Reminders")
@@ -550,7 +580,6 @@ def add_reminder(target_user: str, remind_at_str: str, text: str, recurrence: st
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
     rem_id = f"REM_{now.strftime('%Y%m%d_%H%M%S')}"
     ws.append_row([rem_id, now_str, target_user, remind_at_str, text, "pending", recurrence], table_range=_table_range(7))
-
 
 def get_pending_reminders():
     try:
@@ -565,20 +594,3 @@ def get_pending_reminders():
     except Exception as e:
         print(f"[Напоминания] Ошибка чтения: {e}")
         return []
-
-
-def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = ""):
-    try:
-        ws = get_db().worksheet("Reminders")
-        if recurrence == "daily" and remind_at:
-            try:
-                old_dt = datetime.datetime.strptime(remind_at, "%Y-%m-%d %H:%M:%S")
-                next_dt = old_dt + datetime.timedelta(days=1)
-                ws.update_cell(row_idx, 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-            except Exception as dt_err:
-                print(f"[Напоминания] Ошибка переноса: {dt_err}")
-                ws.update_cell(row_idx, 6, "sent")
-        else:
-            ws.update_cell(row_idx, 6, "sent")
-    except Exception as e:
-        print(f"[Напоминания] Ошибка завершения: {e}")
