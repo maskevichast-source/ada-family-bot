@@ -205,3 +205,4 @@ def get_time_context_hint(hour: int, weekday: int) -> str:
         hints.append("выходной — кафе, развлечения, продукты домой, ремонт")
 
     return "; ".join(hints)
+
