@@ -114,3 +114,4 @@ async def handle_media(message: Message):
             message,
             reply or f"Распознала {len(validated_transactions)} покупок. Напиши комментарий к чеку, и я запишу."
         )
+
