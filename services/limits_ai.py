@@ -85,3 +85,4 @@ async def generate_limits_from_history() -> dict:
         # Возвращаем дефолтные
         save_category_limits(DEFAULT_EXPENSE_LIMITS)
         return DEFAULT_EXPENSE_LIMITS
+
