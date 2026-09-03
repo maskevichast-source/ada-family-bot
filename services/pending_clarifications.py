@@ -71,3 +71,4 @@ def sweep_expired_clarifications():
                 expired.append((chat_id, entry["transaction"]))
                 del _pending_clarifications[chat_id]
     return expired
+
