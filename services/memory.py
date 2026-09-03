@@ -26,3 +26,4 @@ def get_chat_history(chat_id: int) -> list[dict]:
 def clear_chat_history(chat_id: int):
     """Очистить историю чата."""
     _chat_history[chat_id] = []
+
