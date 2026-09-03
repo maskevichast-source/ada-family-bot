@@ -75,7 +75,7 @@ def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
         "✍️ **Записано:**",
         f"• {amt} {curr} | {bank_source} | {cat}{comm_str}",
     ]
-    if ai_comment and "задумалась" not in ai_comment.lower():
+    if ai_comment and not any(bad in ai_comment.lower() for bad in ["задумалась", "повтори", "на связи"]):
         lines.append(f"\n💬 {ai_comment}")
     return "\n".join(lines)
 
@@ -154,19 +154,23 @@ async def _process_text_message(message: Message, text: str):
     chat_id = message.chat.id
     add_chat_message(chat_id, user_name, text)
 
-    # 1. Чек ожидает комментария
+    # 1. Чек ожидает комментария (Бережное объединение позиций)
     if has_pending(chat_id):
         pending = pop_pending(chat_id)
         if pending:
             transactions, receipt_user = pending
             lines = ["📸 **Записано по чеку:**"]
             for tx in transactions:
-                tx["user_comment"] = text
+                original_item = str(tx.get("user_comment", "") or "").strip()
+                if original_item and original_item != text:
+                    tx["user_comment"] = f"{original_item} ({text})"
+                else:
+                    tx["user_comment"] = text
                 tx["user"] = receipt_user
                 append_transaction(tx)
                 lines.append(
                     f"• {_format_currency(tx.get('amount'))} {tx.get('currency')} | "
-                    f"{tx.get('bank')} | {tx.get('category')} ({text})"
+                    f"{tx.get('bank')} | {tx.get('category')} ({tx['user_comment']})"
                 )
             rep = "\n".join(lines)
             add_chat_message(chat_id, "Ада", rep)
@@ -277,7 +281,6 @@ async def _process_text_message(message: Message, text: str):
     # ── УНИВЕРСАЛЬНЫЙ ПЕРЕХВАТ: КНОПКИ ДЛЯ ЛЮБОЙ НЕПОНЯТНОЙ СИТУАЦИИ ──
     ambig_options = parsed.get("clarification_options") or get_ambiguous_options(text)
 
-    # Если есть варианты кнопок И (intent требует уточнения ЛИБО в тексте есть сумма покупки):
     if ambig_options and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0):
         tx = parsed.get("transaction") or {}
         if not tx.get("amount"):
@@ -295,7 +298,7 @@ async def _process_text_message(message: Message, text: str):
         tx["user"] = user_name
         tx["user_comment"] = text
 
-        # Санитарная очистка текста над кнопками (убираем аварийные фразы)
+        # Санитарная очистка текста над кнопками
         amt_str = _format_currency(tx.get("amount", 0))
         curr = tx.get("currency", "KZT")
         res_label = ", наличные" if tx.get("resource") == "Наличные" else ""
@@ -338,13 +341,12 @@ async def _process_text_message(message: Message, text: str):
         if not tx.get("user_comment"): tx["user_comment"] = text
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
 
+        # Проверка на реальный дубль (не блокируем, а предупреждаем и записываем)
         amount = parse_amount(tx.get("amount", 0))
-        duplicate = find_recent_duplicate_transaction(amount)
+        duplicate = find_recent_duplicate_transaction(amount, text)
         if duplicate:
-            dup_msg = f"⚠️ Похожая операция на {_format_currency(amount)} тг уже была записана ({duplicate.get('category')} — {duplicate.get('date')}). Записать ещё раз?"
-            add_chat_message(chat_id, "Ада", dup_msg)
-            await safe_answer(message, dup_msg)
-            return
+            dup_warning = f"⚠️ _Записала, но похоже на недавний дубль ({_format_currency(amount)} тг в {str(duplicate.get('date', ''))[-8:]})._"
+            reply = f"{reply}\n\n{dup_warning}" if reply else dup_warning
 
         append_transaction(tx)
         report = _format_confirmation_report(tx, reply)
