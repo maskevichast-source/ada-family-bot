@@ -23,6 +23,9 @@ from services.pending_clarifications import sweep_expired_clarifications
 from services.timezone import ASTANA_TZ, parse_flexible_datetime
 from services.weather import get_weather_forecast, get_tomorrow_forecast
 from services.charts import generate_expense_chart
+from services.reports import generate_pdf_report, generate_excel_export
+from services.analytics import analyze_budget_leaks
+from services.timezone import now_astana
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -42,6 +45,8 @@ async def cmd_start(message: types.Message):
         "Привет! Я Ада — твоя финансовая помощница.\n\n"
         "Что я умею:\n"
         "• Учёт трат и доходов (текстом, фото чеков, PDF)\n"
+        "• Анализ «утечек бюджета» (/leaks)\n"
+        "• Экспорт отчётов в PDF (/report) и Excel (/export)\n"
         "• Лимиты бюджета по категориям\n"
         "• Напоминания (разовые, ежедневные, ежемесячные)\n"
         "• Список покупок\n"
@@ -51,7 +56,7 @@ async def cmd_start(message: types.Message):
         "• Прогноз погоды (на сегодня, завтра или неделю)\n"
         "• Графики расходов (/chart)\n"
         "• Голосовые сообщения\n\n"
-        "Просто напиши мне о покупке или доходе — я всё запишу!"
+        "Просто напиши мне о покупке, доходе или пришли чек!"
     )
 
 
@@ -62,10 +67,14 @@ async def cmd_help(message: types.Message):
         "📋 Команды:\n"
         "/start — начать работу\n"
         "/chart — график расходов за месяц\n"
+        "/leaks — анализ утечек бюджета (микротраты)\n"
+        "/report — скачать PDF-буклет за месяц\n"
+        "/export — скачать выписку в Excel (.xlsx)\n"
         "/debug — диагностика таблицы\n\n"
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
         "• 'Зарплата 300000'\n"
+        "• 'Куда уходят деньги?'\n"
         "• 'Погода на завтра'\n"
         "• 'Прогноз на неделю'\n"
         "• 'Напомни в 21:00 выпить витамины'\n"
@@ -86,6 +95,36 @@ async def cmd_chart(message: types.Message):
     except Exception as error:
         print(f"[График] Ошибка: {error}")
         await safe_answer(message, "Не удалось построить график.")
+
+
+@dp.message(Command("leaks"))
+async def cmd_leaks(message: types.Message):
+    leak_data = analyze_budget_leaks()
+    await safe_answer(message, leak_data["text"])
+
+
+@dp.message(Command("report"))
+async def cmd_report(message: types.Message):
+    try:
+        await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_document")
+        pdf_bytes = await asyncio.to_thread(generate_pdf_report)
+        pdf_file = BufferedInputFile(pdf_bytes, filename=f"Finance_Report_{now_astana().strftime('%Y_%m')}.pdf")
+        await message.answer_document(document=pdf_file, caption="📑 Официальный семейный финансовый отчёт за месяц.")
+    except Exception as e:
+        print(f"[PDF] Ошибка: {e}")
+        await safe_answer(message, "Не удалось сформировать PDF-отчёт.")
+
+
+@dp.message(Command("export"))
+async def cmd_export(message: types.Message):
+    try:
+        await message.bot.send_chat_action(chat_id=message.chat.id, action="upload_document")
+        excel_bytes = await asyncio.to_thread(generate_excel_export)
+        excel_file = BufferedInputFile(excel_bytes, filename=f"Family_Finance_{now_astana().strftime('%Y_%m')}.xlsx")
+        await message.answer_document(document=excel_file, caption="📊 Полная выписка в формате Excel (.xlsx).")
+    except Exception as e:
+        print(f"[Excel] Ошибка: {e}")
+        await safe_answer(message, "Не удалось сформировать файл Excel.")
 
 
 @dp.message(Command("debug"))
