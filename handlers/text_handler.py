@@ -29,7 +29,6 @@ from services.sheets import (
     split_last_transaction_by_amount, find_and_update_record, delete_record_by_keyword,
     get_transactions_for_period, find_recent_duplicate_transaction,
     debug_transactions_snapshot, normalize_necessity,
-    add_tracked_item, get_active_tracked_items, delete_tracked_item,
     update_last_transaction_bank_and_source,
 )
 from services.charts import generate_expense_chart
@@ -43,7 +42,6 @@ from services.pending_clarifications import (
 from services.memory import get_chat_history, add_chat_message
 from services.voice import transcribe_voice
 from services.timezone import now_astana
-from services.price_tracker import fetch_product_info, detect_marketplace
 
 
 def _to_number_or_blank(value):
@@ -217,7 +215,6 @@ async def _process_text_message(message: Message, text: str):
             return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 0: МГНОВЕННОЕ ИЗМЕНЕНИЕ БАНКА В ПОСЛЕДНЕЙ ЗАПИСИ ──
-    # Ловит фразы типа: "измени банк на bcc", "запиши что это оплата через bcc", "банк каспи", "это с bcc"
     bank_match = re.search(r'(?:измени|поменяй|запиши|исправь)?\s*(?:что\s+это\s+)?(?:оплата\s+через|банк\s+на|карту\s+на|с\s+карты|банк)\s+([a-zA-Zа-яА-Я]+)', t_clean)
     if bank_match:
         target_bank = bank_match.group(1).upper()
@@ -235,89 +232,7 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, res)
             return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 1: ССЫЛКИ НА МАРКЕТПЛЕЙСЫ (ТРЕКЕР СКИДОК) ──
-    url_match = re.search(r'https?://[^\s]+', text)
-    if url_match:
-        found_url = url_match.group(0).rstrip('.,!?')
-        marketplace = detect_marketplace(found_url)
-
-        if marketplace:
-            try:
-                await message.bot.send_chat_action(chat_id=chat_id, action="typing")
-            except Exception:
-                pass
-
-            info = await fetch_product_info(found_url)
-            if info and info.get("price", 0) > 0:
-                add_tracked_item(
-                    user=user_name,
-                    marketplace=info["marketplace"],
-                    item_id=info["item_id"],
-                    title=info["title"],
-                    price=info["price"],
-                    url=info["url"],
-                    in_stock=info["in_stock"],
-                )
-                stock_status = "в наличии ✅" if info["in_stock"] else "нет в наличии ❌"
-                res = (
-                    f"🎯 **Взяла на карандаш!**\n\n"
-                    f"• **Товар:** {info['title']}\n"
-                    f"• **Площадка:** {info['marketplace']}\n"
-                    f"• **Текущая цена:** {_format_currency(info['price'])} KZT ({stock_status})\n\n"
-                    f"_Буду проверять цену 4 раза в день. Если подешевеет или закончится — сразу сообщу в чат!_"
-                )
-            elif info:
-                add_tracked_item(
-                    user=user_name,
-                    marketplace=info["marketplace"],
-                    item_id=info["item_id"],
-                    title=info["title"],
-                    price=0,
-                    url=info["url"],
-                    in_stock=info.get("in_stock", True),
-                )
-                res = (
-                    f"🎯 **Товар добавлен на мониторинг!**\n\n"
-                    f"• **Товар:** {info['title']}\n"
-                    f"• **Площадка:** {info['marketplace']}\n\n"
-                    f"_Цена на странице сейчас скрыта защитой от ботов. Если хочешь зафиксировать стартовую цену для отслеживания скидки, напиши её в ответ (например: «цена 48500»)._"
-                )
-            else:
-                res = f"Не удалось автоматически разобрать карточку {marketplace}. Проверьте, открывается ли ссылка в браузере."
-
-            add_chat_message(chat_id, "Ада", res)
-            await safe_answer(message, res)
-            return
-
-    # ── ПРЯМОЙ ПЕРЕХВАТ 2: ПРОСМОТР ТОВАРОВ В ОТСЛЕЖИВАНИИ ──
-    if any(k in t_clean for k in ["что в отслеживании", "список отслеживания", "какие товары отслеживаем", "трекер цен", "мои скидки"]):
-        items = get_active_tracked_items()
-        if not items:
-            res = "В отслеживании пока нет товаров. Скиньте ссылку на Wildberries, Kaspi или Ozon — и я начну следить!"
-        else:
-            lines = ["🎯 **Товары на мониторинге цен:**\n"]
-            for it in items:
-                st = "✅" if it["in_stock"] else "❌"
-                lines.append(f"• **{it['title'][:35]}** ({it['marketplace']})\n  Цена: {_format_currency(it['last_price'])} KZT | {st} [Ссылка]({it['url']})")
-            lines.append("\n_Проверяю 4 раза в день. Если цена изменится — сразу напишу сюда._")
-            res = "\n".join(lines)
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    # ── ПРЯМОЙ ПЕРЕХВАТ 3: УДАЛЕНИЕ ИЗ ОТСЛЕЖИВАНИЯ ──
-    if "отслеживан" in t_clean and any(k in t_clean for k in ["удали", "убери", "перестань", "не следи"]):
-        query = re.sub(r'удали|убери|перестань|не следи|из отслеживания|с отслеживания', '', t_clean).strip()
-        deleted = delete_tracked_item(query)
-        if deleted:
-            res = f"Сняла с мониторинга: {deleted.get('title')} ({deleted.get('marketplace')})."
-        else:
-            res = "Не нашла такой товар в списке отслеживания."
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    # ── ПРЯМОЙ ПЕРЕХВАТ 4: ГРАФИКИ ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 1: ГРАФИКИ ──
     if any(k in t_clean for k in ["график", "диаграмм", "чарт", "дашборд"]) or t_clean in {"/chart", "chart"}:
         try:
             image_bytes = await asyncio.to_thread(generate_expense_chart)
@@ -331,7 +246,7 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, "Не удалось построить график.")
         return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 5: ПОГОДА ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 2: ПОГОДА ──
     if any(k in t_clean for k in ["погода", "погоду", "прогноз", "зонт"]):
         target = "today"
         if "недел" in t_clean or "5 дней" in t_clean or "выходн" in t_clean:
@@ -347,13 +262,13 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, res)
         return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 6: ДИАГНОСТИКА ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 3: ДИАГНОСТИКА ──
     if t_clean in {"debug", "/debug"}:
         debug_text = debug_transactions_snapshot()
         await safe_answer(message, f"```\n{debug_text}\n```")
         return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 7: РАЗДЕЛИТЬ ТРАНЗАКЦИЮ ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 4: РАЗДЕЛИТЬ ТРАНЗАКЦИЮ ──
     if "раздели" in t_clean and "транзакцию" in t_clean:
         match = re.search(r"раздели\s+транзакцию\s+(\d+)[\s:]*(.+?)[\s]*\|\s*(.+?)", text, re.IGNORECASE)
         if match:
