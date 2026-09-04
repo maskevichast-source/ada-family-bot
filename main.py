@@ -3,11 +3,11 @@
 import asyncio
 import datetime
 
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
 
-from config import TELEGRAM_BOT_TOKEN, FAMILY_CHAT_ID
+from config import TELEGRAM_BOT_TOKEN, FAMILY_CHAT_ID, VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID
 from handlers.text_handler import (
     handle_text, handle_voice, handle_category_clarification_callback
 )
@@ -15,6 +15,7 @@ from handlers.media_handler import handle_media
 from services.sheets import (
     get_pending_reminders, mark_reminder_done, append_transaction,
     ensure_power_bi_dimension_table, process_due_subscriptions,
+    normalize_existing_family_table_values,
 )
 from services.categories import FALLBACK_EXPENSE_CATEGORY
 from services.telegram_safe import safe_answer, safe_send_message
@@ -29,6 +30,37 @@ from services.timezone import now_astana
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
+
+
+class FamilyPrivacyMiddleware(BaseMiddleware):
+    """Пускает к боту только семейный чат или разрешённые Telegram ID.
+
+    Бот приватный: даже если токен/username узнает посторонний, он не сможет
+    читать отчёты, писать траты или смотреть таблицу.
+    """
+
+    async def __call__(self, handler, event, data):
+        chat = getattr(event, "chat", None) or getattr(getattr(event, "message", None), "chat", None)
+        user = getattr(event, "from_user", None)
+
+        allowed_chat = bool(chat and int(chat.id) == int(FAMILY_CHAT_ID))
+        allowed_users = {str(x) for x in (VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID) if x}
+        allowed_user = bool(user and str(user.id) in allowed_users)
+
+        if allowed_chat or allowed_user:
+            return await handler(event, data)
+
+        # Молча игнорируем callback, а в личке коротко объясняем.
+        if hasattr(event, "answer") and chat:
+            try:
+                await event.answer("Это приватный семейный бот.")
+            except Exception:
+                pass
+        return None
+
+
+dp.message.middleware(FamilyPrivacyMiddleware())
+dp.callback_query.middleware(FamilyPrivacyMiddleware())
 
 
 def _format_currency(value):
@@ -159,7 +191,7 @@ async def check_reminders():
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
-            reminders = get_pending_reminders()
+            reminders = await asyncio.to_thread(get_pending_reminders)
             for rem in reminders:
                 try:
                     rem_time = parse_flexible_datetime(rem.get("remind_at"))
@@ -176,7 +208,7 @@ async def check_reminders():
                             )
                         except Exception as send_err:
                             print(f"[Напоминания] Не удалось отправить: {send_err}")
-                        mark_reminder_done(row_idx, recurrence, remind_at)
+                        await asyncio.to_thread(mark_reminder_done, row_idx, recurrence, remind_at)
                 except Exception as e:
                     print(f"[Напоминания] Ошибка обработки: {e}")
         except Exception as e:
@@ -189,7 +221,7 @@ async def check_subscriptions():
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             if now.minute == 5:
-                due = process_due_subscriptions(now)
+                due = await asyncio.to_thread(process_due_subscriptions, now)
                 if due:
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=f"💳 Автосписание подписок: {', '.join(due)}.")
         except Exception as e:
@@ -236,7 +268,7 @@ async def sweep_pending_receipts():
                 for tx in transactions:
                     tx["user"] = user_name
                     tx["user_comment"] = tx.get("user_comment", "") or "(без комментария — авто-сохранение)"
-                    append_transaction(tx)
+                    await asyncio.to_thread(append_transaction, tx)
                 try:
                     await safe_send_message(
                         bot, chat_id=chat_id,
@@ -259,7 +291,7 @@ async def sweep_clarifications():
                 comm = tx.get("user_comment", "")
                 tx["user_comment"] = f"{comm} (автосохранение: {tx['category']})".strip()
 
-                append_transaction(tx)
+                await asyncio.to_thread(append_transaction, tx)
                 try:
                     await safe_send_message(
                         bot, chat_id=chat_id,
@@ -274,6 +306,8 @@ async def sweep_clarifications():
 
 async def main():
     await asyncio.to_thread(ensure_power_bi_dimension_table)
+    # Исправляет уже накопленные D/expense в таблице без изменения схемы.
+    await asyncio.to_thread(normalize_existing_family_table_values)
 
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
