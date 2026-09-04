@@ -215,14 +215,13 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, report)
             return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 1: ССЫЛКИ НА МАРКЕТПЛЕЙСЫ (.KZ И .RU) ──
-    # Ищем любую ссылку в сообщении
+    # ── ПРЯМОЙ ПЕРЕХВАТ 1: ССЫЛКИ НА МАРКЕТПЛЕЙСЫ (ТРЕКЕР СКИДОК) ──
     url_match = re.search(r'https?://[^\s]+', text)
     if url_match:
         found_url = url_match.group(0).rstrip('.,!?')
         marketplace = detect_marketplace(found_url)
-        
-        # Если найдена ссылка на WB, Kaspi или Ozon — ОБРАБАТЫВАЕМ ТОЛЬКО КАК ТОВАР
+
+        # Если найдена ссылка на WB, Kaspi или Ozon — ОБРАБАТЫВАЕМ ТОЛЬКО КАК ТОВАР!
         if marketplace:
             try:
                 await message.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -249,8 +248,6 @@ async def _process_text_message(message: Message, text: str):
                     f"_Буду проверять цену 4 раза в день. Если подешевеет или закончится — сразу сообщу в чат!_"
                 )
             elif info:
-                # Если товар есть, но цена временно 0 или скрыта
-                res = f"🎯 Товар **{info.get('title')}** ({marketplace}) добавлен, но цена сейчас скрыта продавцом или товар закончился. Буду следить за появлением!"
                 add_tracked_item(
                     user=user_name,
                     marketplace=info["marketplace"],
@@ -258,14 +255,18 @@ async def _process_text_message(message: Message, text: str):
                     title=info["title"],
                     price=0,
                     url=info["url"],
-                    in_stock=False,
+                    in_stock=info.get("in_stock", True),
+                )
+                res = (
+                    f"🎯 Товар **{info.get('title')}** ({info['marketplace']}) добавлен на мониторинг!\n"
+                    f"Цена сейчас скрыта или требует уточнения. Буду следить за обновлениями."
                 )
             else:
-                res = f"Не удалось автоматически разобрать карточку {marketplace}. Проверьте, открывается ли ссылка."
+                res = f"Не удалось автоматически разобрать карточку {marketplace}. Проверьте, открывается ли ссылка в браузере."
 
             add_chat_message(chat_id, "Ада", res)
             await safe_answer(message, res)
-            return  # СТРОГО ВЫХОДИМ, НЕ ДАВАЯ СООБЩЕНИЮ УЙТИ В ТРАТЫ «None KZT»
+            return  # СТРОГИЙ ВЫХОД: сообщение НИКОГДА не уйдёт в траты «None KZT»
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 2: ПРОСМОТР ТОВАРОВ В ОТСЛЕЖИВАНИИ ──
     if any(k in t_clean for k in ["что в отслеживании", "список отслеживания", "какие товары отслеживаем", "трекер цен", "мои скидки"]):
