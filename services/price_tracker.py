@@ -76,10 +76,6 @@ def get_wb_basket_host(nm_id: int) -> str:
     return "basket-18.wbbasket.ru"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 1. WILDBERRIES (WB)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 async def parse_wildberries(url: str) -> Optional[dict]:
     match = re.search(r'/catalog/(\d+)', url)
     if not match:
@@ -90,7 +86,6 @@ async def parse_wildberries(url: str) -> Optional[dict]:
     price = 0.0
     in_stock = True
 
-    # 1. Забираем гарантированное название товара через CDN корзин WB
     try:
         basket_host = get_wb_basket_host(nm_id)
         vol = nm_id // 100000
@@ -104,7 +99,6 @@ async def parse_wildberries(url: str) -> Optional[dict]:
     except Exception:
         pass
 
-    # 2. Забираем цену в KZT через API каталога
     api_urls = [
         f"https://card.wb.ru/cards/v2/detail?appType=1&curr=kzt&dest=-1257786&nm={nm_id}",
         f"https://card.wb.ru/cards/v1/detail?appType=1&curr=kzt&dest=-1257786&nm={nm_id}",
@@ -126,7 +120,6 @@ async def parse_wildberries(url: str) -> Optional[dict]:
                     if not title:
                         title = p.get("name")
 
-                    # Поиск цены в разных ветках API
                     if p.get("salePriceU"):
                         price = float(p["salePriceU"]) / 100.0
                     elif p.get("priceU"):
@@ -159,26 +152,19 @@ async def parse_wildberries(url: str) -> Optional[dict]:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 2. KASPI МАГАЗИН
-# ═══════════════════════════════════════════════════════════════════════════════
-
 async def parse_kaspi(url: str) -> Optional[dict]:
     final_url = url
     html_content = ""
 
-    # Если ссылка короткая (l.kaspi.kz), разворачиваем её
     if "l.kaspi.kz" in url.lower():
         final_url, html_content = await resolve_redirects(url)
 
-    # Ищем ID товара в финальном URL
     match = re.search(r'-(\d+)(?:/|\?|$)', final_url) or re.search(r'/p/[^/]+-(\d+)', final_url)
     product_id = match.group(1) if match else None
 
     title_from_html = None
     price = 0.0
 
-    # Если в URL ID не найден, вытаскиваем его из HTML промежуточной страницы
     if html_content:
         if not product_id:
             id_match = re.search(r'kaspi\.kz/shop/p/[^"]*?-(\d+)', html_content) or re.search(r'data-product-id="(\d+)"', html_content)
@@ -189,7 +175,6 @@ async def parse_kaspi(url: str) -> Optional[dict]:
         if t_match:
             title_from_html = clean_kaspi_title(t_match.group(1))
 
-        # Поиск цены в JSON-LD разметке страницы
         p_match = re.search(r'"price":\s*"(\d+)"', html_content) or re.search(r'"lowPrice":\s*"(\d+)"', html_content)
         if p_match:
             price = float(p_match.group(1))
@@ -197,7 +182,6 @@ async def parse_kaspi(url: str) -> Optional[dict]:
     if not product_id:
         return None
 
-    # Пробуем запросить цены через API каталога для Астаны (710000000)
     api_url = f"https://kaspi.kz/yml/product-view/p/{product_id}?c=710000000"
     headers = {
         **HEADERS_JSON,
@@ -230,33 +214,25 @@ async def parse_kaspi(url: str) -> Optional[dict]:
     }
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# 3. OZON (.RU / .KZ)
-# ═══════════════════════════════════════════════════════════════════════════════
-
 async def parse_ozon(url: str) -> Optional[dict]:
     final_url, html_content = await resolve_redirects(url)
 
-    # Достаем понятное название из слага ссылки (например: /product/shurupovert-biruda-12345/)
     slug_title = None
     slug_match = re.search(r'/product/([a-zA-Z0-9_-]+)-(\d+)', final_url)
     if slug_match:
         raw_words = slug_match.group(1).replace('-', ' ').strip()
         slug_title = raw_words.capitalize()
 
-    # Заголовок страницы
     title = None
     if html_content:
         t_match = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_content) or re.search(r'<title>([^<]+)</title>', html_content)
         if t_match:
             candidate = html.unescape(t_match.group(1)).replace(" - купить в интернет-магазине OZON", "").replace(" - OZON", "").strip()
-            # Фильтруем заглушки Cloudflare
             if not any(bad in candidate.lower() for bad in ["antibot", "challenge", "доступ ограничен", "ой!"]):
                 title = candidate
 
     final_title = title or slug_title or "Шуруповерт Ozon"
 
-    # Извлечение цены
     price = 0.0
     if html_content:
         p_match = (
