@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import random
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -15,6 +16,7 @@ from handlers.media_handler import handle_media
 from services.sheets import (
     get_pending_reminders, mark_reminder_done, append_transaction,
     ensure_power_bi_dimension_table, process_due_subscriptions,
+    get_active_tracked_items, update_tracked_item_state,
 )
 from services.categories import FALLBACK_EXPENSE_CATEGORY
 from services.telegram_safe import safe_answer, safe_send_message
@@ -23,6 +25,7 @@ from services.pending_clarifications import sweep_expired_clarifications
 from services.timezone import ASTANA_TZ, parse_flexible_datetime
 from services.weather import get_weather_forecast, get_tomorrow_forecast
 from services.charts import generate_expense_chart
+from services.price_tracker import fetch_product_info
 
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
 dp = Dispatcher()
@@ -43,6 +46,7 @@ async def cmd_start(message: types.Message):
         "Что я умею:\n"
         "• Учёт трат и доходов (текстом, фото чеков, PDF)\n"
         "• Лимиты бюджета по категориям\n"
+        "• Мониторинг цен на Wildberries, Kaspi и Ozon (просто кинь ссылку!)\n"
         "• Напоминания (разовые, ежедневные, ежемесячные)\n"
         "• Список покупок\n"
         "• Рассрочки и Kaspi Red\n"
@@ -51,7 +55,7 @@ async def cmd_start(message: types.Message):
         "• Прогноз погоды (на сегодня, завтра или неделю)\n"
         "• Графики расходов (/chart)\n"
         "• Голосовые сообщения\n\n"
-        "Просто напиши мне о покупке или доходе — я всё запишу!"
+        "Просто напиши мне о покупке, скинь чек или ссылку на товар!"
     )
 
 
@@ -66,10 +70,12 @@ async def cmd_help(message: types.Message):
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
         "• 'Зарплата 300000'\n"
+        "• https://kaspi.kz/shop/p/... (мониторинг цены)\n"
+        "• 'Что в отслеживании?'\n"
         "• 'Погода на завтра'\n"
         "• 'Прогноз на неделю'\n"
-        "• 'Напомни мне в 21:00 выпить витамины'\n"
-        "• 'Добавь в список: молоко, хлеб'\n"
+        "• 'Напомни в 21:00 выпить витамины'\n"
+        "• 'Добавь в покупки: молоко, хлеб'\n"
         "• 'Покажи лимиты'"
     )
 
@@ -109,7 +115,7 @@ async def handle_all_messages(message: types.Message):
     elif message.text:
         await handle_text(message)
     else:
-        await safe_answer(message, "Я понимаю текст, фото, PDF и голосовые.")
+        await safe_answer(message, "Я понимаю текст, фото, PDF, ссылки и голосовые.")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -146,11 +152,9 @@ async def check_reminders():
 
 
 async def check_subscriptions():
-    """Проверка подписок — исключает пропуск месяца при рестартах."""
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
-            # Проверяем в начале каждого часа или в 00:05
             if now.minute == 5:
                 due = process_due_subscriptions(now)
                 if due:
@@ -161,7 +165,6 @@ async def check_subscriptions():
 
 
 async def weather_scheduler():
-    """Отправка утреннего прогноза в 08:30 и вечернего на завтра в 22:30."""
     sent_morning_today = None
     sent_evening_today = None
 
@@ -192,6 +195,85 @@ async def weather_scheduler():
         await asyncio.sleep(30)
 
 
+async def price_tracker_scheduler():
+    """Фоновая проверка цен товаров 4 раза в сутки: 09:30, 14:30, 19:30, 23:30."""
+    last_run_slot = None
+
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            # Слоты запуска: 09:30, 14:30, 19:30, 23:30
+            is_time_slot = (
+                (now.hour == 9 and now.minute >= 30) or
+                (now.hour == 14 and now.minute >= 30) or
+                (now.hour == 19 and now.minute >= 30) or
+                (now.hour == 23 and now.minute >= 30)
+            )
+            slot_id = f"{now.strftime('%Y-%m-%d')}_{now.hour}"
+
+            if is_time_slot and last_run_slot != slot_id:
+                items = get_active_tracked_items()
+                if items:
+                    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+                    for item in items:
+                        url = item.get("url")
+                        old_price = float(item.get("last_price", 0))
+                        was_in_stock = item.get("in_stock", True)
+                        row_idx = item.get("row_idx")
+
+                        info = await fetch_product_info(url)
+                        if info:
+                            new_price = float(info.get("price", 0))
+                            is_in_stock = info.get("in_stock", True)
+
+                            # 1. Проверка падения цены
+                            if new_price > 0 and old_price > 0 and new_price < old_price:
+                                diff = old_price - new_price
+                                pct = int((diff / old_price) * 100)
+                                msg = (
+                                    f"📉 **Цена упала на {info['marketplace']}!**\n\n"
+                                    f"• **Товар:** {info['title']}\n"
+                                    f"• **Было:** ~~{_format_currency(old_price)} KZT~~\n"
+                                    f"• **Сейчас:** **{_format_currency(new_price)} KZT** (-{pct}%)\n"
+                                    f"• **Экономия:** {_format_currency(diff)} KZT\n\n"
+                                    f"[👉 Перейти к товару]({info['url']})"
+                                )
+                                await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=msg)
+
+                            # 2. Товар распродан
+                            elif was_in_stock and not is_in_stock:
+                                msg = (
+                                    f"⚠️ **Товар раскупили!**\n\n"
+                                    f"• {info['title']} ({info['marketplace']})\n"
+                                    f"Сейчас нет в наличии у продавцов.\n"
+                                    f"[Ссылка на товар]({info['url']})"
+                                )
+                                await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=msg)
+
+                            # 3. Товар снова в наличии
+                            elif not was_in_stock and is_in_stock:
+                                msg = (
+                                    f"🟢 **Товар снова в наличии!**\n\n"
+                                    f"• {info['title']} ({info['marketplace']})\n"
+                                    f"Цена: {_format_currency(new_price)} KZT\n"
+                                    f"[👉 Купить]({info['url']})"
+                                )
+                                await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=msg)
+
+                            # Сохраняем состояние в таблицу
+                            update_tracked_item_state(row_idx, new_price, is_in_stock, now_str)
+
+                        # Задержка 3-6 секунд между проверками (имитация человека)
+                        await asyncio.sleep(random.uniform(3.0, 6.0))
+
+                last_run_slot = slot_id
+
+        except Exception as e:
+            print(f"[PriceTracker Scheduler] Ошибка: {e}")
+
+        await asyncio.sleep(60)
+
+
 async def sweep_pending_receipts():
     while True:
         try:
@@ -214,12 +296,10 @@ async def sweep_pending_receipts():
 
 
 async def sweep_clarifications():
-    """Очистка просроченных уточнений — теперь подставляет первую категорию, а не оставляет пустую."""
     while True:
         try:
             expired = sweep_expired_clarifications()
             for chat_id, tx in expired:
-                # ИСПРАВЛЕНИЕ: гарантируем валидную категорию вместо пустой строки
                 if not tx.get("category"):
                     tx["category"] = FALLBACK_EXPENSE_CATEGORY
                 comm = tx.get("user_comment", "")
@@ -244,6 +324,7 @@ async def main():
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
     asyncio.create_task(weather_scheduler())
+    asyncio.create_task(price_tracker_scheduler())
     asyncio.create_task(sweep_pending_receipts())
     asyncio.create_task(sweep_clarifications())
     await dp.start_polling(bot)
