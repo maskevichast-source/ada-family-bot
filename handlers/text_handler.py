@@ -187,41 +187,12 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, rep)
             return
 
-    # 2. Перехват текстового ответа на вопрос уточнения
-    clarification = get_clarification(chat_id)
-    if clarification:
-        matched_opt = None
-        for opt in clarification.get("options", []):
-            words = re.findall(r'\w+', opt["label"].lower())
-            if any(w in t_clean for w in words if len(w) > 3):
-                matched_opt = opt
-                break
-        if not matched_opt:
-            if any(k in t_clean for k in ["работ", "кафе", "собой", "перекус", "офис", "зал", "спорт"]):
-                matched_opt = clarification["options"][0]
-            elif any(k in t_clean for k in ["дом", "продукт", "семь", "каждый день", "обычн"]):
-                matched_opt = clarification["options"][-1]
-
-        if matched_opt:
-            pop_clarification(chat_id)
-            tx = clarification["transaction"]
-            tx["category"] = matched_opt["category"]
-            tx["subcategory"] = matched_opt.get("subcategory", "")
-            tx["user_comment"] = f"{tx.get('user_comment', '')} ({text})".strip()
-            tx["necessity"] = matched_opt.get("necessity") or normalize_necessity(tx.get("necessity"), tx["category"])
-            append_transaction(tx)
-            report = _format_confirmation_report(tx, f"Поняла, это {matched_opt['label']}!")
-            add_chat_message(chat_id, "Ада", report)
-            await safe_answer(message, report)
-            return
-
-    # ── ПРЯМОЙ ПЕРЕХВАТ 1: ССЫЛКИ НА МАРКЕТПЛЕЙСЫ (ТРЕКЕР СКИДОК) ──
+# ── ПРЯМОЙ ПЕРЕХВАТ 1: ССЫЛКИ НА МАРКЕТПЛЕЙСЫ (ТРЕКЕР СКИДОК) ──
     url_match = re.search(r'https?://[^\s]+', text)
     if url_match:
         found_url = url_match.group(0).rstrip('.,!?')
         marketplace = detect_marketplace(found_url)
 
-        # Если найдена ссылка на WB, Kaspi или Ozon — ОБРАБАТЫВАЕМ ТОЛЬКО КАК ТОВАР!
         if marketplace:
             try:
                 await message.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -238,6 +209,37 @@ async def _process_text_message(message: Message, text: str):
                     price=info["price"],
                     url=info["url"],
                     in_stock=info["in_stock"],
+                )
+                stock_status = "в наличии ✅" if info["in_stock"] else "нет в наличии ❌"
+                res = (
+                    f"🎯 **Взяла на карандаш!**\n\n"
+                    f"• **Товар:** {info['title']}\n"
+                    f"• **Площадка:** {info['marketplace']}\n"
+                    f"• **Текущая цена:** {_format_currency(info['price'])} KZT ({stock_status})\n\n"
+                    f"_Буду проверять цену 4 раза в день. Если подешевеет или закончится — сразу сообщу в чат!_"
+                )
+            elif info:
+                add_tracked_item(
+                    user=user_name,
+                    marketplace=info["marketplace"],
+                    item_id=info["item_id"],
+                    title=info["title"],
+                    price=0,
+                    url=info["url"],
+                    in_stock=info.get("in_stock", True),
+                )
+                res = (
+                    f"🎯 **Товар добавлен на мониторинг!**\n\n"
+                    f"• **Товар:** {info['title']}\n"
+                    f"• **Площадка:** {info['marketplace']}\n\n"
+                    f"_Цена на странице сейчас скрыта или требует выбора продавца. Если хочешь зафиксировать стартовую цену для отслеживания скидки, напиши её в ответ (например: «цена 48500»)._"
+                )
+            else:
+                res = f"Не удалось автоматически разобрать карточку {marketplace}. Проверьте, открывается ли ссылка."
+
+            add_chat_message(chat_id, "Ада", res)
+            await safe_answer(message, res)
+            return  # СТРОГИЙ ВЫХОД: сообщение НИКОГДА не уйдёт в траты «None KZT»
                 )
                 stock_status = "в наличии ✅" if info["in_stock"] else "нет в наличии ❌"
                 res = (
