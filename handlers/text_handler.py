@@ -42,6 +42,8 @@ from services.pending_clarifications import (
 from services.memory import get_chat_history, add_chat_message
 from services.voice import transcribe_voice
 from services.timezone import now_astana
+from services.analytics import analyze_budget_leaks
+from services.reports import generate_pdf_report, generate_excel_export
 
 
 def _to_number_or_blank(value):
@@ -186,7 +188,7 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, rep)
             return
 
-    # 2. Перехват текстового ответа на вопрос уточнения
+    # 2. Перехват ответа на уточнение
     clarification = get_clarification(chat_id)
     if clarification:
         matched_opt = None
@@ -214,7 +216,7 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, report)
             return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 0: МГНОВЕННОЕ ИЗМЕНЕНИЕ БАНКА В ПОСЛЕДНЕЙ ЗАПИСИ ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 0: МГНОВЕННАЯ СМЕНА БАНКА ПОСЛЕДНЕЙ ТРАТЫ ──
     bank_match = re.search(r'(?:измени|поменяй|запиши|исправь)?\s*(?:что\s+это\s+)?(?:оплата\s+через|банк\s+на|карту\s+на|с\s+карты|банк)\s+([a-zA-Zа-яА-Я]+)', t_clean)
     if bank_match:
         target_bank = bank_match.group(1).upper()
@@ -232,7 +234,40 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, res)
             return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 1: ГРАФИКИ ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 1: ДЕТЕКТОР УТЕЧЕК БЮДЖЕТА ──
+    if t_clean in {"/leaks", "утечки"} or any(k in t_clean for k in ["утечки бюджета", "микротраты", "куда уходят деньги", "куда утекают деньги", "мелкие траты", "на что уходит мелочь"]):
+        leak_data = analyze_budget_leaks()
+        add_chat_message(chat_id, "Ада", leak_data["text"])
+        await safe_answer(message, leak_data["text"])
+        return
+
+    # ── ПРЯМОЙ ПЕРЕХВАТ 2: ГЕНЕРАЦИЯ PDF-ОТЧЁТА ──
+    if t_clean in {"/report", "pdf"} or any(k in t_clean for k in ["отчет в pdf", "отчёт в pdf", "выгрузи отчет в pdf", "скачать pdf"]):
+        try:
+            await message.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+            pdf_bytes = await asyncio.to_thread(generate_pdf_report)
+            pdf_file = BufferedInputFile(pdf_bytes, filename=f"Finance_Report_{now_astana().strftime('%Y_%m')}.pdf")
+            await message.answer_document(document=pdf_file, caption="📑 Ваш официальный семейный финансовый отчёт за месяц.")
+            return
+        except Exception as e:
+            print(f"[PDF Report] Ошибка: {e}")
+            await safe_answer(message, "Не удалось сформировать PDF-отчёт.")
+            return
+
+    # ── ПРЯМОЙ ПЕРЕХВАТ 3: ЭКСПОРТ В EXCEL (.XLSX) ──
+    if t_clean in {"/export", "excel"} or any(k in t_clean for k in ["выгрузи в excel", "экспорт в excel", "скачать выписку", "выгрузи выписку", "скачать excel"]):
+        try:
+            await message.bot.send_chat_action(chat_id=chat_id, action="upload_document")
+            excel_bytes = await asyncio.to_thread(generate_excel_export)
+            excel_file = BufferedInputFile(excel_bytes, filename=f"Family_Finance_{now_astana().strftime('%Y_%m')}.xlsx")
+            await message.answer_document(document=excel_file, caption="📊 Ваша полная выписка в формате Excel со всеми операциями.")
+            return
+        except Exception as e:
+            print(f"[Excel Export] Ошибка: {e}")
+            await safe_answer(message, "Не удалось сформировать файл Excel.")
+            return
+
+    # ── ПРЯМОЙ ПЕРЕХВАТ 4: ГРАФИКИ ──
     if any(k in t_clean for k in ["график", "диаграмм", "чарт", "дашборд"]) or t_clean in {"/chart", "chart"}:
         try:
             image_bytes = await asyncio.to_thread(generate_expense_chart)
@@ -246,7 +281,7 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, "Не удалось построить график.")
         return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 2: ПОГОДА ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 5: ПОГОДА ──
     if any(k in t_clean for k in ["погода", "погоду", "прогноз", "зонт"]):
         target = "today"
         if "недел" in t_clean or "5 дней" in t_clean or "выходн" in t_clean:
@@ -262,13 +297,13 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, res)
         return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 3: ДИАГНОСТИКА ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 6: ДИАГНОСТИКА ──
     if t_clean in {"debug", "/debug"}:
         debug_text = debug_transactions_snapshot()
         await safe_answer(message, f"```\n{debug_text}\n```")
         return
 
-    # ── ПРЯМОЙ ПЕРЕХВАТ 4: РАЗДЕЛИТЬ ТРАНЗАКЦИЮ ──
+    # ── ПРЯМОЙ ПЕРЕХВАТ 7: РАЗДЕЛИТЬ ТРАНЗАКЦИЮ ──
     if "раздели" in t_clean and "транзакцию" in t_clean:
         match = re.search(r"раздели\s+транзакцию\s+(\d+)[\s:]*(.+?)[\s]*\|\s*(.+?)", text, re.IGNORECASE)
         if match:
