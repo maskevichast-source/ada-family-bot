@@ -1,11 +1,14 @@
 """Обработка фото, PDF и скриншотов чеков."""
 
+import asyncio
+
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from services.vision import parse_receipt
 from services.sheets import append_transaction, normalize_necessity
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending
 from services.pending_clarifications import set_clarification
+from config import get_authorized_user_name
 from services.categories import (
     TYPE_EXPENSE, TYPE_INCOME,
     EXPENSE_CATEGORIES, INCOME_CATEGORIES,
@@ -40,7 +43,7 @@ def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> st
 
 
 async def handle_media(message: Message):
-    user_name = message.from_user.first_name or "Пользователь"
+    user_name = get_authorized_user_name(message.from_user.id, message.from_user.first_name) or message.from_user.first_name or "Пользователь"
     chat_id = message.chat.id
     caption = message.caption or ""
 
@@ -87,7 +90,7 @@ async def handle_media(message: Message):
         if not tx.get("currency"): tx["currency"] = "KZT"
         if not tx.get("funds_type"): tx["funds_type"] = "Собственные"
         if not tx.get("resource"): tx["resource"] = "Карта"
-        if not tx.get("user"): tx["user"] = user_name
+        tx["user"] = user_name
         if not tx.get("merchant"): tx["merchant"] = ""
         if not tx.get("user_comment"): tx["user_comment"] = caption or ""
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
@@ -101,25 +104,23 @@ async def handle_media(message: Message):
     ]
 
     if low_confidence_txs and not caption:
-        tx = low_confidence_txs[0]
-        options = [
-            {"label": alt, "category": alt, "subcategory": ""}
-            for alt in tx.get("alternatives", [])
-        ]
-        buttons = [
-            [InlineKeyboardButton(text=opt["label"], callback_data=f"clarify_opt:{i}")]
-            for i, opt in enumerate(options)
-        ]
-        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
-        set_clarification(chat_id, tx, options)
-        await message.answer(reply or "Не уверена в категории чека. Выбери вариант:", reply_markup=kb)
+        # Не теряем остальные позиции чека: весь чек ждёт короткий комментарий/уточнение.
+        # Раньше в pending_clarification уходила только одна позиция, а остальные могли потеряться.
+        set_pending(chat_id, validated_transactions, user_name)
+        await safe_answer(
+            message,
+            (
+                f"Распознала {len(validated_transactions)} позиций, но по одной категории сомневаюсь. "
+                "Напиши короткий комментарий к чеку или уточни категорию — и я сохраню всё вместе."
+            ),
+        )
         return
 
     if caption:
         for tx in validated_transactions:
             tx["user_comment"] = caption
             tx["user"] = user_name
-            append_transaction(tx)
+            await asyncio.to_thread(append_transaction, tx)
         report = _format_receipt_report(validated_transactions, reply)
         await safe_answer(message, report)
     else:
