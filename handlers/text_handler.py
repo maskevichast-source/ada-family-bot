@@ -30,6 +30,7 @@ from services.sheets import (
     get_transactions_for_period, find_recent_duplicate_transaction,
     debug_transactions_snapshot, normalize_necessity,
     add_tracked_item, get_active_tracked_items, delete_tracked_item,
+    update_last_transaction_bank_and_source,
 )
 from services.charts import generate_expense_chart
 from services.limits_ai import generate_limits_from_history
@@ -215,13 +216,31 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, report)
             return
 
+    # ── ПРЯМОЙ ПЕРЕХВАТ 0: МГНОВЕННОЕ ИЗМЕНЕНИЕ БАНКА В ПОСЛЕДНЕЙ ЗАПИСИ ──
+    # Ловит фразы типа: "измени банк на bcc", "запиши что это оплата через bcc", "банк каспи", "это с bcc"
+    bank_match = re.search(r'(?:измени|поменяй|запиши|исправь)?\s*(?:что\s+это\s+)?(?:оплата\s+через|банк\s+на|карту\s+на|с\s+карты|банк)\s+([a-zA-Zа-яА-Я]+)', t_clean)
+    if bank_match:
+        target_bank = bank_match.group(1).upper()
+        if target_bank in ["BCC", "KASPI", "HALYK", "FORTE", "FREEDOM", "НАЛОМ", "НАЛИЧНЫЕ", "БЦК", "КАСПИ"]:
+            if target_bank in ["БЦК"]: target_bank = "BCC"
+            if target_bank in ["КАСПИ"]: target_bank = "Kaspi"
+            if target_bank in ["НАЛОМ", "НАЛИЧНЫЕ"]: target_bank = "Наличные"
+
+            updated_rec = update_last_transaction_bank_and_source(target_bank)
+            if updated_rec:
+                res = f"✅ Исправила в последней записи ({updated_rec.get('user_comment')}, {_format_currency(updated_rec.get('amount'))} KZT): банк изменён на **{updated_rec.get('bank')}** ({updated_rec.get('source')})."
+            else:
+                res = "Не нашла последнюю запись в таблице для изменения банка."
+            add_chat_message(chat_id, "Ада", res)
+            await safe_answer(message, res)
+            return
+
     # ── ПРЯМОЙ ПЕРЕХВАТ 1: ССЫЛКИ НА МАРКЕТПЛЕЙСЫ (ТРЕКЕР СКИДОК) ──
     url_match = re.search(r'https?://[^\s]+', text)
     if url_match:
         found_url = url_match.group(0).rstrip('.,!?')
         marketplace = detect_marketplace(found_url)
 
-        # Если найдена ссылка на WB, Kaspi или Ozon — ОБРАБАТЫВАЕМ ТОЛЬКО КАК ТОВАР!
         if marketplace:
             try:
                 await message.bot.send_chat_action(chat_id=chat_id, action="typing")
@@ -261,14 +280,14 @@ async def _process_text_message(message: Message, text: str):
                     f"🎯 **Товар добавлен на мониторинг!**\n\n"
                     f"• **Товар:** {info['title']}\n"
                     f"• **Площадка:** {info['marketplace']}\n\n"
-                    f"_Цена на странице сейчас скрыта или требует выбора продавца. Если хочешь зафиксировать стартовую цену для отслеживания скидки, напиши её в ответ (например: «цена 48500»)._"
+                    f"_Цена на странице сейчас скрыта защитой от ботов. Если хочешь зафиксировать стартовую цену для отслеживания скидки, напиши её в ответ (например: «цена 48500»)._"
                 )
             else:
                 res = f"Не удалось автоматически разобрать карточку {marketplace}. Проверьте, открывается ли ссылка в браузере."
 
             add_chat_message(chat_id, "Ада", res)
             await safe_answer(message, res)
-            return  # СТРОГИЙ ВЫХОД: сообщение НИКОГДА не уйдёт в траты «None KZT»
+            return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 2: ПРОСМОТР ТОВАРОВ В ОТСЛЕЖИВАНИИ ──
     if any(k in t_clean for k in ["что в отслеживании", "список отслеживания", "какие товары отслеживаем", "трекер цен", "мои скидки"]):
