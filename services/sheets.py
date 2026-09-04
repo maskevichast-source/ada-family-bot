@@ -123,6 +123,31 @@ def append_transaction(data: dict):
         print(f"[Транзакции] Не удалось добавить запись: {e}")
 
 
+def update_last_transaction_bank_and_source(new_bank: str) -> Optional[dict]:
+    """Мгновенно и железно обновляет банк и источник в САМОЙ ПОСЛЕДНЕЙ записи таблицы."""
+    try:
+        ws = get_db().worksheet("Transactions")
+        records = _get_all_records_safe(ws)
+        if not records:
+            return None
+
+        last_row_idx = len(records) + 1  # 1-индексация с учетом заголовка
+        bank_norm = new_bank.strip()
+        source_norm = normalize_bank_source(bank_norm, "")
+
+        # Колонка 7: bank, Колонка 8: source
+        ws.update_cell(last_row_idx, 7, bank_norm)
+        ws.update_cell(last_row_idx, 8, source_norm)
+
+        last_rec = records[-1]
+        last_rec["bank"] = bank_norm
+        last_rec["source"] = source_norm
+        return last_rec
+    except Exception as e:
+        print(f"[Таблицы] Ошибка прямого обновления банка: {e}")
+        return None
+
+
 def ensure_power_bi_dimension_table():
     try:
         db = get_db()
