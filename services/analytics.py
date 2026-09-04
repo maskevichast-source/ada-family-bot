@@ -104,3 +104,4 @@ def analyze_budget_leaks(year: int = None, month: int = None) -> dict:
         "percent": pct,
         "details": leaks,
     }
+
