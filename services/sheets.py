@@ -123,7 +123,6 @@ def append_transaction(data: dict):
 
 
 def ensure_power_bi_dimension_table():
-    """Создаёт лист Dim_Categories со строго уникальными категориями (связь 1:* для Power BI)."""
     try:
         db = get_db()
         try:
@@ -177,7 +176,6 @@ def get_last_200_transactions():
 
 
 def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
-    """Универсальное чтение периода: работает как с YYYY-MM-DD, так и с DD.MM.YYYY."""
     try:
         ws = get_db().worksheet("Transactions")
         records = _get_all_records_safe(ws)
@@ -249,7 +247,6 @@ def find_recent_duplicate_transaction(amount, comment: str = "", minutes: int = 
 
 
 def delete_record_by_keyword(worksheet_name: str, search_query: str, search_from_recent: bool = True):
-    """Точное удаление: all() для всех ключевых слов, защита от удаления чужих записей."""
     try:
         ws = get_db().worksheet(worksheet_name)
         records = _get_all_records_safe(ws)
@@ -670,3 +667,84 @@ def get_pending_reminders():
     except Exception as e:
         print(f"[Напоминания] Ошибка чтения: {e}")
         return []
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ТРЕКЕР СКИДОК И НАЛИЧИЯ (WILDBERRIES, KASPI, OZON)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+TRACKER_COLUMNS = [
+    "id", "date_added", "user", "marketplace", "item_id", "title",
+    "url", "initial_price", "last_price", "in_stock", "status", "last_checked"
+]
+
+
+def _get_or_create_tracker_sheet():
+    db = get_db()
+    try:
+        ws = db.worksheet("PriceTracker")
+    except Exception:
+        ws = db.add_worksheet(title="PriceTracker", rows=100, cols=len(TRACKER_COLUMNS))
+        ws.append_row(TRACKER_COLUMNS)
+        return ws
+    if not ws.row_values(1):
+        ws.append_row(TRACKER_COLUMNS)
+    return ws
+
+
+def add_tracked_item(user: str, marketplace: str, item_id: str, title: str,
+                     price: float, url: str, in_stock: bool = True) -> dict:
+    """Добавить новый товар в отслеживание."""
+    ws = _get_or_create_tracker_sheet()
+    now = datetime.datetime.now(ASTANA_TZ)
+    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
+    item_key = f"TRK_{now.strftime('%Y%m%d_%H%M%S')}"
+
+    row = [
+        item_key, now_str, user, marketplace, str(item_id), title,
+        url, str(price), str(price), "True" if in_stock else "False", "active", now_str
+    ]
+    ws.append_row(row, table_range=_table_range(len(TRACKER_COLUMNS)))
+    return {
+        "id": item_key,
+        "marketplace": marketplace,
+        "title": title,
+        "price": price,
+        "in_stock": in_stock,
+        "url": url,
+    }
+
+
+def get_active_tracked_items() -> list[dict]:
+    """Получить все активные товары на мониторинге."""
+    try:
+        ws = _get_or_create_tracker_sheet()
+        records = _get_all_records_safe(ws)
+        active = []
+        for idx, r in enumerate(records, start=2):
+            if str(r.get("status", "active")).lower() == "active":
+                r["row_idx"] = idx
+                r["initial_price"] = parse_amount(r.get("initial_price", 0))
+                r["last_price"] = parse_amount(r.get("last_price", 0))
+                r["in_stock"] = str(r.get("in_stock", "True")).lower() == "true"
+                active.append(r)
+        return active
+    except Exception as e:
+        print(f"[PriceTracker] Ошибка чтения списка: {e}")
+        return []
+
+
+def update_tracked_item_state(row_idx: int, new_price: float, in_stock: bool, checked_at: str):
+    """Обновить цену и статус наличия товара."""
+    try:
+        ws = _get_or_create_tracker_sheet()
+        ws.update_cell(row_idx, 9, str(new_price))  # last_price
+        ws.update_cell(row_idx, 10, "True" if in_stock else "False")  # in_stock
+        ws.update_cell(row_idx, 12, checked_at)  # last_checked
+    except Exception as e:
+        print(f"[PriceTracker] Ошибка обновления товара на строке {row_idx}: {e}")
+
+
+def delete_tracked_item(search_query: str) -> Optional[dict]:
+    """Удалить товар из мониторинга."""
+    return delete_record_by_keyword("PriceTracker", search_query, search_from_recent=True)
