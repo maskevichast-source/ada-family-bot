@@ -124,18 +124,17 @@ def append_transaction(data: dict):
 
 
 def update_last_transaction_bank_and_source(new_bank: str) -> Optional[dict]:
-    """Мгновенно и железно обновляет банк и источник в САМОЙ ПОСЛЕДНЕЙ записи таблицы."""
+    """Мгновенно обновляет банк и источник в последней записи таблицы."""
     try:
         ws = get_db().worksheet("Transactions")
         records = _get_all_records_safe(ws)
         if not records:
             return None
 
-        last_row_idx = len(records) + 1  # 1-индексация с учетом заголовка
+        last_row_idx = len(records) + 1
         bank_norm = new_bank.strip()
         source_norm = normalize_bank_source(bank_norm, "")
 
-        # Колонка 7: bank, Колонка 8: source
         ws.update_cell(last_row_idx, 7, bank_norm)
         ws.update_cell(last_row_idx, 8, source_norm)
 
@@ -144,7 +143,7 @@ def update_last_transaction_bank_and_source(new_bank: str) -> Optional[dict]:
         last_rec["source"] = source_norm
         return last_rec
     except Exception as e:
-        print(f"[Таблицы] Ошибка прямого обновления банка: {e}")
+        print(f"[Таблицы] Ошибка обновления банка: {e}")
         return None
 
 
@@ -693,80 +692,3 @@ def get_pending_reminders():
     except Exception as e:
         print(f"[Напоминания] Ошибка чтения: {e}")
         return []
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# ТРЕКЕР СКИДОК И НАЛИЧИЯ (WILDBERRIES, KASPI, OZON)
-# ═══════════════════════════════════════════════════════════════════════════════
-
-TRACKER_COLUMNS = [
-    "id", "date_added", "user", "marketplace", "item_id", "title",
-    "url", "initial_price", "last_price", "in_stock", "status", "last_checked"
-]
-
-
-def _get_or_create_tracker_sheet():
-    db = get_db()
-    try:
-        ws = db.worksheet("PriceTracker")
-    except Exception:
-        ws = db.add_worksheet(title="PriceTracker", rows=100, cols=len(TRACKER_COLUMNS))
-        ws.append_row(TRACKER_COLUMNS)
-        return ws
-    if not ws.row_values(1):
-        ws.append_row(TRACKER_COLUMNS)
-    return ws
-
-
-def add_tracked_item(user: str, marketplace: str, item_id: str, title: str,
-                     price: float, url: str, in_stock: bool = True) -> dict:
-    ws = _get_or_create_tracker_sheet()
-    now = datetime.datetime.now(ASTANA_TZ)
-    now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    item_key = f"TRK_{now.strftime('%Y%m%d_%H%M%S')}"
-
-    row = [
-        item_key, now_str, user, marketplace, str(item_id), title,
-        url, str(price), str(price), "True" if in_stock else "False", "active", now_str
-    ]
-    ws.append_row(row, table_range=_table_range(len(TRACKER_COLUMNS)))
-    return {
-        "id": item_key,
-        "marketplace": marketplace,
-        "title": title,
-        "price": price,
-        "in_stock": in_stock,
-        "url": url,
-    }
-
-
-def get_active_tracked_items() -> list[dict]:
-    try:
-        ws = _get_or_create_tracker_sheet()
-        records = _get_all_records_safe(ws)
-        active = []
-        for idx, r in enumerate(records, start=2):
-            if str(r.get("status", "active")).lower() == "active":
-                r["row_idx"] = idx
-                r["initial_price"] = parse_amount(r.get("initial_price", 0))
-                r["last_price"] = parse_amount(r.get("last_price", 0))
-                r["in_stock"] = str(r.get("in_stock", "True")).lower() == "true"
-                active.append(r)
-        return active
-    except Exception as e:
-        print(f"[PriceTracker] Ошибка чтения списка: {e}")
-        return []
-
-
-def update_tracked_item_state(row_idx: int, new_price: float, in_stock: bool, checked_at: str):
-    try:
-        ws = _get_or_create_tracker_sheet()
-        ws.update_cell(row_idx, 9, str(new_price))
-        ws.update_cell(row_idx, 10, "True" if in_stock else "False")
-        ws.update_cell(row_idx, 12, checked_at)
-    except Exception as e:
-        print(f"[PriceTracker] Ошибка обновления товара на строке {row_idx}: {e}")
-
-
-def delete_tracked_item(search_query: str) -> Optional[dict]:
-    return delete_record_by_keyword("PriceTracker", search_query, search_from_recent=True)
