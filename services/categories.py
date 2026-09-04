@@ -283,3 +283,4 @@ def get_time_context_hint(hour: int, weekday: int) -> str:
         hints.append("ночное время")
 
     return "; ".join(hints)
+
