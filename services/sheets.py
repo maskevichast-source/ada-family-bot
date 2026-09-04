@@ -2,6 +2,7 @@ import datetime
 import json
 import os
 import re
+from typing import Optional
 import gspread
 from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
@@ -694,7 +695,6 @@ def _get_or_create_tracker_sheet():
 
 def add_tracked_item(user: str, marketplace: str, item_id: str, title: str,
                      price: float, url: str, in_stock: bool = True) -> dict:
-    """Добавить новый товар в отслеживание."""
     ws = _get_or_create_tracker_sheet()
     now = datetime.datetime.now(ASTANA_TZ)
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -716,7 +716,6 @@ def add_tracked_item(user: str, marketplace: str, item_id: str, title: str,
 
 
 def get_active_tracked_items() -> list[dict]:
-    """Получить все активные товары на мониторинге."""
     try:
         ws = _get_or_create_tracker_sheet()
         records = _get_all_records_safe(ws)
@@ -735,16 +734,14 @@ def get_active_tracked_items() -> list[dict]:
 
 
 def update_tracked_item_state(row_idx: int, new_price: float, in_stock: bool, checked_at: str):
-    """Обновить цену и статус наличия товара."""
     try:
         ws = _get_or_create_tracker_sheet()
-        ws.update_cell(row_idx, 9, str(new_price))  # last_price
-        ws.update_cell(row_idx, 10, "True" if in_stock else "False")  # in_stock
-        ws.update_cell(row_idx, 12, checked_at)  # last_checked
+        ws.update_cell(row_idx, 9, str(new_price))
+        ws.update_cell(row_idx, 10, "True" if in_stock else "False")
+        ws.update_cell(row_idx, 12, checked_at)
     except Exception as e:
         print(f"[PriceTracker] Ошибка обновления товара на строке {row_idx}: {e}")
 
 
 def delete_tracked_item(search_query: str) -> Optional[dict]:
-    """Удалить товар из мониторинга."""
     return delete_record_by_keyword("PriceTracker", search_query, search_from_recent=True)
