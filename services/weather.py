@@ -1,8 +1,11 @@
-"""Почасовой и многодневный прогноз погоды для Астаны через Open-Meteo (до 7 дней)."""
+"""Простой прогноз погоды для Астаны через Open-Meteo.
+
+Формат специально короткий: семья должна быстро понять день, осадки и одежду,
+а не читать метеосводку на пол-экрана.
+"""
 
 import asyncio
 import datetime
-import json
 import urllib.parse
 import urllib.request
 from services.timezone import ASTANA_TZ
@@ -12,32 +15,32 @@ ASTANA_LONGITUDE = 71.449074
 
 WEATHER_DESCRIPTIONS = {
     0: "ясно ☀️",
-    1: "преимущественно ясно 🌤",
-    2: "переменная облачность ⛅",
+    1: "почти ясно 🌤",
+    2: "облачно с прояснениями ⛅",
     3: "пасмурно ☁️",
     45: "туман 🌫",
-    48: "изморозь и туман 🌫",
-    51: "слабая морось 🌧",
+    48: "туман/изморозь 🌫",
+    51: "морось 🌧",
     53: "морось 🌧",
     55: "сильная морось 🌧",
-    56: "слабая ледяная морось 🌧",
-    57: "сильная ледяная морось 🌧",
+    56: "ледяная морось 🌧",
+    57: "ледяная морось 🌧",
     61: "небольшой дождь 🌦",
     63: "дождь 🌧",
     65: "сильный дождь 🌧",
-    66: "небольшой ледяной дождь 🌧",
-    67: "сильный ледяной дождь 🌧",
+    66: "ледяной дождь 🌧",
+    67: "ледяной дождь 🌧",
     71: "небольшой снег 🌨",
     73: "снег 🌨",
     75: "сильный снег ❄️",
-    77: "снежные зёрна ❄️",
-    80: "небольшой ливень 🌦",
+    77: "снежная крупа ❄️",
+    80: "ливень 🌦",
     81: "ливень 🌧",
     82: "сильный ливень 🌧",
-    85: "слабый снежный ливень 🌨",
+    85: "снежный ливень 🌨",
     86: "сильный снежный ливень ❄️",
     95: "гроза ⛈",
-    96: "гроза с небольшим градом ⛈",
+    96: "гроза с градом ⛈",
     99: "гроза с сильным градом ⛈",
 }
 
@@ -46,16 +49,23 @@ WEEKDAYS_RU = ["понедельник", "вторник", "среда", "чет
 
 def _describe(code: object) -> str:
     try:
-        return WEATHER_DESCRIPTIONS.get(int(code), "неизвестно")
+        return WEATHER_DESCRIPTIONS.get(int(code), "непонятно по небу")
     except (TypeError, ValueError):
-        return "неизвестно"
+        return "непонятно по небу"
+
+
+def _num(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
 def _format_temp(val: object) -> str:
-    try:
-        return f"{float(val):.0f}°C"
-    except (TypeError, ValueError):
+    value = _num(val)
+    if value is None:
         return "нет данных"
+    return f"{value:.0f}°C"
 
 
 def _request_open_meteo(forecast_days: int = 7) -> dict:
@@ -65,115 +75,126 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
         "hourly": "temperature_2m,apparent_temperature,precipitation_probability,weather_code,wind_speed_10m",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max",
-        "forecast_days": max(1, min(forecast_days, 7)),
         "timezone": "Asia/Almaty",
+        "forecast_days": max(1, min(int(forecast_days), 7)),
     })
     url = f"https://api.open-meteo.com/v1/forecast?{params}"
-    req = urllib.request.Request(url, headers={"User-Agent": "FamilyFinanceBot/2.4"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+    with urllib.request.urlopen(url, timeout=12) as response:
+        import json
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _clothes_advice(temp_min: float | None, temp_max: float | None, rain: int | None, wind: float | None) -> str:
+    if temp_max is None:
+        return "Что надеть: ориентируйтесь по фактической температуре за окном."
+
+    parts = []
+    if temp_max <= -15:
+        parts.append("очень тёплая куртка, шапка и перчатки")
+    elif temp_max <= -5:
+        parts.append("зимняя куртка и шапка")
+    elif temp_max <= 5:
+        parts.append("тёплая куртка")
+    elif temp_max <= 12:
+        parts.append("куртка или плотная ветровка")
+    elif temp_max <= 20:
+        parts.append("худи/лёгкая куртка")
+    else:
+        parts.append("лёгкая одежда")
+
+    if rain is not None and rain >= 45:
+        parts.append("зонт лучше взять")
+    if wind is not None and wind >= 30:
+        parts.append("будет ветрено — капюшон или шарф пригодятся")
+
+    return "Что надеть: " + ", ".join(parts) + "."
+
+
+def _day_title(dt: datetime.date, today: datetime.date) -> str:
+    if dt == today:
+        return "Сегодня"
+    if dt == today + datetime.timedelta(days=1):
+        return "Завтра"
+    return f"{WEEKDAYS_RU[dt.weekday()].capitalize()}, {dt.strftime('%d.%m')}"
 
 
 async def get_weather_forecast(target: str = "today", days: int = 1) -> str | None:
-    """Универсальный запрос погоды:
-    - target="today": сегодня (с учётом текущего часа)
-    - target="tomorrow": на завтра
-    - target="after_tomorrow": на послезавтра
-    - target="week": сводка на 5-7 дней
+    """Вернуть короткий прогноз.
+
+    target:
+    - today
+    - tomorrow
+    - after_tomorrow
+    - week
     """
     try:
-        req_days = 7 if target in ["week", "after_tomorrow"] or days > 2 else (2 if target == "tomorrow" else 1)
+        req_days = 7 if target in {"week", "after_tomorrow"} or days >= 4 else (2 if target == "tomorrow" else 1)
         data = await asyncio.to_thread(_request_open_meteo, req_days)
 
         now = datetime.datetime.now(ASTANA_TZ)
         today_date = now.date()
 
-        # ── 1. ПРОГНОЗ НА НЕДЕЛЮ ──
         if target == "week" or days >= 4:
             daily = data.get("daily", {})
             times = daily.get("time", [])
-            lines = ["📅 **ПРОГНОЗ ПОГОДЫ В АСТАНЕ НА НЕДЕЛЮ**\n"]
+            lines = ["📅 Погода в Астане на неделю:"]
             for i, d_str in enumerate(times[:7]):
                 dt = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
-                w_day = WEEKDAYS_RU[dt.weekday()].capitalize()
-                desc = _describe(daily["weather_code"][i])
-                t_min = _format_temp(daily["temperature_2m_min"][i])
-                t_max = _format_temp(daily["temperature_2m_max"][i])
-                rain = daily["precipitation_probability_max"][i]
-                wind = daily["wind_speed_10m_max"][i]
-                day_title = "Сегодня" if dt == today_date else ("Завтра" if dt == today_date + datetime.timedelta(days=1) else f"{w_day}, {dt.strftime('%d.%m')}")
-                lines.append(f"• **{day_title}**: от {t_min} до {t_max}, {desc} (осадки {rain}%, ветер до {wind} км/ч)")
-            lines.append("\nОдевайтесь по погоде, планируйте неделю уверенно!")
+                t_min = _num(daily.get("temperature_2m_min", [None])[i])
+                t_max = _num(daily.get("temperature_2m_max", [None])[i])
+                desc = _describe(daily.get("weather_code", [None])[i])
+                rain = daily.get("precipitation_probability_max", [None])[i]
+                lines.append(f"• {_day_title(dt, today_date)}: {_format_temp(t_min)}…{_format_temp(t_max)}, {desc}, осадки {rain}%")
+            lines.append("\nЕсли планируете поездку — скажи куда и когда, я сверю прогноз под даты.")
             return "\n".join(lines)
 
-        # ── 2. ПРОГНОЗ НА ЗАВТРА ИЛИ ПОСЛЕЗАВТРА ──
-        if target in ["tomorrow", "after_tomorrow"]:
-            offset = 1 if target == "tomorrow" else 2
-            target_date = today_date + datetime.timedelta(days=offset)
-            date_str = target_date.strftime("%Y-%m-%d")
-            w_name = WEEKDAYS_RU[target_date.weekday()].upper()
-            title_word = "ЗАВТРА" if offset == 1 else "ПОСЛЕЗАВТРА"
+        offset = 0
+        if target == "tomorrow":
+            offset = 1
+        elif target == "after_tomorrow":
+            offset = 2
 
-            hourly = data.get("hourly", {})
-            hourly_map = {str(t): i for i, t in enumerate(hourly.get("time", []))}
+        target_date = today_date + datetime.timedelta(days=offset)
+        date_str = target_date.strftime("%Y-%m-%d")
+        title = "сегодня" if offset == 0 else ("завтра" if offset == 1 else "послезавтра")
 
-            lines = [f"🌙 **ПРОГНОЗ НА {title_word}, {w_name} ({target_date.strftime('%d.%m')})**"]
-            day_temps = []
-            rain_probs = []
-
-            for h in [6, 9, 12, 15, 18, 21]:
-                key = f"{date_str}T{h:02d}:00"
-                idx = hourly_map.get(key)
-                if idx is not None:
-                    t = hourly["temperature_2m"][idx]
-                    w = _describe(hourly["weather_code"][idx])
-                    p = hourly["precipitation_probability"][idx]
-                    wind = hourly["wind_speed_10m"][idx]
-                    day_temps.append(t)
-                    rain_probs.append(p)
-                    lines.append(f"{h:02d}:00 — **{_format_temp(t)}**, {w}; осадки {p}%, ветер {wind} км/ч")
-
-            if day_temps:
-                lines.append(f"\nЗа сутки: от {min(day_temps):.0f}°C до {max(day_temps):.0f}°C, макс. вероятность осадков {max(rain_probs)}%.")
-            return "\n".join(lines)
-
-        # ── 3. ПРОГНОЗ НА СЕГОДНЯ (ДИНАМИЧЕСКИЙ) ──
-        curr = data.get("current", {})
         hourly = data.get("hourly", {})
         hourly_map = {str(t): i for i, t in enumerate(hourly.get("time", []))}
-        date_str = today_date.strftime("%Y-%m-%d")
 
-        cur_temp = _format_temp(curr.get("temperature_2m"))
-        app_temp = _format_temp(curr.get("apparent_temperature"))
-        cur_desc = _describe(curr.get("weather_code"))
-        cur_wind = curr.get("wind_speed_10m", "-")
+        temps, rains, winds = [], [], []
+        hours = [9, 12, 15, 18, 21]
+        if offset == 0:
+            hours = [h for h in hours if h >= now.hour] or [18, 21]
 
-        lines = [
-            "☀️ **ПРОГНОЗ ДЛЯ АСТАНЫ НА СЕГОДНЯ**",
-            f"Сейчас: **{cur_temp}**, {cur_desc} (ощущается как {app_temp}), ветер {cur_wind} км/ч.\n",
-        ]
+        cur = data.get("current", {})
+        lines = [f"🌤 Погода в Астане на {title}"]
 
-        # Если вечер (после 19:00), показываем остаток вечера и ночь, а не утро
-        if now.hour >= 19:
-            hours_to_show = [h for h in [20, 22, 23] if h >= now.hour] or [22]
-            lines.append("До конца дня:")
-            for h in hours_to_show:
-                key = f"{date_str}T{h:02d}:00"
-                idx = hourly_map.get(key)
-                if idx is not None:
-                    lines.append(f"{h:02d}:00 — **{_format_temp(hourly['temperature_2m'][idx])}**, {_describe(hourly['weather_code'][idx])}, осадки {hourly['precipitation_probability'][idx]}%")
-            lines.append("\n_День подходит к концу. Чтобы узнать погоду на утро, спроси: «прогноз на завтра»._")
-        else:
-            # Показываем только предстоящие часы
-            hours_to_show = [h for h in [9, 12, 15, 18, 21] if h >= now.hour]
-            if not hours_to_show:
-                hours_to_show = [15, 18, 21]
-            for h in hours_to_show:
-                key = f"{date_str}T{h:02d}:00"
-                idx = hourly_map.get(key)
-                if idx is not None:
-                    lines.append(f"{h:02d}:00 — **{_format_temp(hourly['temperature_2m'][idx])}**, {_describe(hourly['weather_code'][idx])}; осадки {hourly['precipitation_probability'][idx]}%, ветер {hourly['wind_speed_10m'][idx]} км/ч")
-            lines.append("\nОдевайтесь по погоде, а не по оптимизму!")
+        if offset == 0:
+            lines.append(
+                f"Сейчас: {_format_temp(cur.get('temperature_2m'))}, {_describe(cur.get('weather_code'))}. "
+                f"Ощущается как {_format_temp(cur.get('apparent_temperature'))}."
+            )
+
+        period_names = {9: "утро", 12: "день", 15: "день", 18: "вечер", 21: "вечер"}
+        for h in hours:
+            key = f"{date_str}T{h:02d}:00"
+            idx = hourly_map.get(key)
+            if idx is None:
+                continue
+            temp = _num(hourly["temperature_2m"][idx])
+            rain = hourly["precipitation_probability"][idx]
+            wind = _num(hourly["wind_speed_10m"][idx])
+            code = hourly["weather_code"][idx]
+            if temp is not None:
+                temps.append(temp)
+            rains.append(rain)
+            if wind is not None:
+                winds.append(wind)
+            lines.append(f"• {period_names.get(h, str(h))} {h:02d}:00 — {_format_temp(temp)}, {_describe(code)}, осадки {rain}%")
+
+        if temps:
+            lines.append("")
+            lines.append(_clothes_advice(min(temps), max(temps), max(rains) if rains else None, max(winds) if winds else None))
 
         return "\n".join(lines)
 
