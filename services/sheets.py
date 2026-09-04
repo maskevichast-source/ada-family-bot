@@ -6,7 +6,7 @@ from typing import Optional
 import gspread
 from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
-from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE
+from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE, normalize_family_user_name
 from services.categories import TYPE_EXPENSE, SUBCATEGORIES_MAP, DEFAULT_EXPENSE_LIMITS
 from services.money import parse_amount, to_clean_number
 from services.banks import normalize_bank_source
@@ -36,6 +36,30 @@ def _get_all_records_safe(ws):
         padded = row + [""] * (len(headers) - len(row))
         records.append(dict(zip(headers, padded)))
     return records
+
+
+def _get_or_create_worksheet(title: str, headers: list[str], rows: int = 50, cols: int | None = None):
+    """Получить лист или создать его с корректной шапкой.
+
+    Если лист уже есть, но пустой — шапка добавляется. Если первый заголовок
+    старого Reminders был "id", он приводится к "reminder_id" без потери строк.
+    """
+    db = get_db()
+    try:
+        ws = db.worksheet(title)
+    except Exception:
+        ws = db.add_worksheet(title=title, rows=rows, cols=cols or len(headers))
+        ws.append_row(headers, table_range=_table_range(len(headers)))
+        return ws
+
+    values = ws.get_all_values()
+    if not values:
+        ws.append_row(headers, table_range=_table_range(len(headers)))
+    elif title == "Reminders" and values[0]:
+        first = str(values[0][0]).strip().lower()
+        if first == "id":
+            ws.update_cell(1, 1, "reminder_id")
+    return ws
 
 
 def _load_google_credentials():
@@ -83,14 +107,21 @@ def append_transaction(data: dict):
         amount = int(amount)
 
     if not data.get("transaction_id"):
-        data["transaction_id"] = f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_{amount}"
+        data["transaction_id"] = f"TRX_{now.strftime('%Y%m%d_%H%M%S_%f')}_{amount}"
 
     data["date"] = now.strftime("%Y-%m-%d %H:%M:%S")
     if not data.get("user"):
         data["user"] = "Влад"
+    else:
+        data["user"] = normalize_family_user_name(data.get("user")) or str(data.get("user")).strip()
 
-    if not data.get("type") or str(data.get("type")).strip() == "":
+    raw_type = str(data.get("type") or "").strip().lower()
+    if raw_type in {"income", "доход", "in"}:
+        data["type"] = "ДОХОД"
+    elif raw_type in {"expense", "расход", "out", ""}:
         data["type"] = TYPE_EXPENSE
+    else:
+        data["type"] = str(data.get("type")).strip().upper()
 
     if not data.get("currency"):
         data["currency"] = "KZT"
@@ -121,6 +152,7 @@ def append_transaction(data: dict):
         ws.append_row(row, table_range=_table_range(len(columns)))
     except Exception as e:
         print(f"[Транзакции] Не удалось добавить запись: {e}")
+        raise
 
 
 def update_last_transaction_bank_and_source(new_bank: str) -> Optional[dict]:
@@ -617,67 +649,189 @@ def deactivate_subscription(name: str):
         print(f"[Подписки] Ошибка отмены: {e}")
         return None
 
-def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
+def normalize_existing_family_table_values() -> dict:
+    """Разовая мягкая санация старых строк без изменения структуры таблицы.
+
+    Исправляет уже записанные значения:
+    - Transactions.user: D/d/Diana -> Диана, Vlad/Vladislav -> Влад
+    - Transactions.type: expense/income -> РАСХОД/ДОХОД
+    - Reminders.target_user и ShoppingList.added_by — те же алиасы.
+    """
+    stats = {"transactions_users": 0, "transactions_types": 0, "reminders": 0, "shopping": 0}
+
+    # Transactions
     try:
-        ws = get_db().worksheet("Trips")
+        ws = get_db().worksheet("Transactions")
+        records = _get_all_records_safe(ws)
+        for idx, r in enumerate(records, start=2):
+            normalized_user = normalize_family_user_name(r.get("user"))
+            if normalized_user and normalized_user != r.get("user"):
+                ws.update_cell(idx, 3, normalized_user)
+                stats["transactions_users"] += 1
+
+            raw_type = str(r.get("type") or "").strip().lower()
+            new_type = None
+            if raw_type in {"expense", "расход", "out"}:
+                new_type = "РАСХОД"
+            elif raw_type in {"income", "доход", "in"}:
+                new_type = "ДОХОД"
+            if new_type and new_type != r.get("type"):
+                ws.update_cell(idx, 4, new_type)
+                stats["transactions_types"] += 1
+    except Exception as e:
+        print(f"[Санация] Transactions: {e}")
+
+    # Reminders
+    try:
+        ws = get_db().worksheet("Reminders")
+        records = _get_all_records_safe(ws)
+        for idx, r in enumerate(records, start=2):
+            normalized = normalize_family_user_name(r.get("target_user"))
+            if normalized and normalized != r.get("target_user"):
+                ws.update_cell(idx, 3, normalized)
+                stats["reminders"] += 1
+    except Exception as e:
+        print(f"[Санация] Reminders: {e}")
+
+    # ShoppingList
+    try:
+        ws = get_db().worksheet("ShoppingList")
+        records = _get_all_records_safe(ws)
+        for idx, r in enumerate(records, start=2):
+            normalized = normalize_family_user_name(r.get("added_by"))
+            if normalized and normalized != r.get("added_by"):
+                ws.update_cell(idx, 3, normalized)
+                stats["shopping"] += 1
+    except Exception as e:
+        print(f"[Санация] ShoppingList: {e}")
+
+    return stats
+
+
+def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
+    # Сохраняем схему Trips как в текущей таблице/PowerBI: trip_id, destination, dates, budget.
+    headers = ["trip_id", "destination", "dates", "budget"]
+    try:
+        ws = _get_or_create_worksheet("Trips", headers, rows=50, cols=4)
         now = datetime.datetime.now(ASTANA_TZ)
-        trip_id = f"TRIP_{now.strftime('%Y%m%d_%H%M%S')}"
-        ws.append_row([trip_id, destination, dates, parse_amount(budget), notes, "planned"], table_range=_table_range(6))
+        trip_id = f"TRIP_{now.strftime('%Y%m%d_%H%M%S_%f')}"
+        ws.append_row(
+            [trip_id, destination, dates, parse_amount(budget)],
+            table_range=_table_range(4),
+            value_input_option="USER_ENTERED",
+        )
+        return {
+            "trip_id": trip_id,
+            "destination": destination,
+            "dates": dates,
+            "budget": parse_amount(budget),
+            "notes": notes,
+            "status": "planned",
+        }
     except Exception as e:
         print(f"[Поездки] Ошибка: {e}")
+        raise
+
 
 def get_planned_trips():
     try:
         ws = get_db().worksheet("Trips")
         records = _get_all_records_safe(ws)
-        return [r for r in records if str(r.get("status")).lower() == "planned"]
+        return [r for r in records if r.get("destination") or r.get("dates")]
     except Exception as e:
         print(f"[Поездки] Ошибка: {e}")
         return []
 
+
 def add_shopping_items(items: list, user_name: str):
+    headers = ["item_id", "date_added", "added_by", "item", "status"]
     try:
-        ws = get_db().worksheet("ShoppingList")
+        ws = _get_or_create_worksheet("ShoppingList", headers, rows=100, cols=5)
         now = datetime.datetime.now(ASTANA_TZ)
         now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        for item in items:
-            item_id = f"SHOP_{now.strftime('%Y%m%d_%H%M%S')}"
-            ws.append_row([item_id, now_str, user_name, item, "active"], table_range=_table_range(5))
+        saved = []
+        clean_user = normalize_family_user_name(user_name) or user_name or "Семья"
+        for idx, item in enumerate(items or []):
+            item_text = str(item).strip()
+            if not item_text:
+                continue
+            item_id = f"SHOP_{now.strftime('%Y%m%d_%H%M%S_%f')}_{idx}"
+            row = [item_id, now_str, clean_user, item_text, "active"]
+            ws.append_row(row, table_range=_table_range(5), value_input_option="USER_ENTERED")
+            saved.append({
+                "item_id": item_id,
+                "date_added": now_str,
+                "added_by": clean_user,
+                "item": item_text,
+                "status": "active",
+            })
+        return saved
     except Exception as e:
         print(f"[Покупки] Ошибка: {e}")
+        raise
+
 
 def get_shopping_items():
     try:
         ws = get_db().worksheet("ShoppingList")
         records = _get_all_records_safe(ws)
-        return [r for r in records if str(r.get("status")).lower() == "active"]
+        return [r for r in records if str(r.get("status") or "").strip().lower() in {"active", ""} and r.get("item")]
     except Exception as e:
         print(f"[Покупки] Ошибка чтения: {e}")
         return []
+
 
 def mark_shopping_items_done(items_to_remove: list):
     try:
         ws = get_db().worksheet("ShoppingList")
         records = _get_all_records_safe(ws)
         for idx, r in enumerate(records, start=2):
-            if str(r.get("status")).lower() == "active":
+            if str(r.get("status") or "").lower() in {"active", ""}:
                 for item_name in items_to_remove:
-                    if item_name.lower() in str(r.get("item")).lower():
+                    if str(item_name).lower() in str(r.get("item")).lower():
                         ws.update_cell(idx, 5, "done")
     except Exception as e:
         print(f"[Покупки] Ошибка отметки: {e}")
+        raise
 
-def add_reminder(target_user: str, remind_at_str: str, text: str, recurrence: str = "once"):
-    try:
-        ws = get_db().worksheet("Reminders")
-    except Exception:
-        ws = get_db().add_worksheet(title="Reminders", rows=20, cols=7)
-        ws.append_row(["id", "created_at", "target_user", "remind_at", "text", "status", "recurrence"])
+
+def add_reminder(target_user: str, remind_at_str: str, text: str, recurrence: str = "once") -> dict:
+    """Добавляет напоминание и возвращает сохранённую запись.
+
+    Важно: исключения не проглатываются. Хендлер должен честно сказать, если
+    Google Sheets не сохранил строку.
+    """
+    headers = ["reminder_id", "created_at", "target_user", "remind_at", "text", "status", "recurrence"]
+    ws = _get_or_create_worksheet("Reminders", headers, rows=100, cols=7)
 
     now = datetime.datetime.now(ASTANA_TZ)
+    parsed_dt = parse_flexible_datetime(remind_at_str)
+    if not parsed_dt:
+        raise ValueError(f"Некорректное время напоминания: {remind_at_str}")
+
+    clean_target = normalize_family_user_name(target_user) or str(target_user or "Семья").strip() or "Семья"
+    reminder_text = str(text or "Напоминание").strip() or "Напоминание"
+    rec = str(recurrence or "once").strip().lower() or "once"
+    if rec not in {"once", "daily", "monthly"}:
+        rec = "once"
+
     now_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    rem_id = f"REM_{now.strftime('%Y%m%d_%H%M%S')}"
-    ws.append_row([rem_id, now_str, target_user, remind_at_str, text, "pending", recurrence], table_range=_table_range(7))
+    remind_at_norm = parsed_dt.strftime("%Y-%m-%d %H:%M:%S")
+    rem_id = f"REM_{now.strftime('%Y%m%d_%H%M%S_%f')}"
+
+    row = [rem_id, now_str, clean_target, remind_at_norm, reminder_text, "pending", rec]
+    ws.append_row(row, table_range=_table_range(7), value_input_option="USER_ENTERED")
+
+    return {
+        "reminder_id": rem_id,
+        "created_at": now_str,
+        "target_user": clean_target,
+        "remind_at": remind_at_norm,
+        "text": reminder_text,
+        "status": "pending",
+        "recurrence": rec,
+    }
+
 
 def get_pending_reminders():
     try:
@@ -685,8 +839,20 @@ def get_pending_reminders():
         records = _get_all_records_safe(ws)
         pending = []
         for idx, r in enumerate(records, start=2):
-            if str(r.get("status")).lower() == "pending":
+            status = str(r.get("status") or "").strip().lower()
+            remind_at = r.get("remind_at")
+            text = r.get("text")
+
+            # Старые строки без статуса, но с датой и текстом, считаем активными.
+            if status in {"pending", "active", ""} and remind_at and text:
                 r["row_idx"] = idx
+                if not r.get("status"):
+                    r["status"] = "pending"
+                if not r.get("reminder_id") and r.get("id"):
+                    r["reminder_id"] = r.get("id")
+                target = normalize_family_user_name(r.get("target_user"))
+                if target:
+                    r["target_user"] = target
                 pending.append(r)
         return pending
     except Exception as e:
