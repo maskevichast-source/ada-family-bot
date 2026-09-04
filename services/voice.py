@@ -33,3 +33,4 @@ async def transcribe_voice(file_bytes: bytes, filename: str = "voice.oga") -> st
     except Exception as error:
         print(f"[Голос] Не удалось распознать: {error}")
         return ""
+
