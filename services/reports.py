@@ -205,3 +205,4 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
     wb.save(buf)
     buf.seek(0)
     return buf.getvalue()
+
