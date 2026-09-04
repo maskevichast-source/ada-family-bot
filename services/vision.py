@@ -204,3 +204,4 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
     except Exception as error:
         print(f"[Распознавание] Сбой API или формата файла: {error}")
     return {}
+    
