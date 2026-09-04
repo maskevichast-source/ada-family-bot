@@ -31,3 +31,4 @@ def clear_chat_history(chat_id: int):
     """Очистить историю чата."""
     with _lock:
         _chat_history[chat_id] = []
+
