@@ -1,18 +1,15 @@
 """Генерация лимитов бюджета на основе истории трат через DeepSeek."""
 
 import json
-import asyncio
-import math
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY
 from services.ai_config import DEEPSEEK_MODEL
 from services.categories import (
     EXPENSE_CATEGORIES, DEFAULT_EXPENSE_LIMITS, TYPE_EXPENSE,
 )
-from services.sheets import get_transactions_for_period, get_category_limits, save_category_limits
-from services.timezone import now_astana, parse_flexible_datetime
+from services.sheets import get_last_200_transactions, save_category_limits
 
-client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY or "not-configured", base_url="https://api.deepseek.com", timeout=30, max_retries=1)
+client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 LIMITS_SYSTEM_PROMPT = f"""
 Ты — Ада, финансовый аналитик. На основе истории трат семьи за последние месяцы
@@ -34,16 +31,7 @@ LIMITS_SYSTEM_PROMPT = f"""
 async def generate_limits_from_history() -> dict:
     """Сгенерировать лимиты на основе истории трат."""
     try:
-        import datetime as dt
-        now = now_astana()
-        # Complete last three calendar months (including current partial month), not last 200 rows.
-        start = now.date().replace(day=1)
-        for _ in range(2):
-            start = (start-dt.timedelta(days=1)).replace(day=1)
-        transactions = await asyncio.to_thread(get_transactions_for_period, start.isoformat(),
-                       (now.date()+dt.timedelta(days=1)).isoformat())
-        if not any(t.get("type") == TYPE_EXPENSE for t in transactions):
-            return {}
+        transactions = get_last_200_transactions()
 
         # Группируем траты по категориям за последние 3 месяца
         from collections import defaultdict
@@ -84,22 +72,18 @@ async def generate_limits_from_history() -> dict:
         result = json.loads(response.choices[0].message.content)
         limits = result.get("limits", {})
 
-        if not isinstance(limits, dict) or not any(cat in limits for cat in EXPENSE_CATEGORIES):
-            raise ValueError("Модель не вернула лимиты")
-        current = await asyncio.to_thread(get_category_limits)
         # Валидация: все категории из EXPENSE_CATEGORIES должны быть
         final_limits = {}
         for cat in EXPENSE_CATEGORIES:
-            final_limits[cat] = float(limits.get(cat, current.get(cat, DEFAULT_EXPENSE_LIMITS.get(cat, 10000))))
+            final_limits[cat] = float(limits.get(cat, DEFAULT_EXPENSE_LIMITS.get(cat, 10000)))
 
-        if any(not math.isfinite(v) or v < 0 for v in final_limits.values()):
-            raise ValueError("Некорректные лимиты ИИ")
-        await asyncio.to_thread(save_category_limits, final_limits)
+        save_category_limits(final_limits)
         return final_limits
 
     except Exception as e:
         print(f"[Лимиты AI] Ошибка генерации: {e}")
-        # Preserve user limits if the model/API fails.
-        return {}
+        # Возвращаем дефолтные
+        save_category_limits(DEFAULT_EXPENSE_LIMITS)
+        return DEFAULT_EXPENSE_LIMITS
 
 

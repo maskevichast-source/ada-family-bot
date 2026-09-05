@@ -1,9 +1,6 @@
-from services.timezone import month_label
 """Генерация PDF-отчётов и выгрузки Excel (.xlsx) прямо в Telegram."""
 
 import io
-import re
-import textwrap
 import datetime
 from collections import defaultdict
 import matplotlib
@@ -22,17 +19,11 @@ from services.analytics import analyze_budget_leaks
 
 
 def _format_currency(value):
-    from services.money import parse_amount
-    amount = parse_amount(value)
-    return f"{amount:,.{0 if amount.is_integer() else 2}f}".replace(",", " ")
+    try:
+        return f"{float(value):,.0f}".replace(",", " ")
+    except (ValueError, TypeError):
+        return str(value)
 
-
-def _pdf_text(text):
-    # DejaVu covers Cyrillic, not colour emoji. Avoid tofu squares in generated PDF.
-    return re.sub(r"[\U0001F000-\U0001FAFF\u2600-\u27BF\uFE0F]", "", str(text)).replace("**","").replace("_","")
-
-def _wrap_pdf(text, width=78):
-    return "\n".join("\n".join(textwrap.wrap(line,width=width)) if line else "" for line in _pdf_text(text).splitlines())
 
 def generate_pdf_report(year: int = None, month: int = None) -> bytes:
     """Генерирует двухстраничный финансовый PDF-буклет семьи."""
@@ -47,7 +38,7 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         end_date = datetime.date(y, m + 1, 1).strftime("%Y-%m-%d")
 
     transactions = get_transactions_for_period(start_date, end_date)
-    month_name = month_label(datetime.date(y, m, 1)).capitalize()
+    month_name = datetime.date(y, m, 1).strftime("%B %Y").capitalize()
 
     expenses = [t for t in transactions if str(t.get("type", "")).strip() != TYPE_INCOME]
     incomes = [t for t in transactions if str(t.get("type", "")).strip() == TYPE_INCOME]
@@ -68,10 +59,10 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         ax_cards.set_facecolor("#1a1a2e")
         ax_cards.axis("off")
         card_text = (
-            f"Общий доход:  {_format_currency(total_inc)} KZT\n"
-            f"Общий расход: {_format_currency(total_exp)} KZT\n"
-            f"Доходы минус расходы: {_format_currency(balance)} KZT\n"
-            f"Всего операций: {len(transactions)} (Расходов: {len(expenses)}, Доходов: {len(incomes)})"
+            f"💰 Общий доход:  {_format_currency(total_inc)} KZT\n"
+            f"💸 Общий расход: {_format_currency(total_exp)} KZT\n"
+            f"📈 Чистый баланс: {_format_currency(balance)} KZT\n"
+            f"📊 Всего операций: {len(transactions)} (Расходов: {len(expenses)}, Доходов: {len(incomes)})"
         )
         ax_cards.text(0.1, 0.4, card_text, fontsize=12, color="#ecf0f1", linespacing=1.6,
                       bbox=dict(boxstyle="round,pad=1", facecolor="#27293d", edgecolor="#4ECDC4", linewidth=1.5))
@@ -93,11 +84,7 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         colors = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7', '#DDA0DD', '#85C1E9']
 
         if sum(vals) > 0:
-            wedges, _, _ = ax_pie.pie(vals, labels=None, autopct=lambda p: f"{p:.0f}%" if p >= 5 else "",
-                                     colors=colors[:len(vals)], textprops={"color":"#ecf0f1","fontsize":8})
-            legend_labels = ["\n".join(textwrap.wrap(name,28)) for name,_ in top_cats]
-            ax_pie.legend(wedges,legend_labels,loc="upper left",bbox_to_anchor=(-.1,-.05),
-                          frameon=False,labelcolor="#ecf0f1",fontsize=7)
+            ax_pie.pie(vals, labels=labels, autopct="%1.0f%%", colors=colors[:len(vals)], textprops={"color": "#ecf0f1", "fontsize": 8})
         else:
             ax_pie.text(0.5, 0.5, "Трат нет", color="#ecf0f1", ha="center")
         ax_pie.set_title("Расходы по категориям", color="#ecf0f1", fontsize=10, pad=8)
@@ -129,8 +116,8 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         ax_leaks.set_facecolor("#1a1a2e")
         ax_leaks.axis("off")
         leak_data = analyze_budget_leaks(y, m)
-        ax_leaks.text(0.0, 0.98, _wrap_pdf(leak_data["text"], 82),
-                      fontsize=9, va="top", color="#ecf0f1", linespacing=1.2,
+        ax_leaks.text(0.05, 0.2, leak_data["text"].replace("**", "").replace("_", ""),
+                      fontsize=10, color="#ecf0f1", linespacing=1.5,
                       bbox=dict(boxstyle="round,pad=1", facecolor="#27293d", edgecolor="#E74C3C", linewidth=1.5))
 
         # Топ-7 крупных покупок месяца
@@ -138,12 +125,11 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         ax_top.set_facecolor("#1a1a2e")
         ax_top.axis("off")
         top_txs = sorted(expenses, key=lambda x: -parse_amount(x.get("amt", 0)))[:7]
-        top_lines = ["Топ-7 крупнейших трат месяца:\n"]
+        top_lines = ["🏆 Топ-7 крупнейших трат месяца:\n"]
         for idx, t in enumerate(top_txs, 1):
-            top_lines.append(f"{idx}. {_format_currency(t.get('amt'))} KZT — {t.get('cat')} | {t.get('user')}")
-            top_lines.append("   " + textwrap.shorten(_pdf_text(t.get("comm") or "Без комментария"), width=80, placeholder="…"))
+            top_lines.append(f"{idx}. {_format_currency(t.get('amt'))} KZT — {t.get('cat')} ({t.get('comm')}) | {t.get('user')}")
 
-        ax_top.text(0.0, 0.98, _wrap_pdf("\n".join(top_lines), 84), fontsize=9, va="top", color="#ecf0f1", linespacing=1.35,
+        ax_top.text(0.05, 0.2, "\n".join(top_lines), fontsize=10, color="#ecf0f1", linespacing=1.6,
                     bbox=dict(boxstyle="round,pad=1", facecolor="#27293d", edgecolor="#45B7D1", linewidth=1.5))
 
         pdf.savefig(fig2)
@@ -199,14 +185,14 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
             str(t.get("curr", "KZT")),
             str(t.get("bank", "")),
             str(t.get("source", "")),
-            str(t.get("funds_type", "")),
-            str(t.get("resource", "")),
+            "Собственные",
+            "Карта",
             str(t.get("cat", "")),
             str(t.get("subcat", "")),
-            str(t.get("merchant", "")),
+            "",
             str(t.get("nec", "")),
             str(t.get("comm", "")),
-            str(t.get("ai_comment", ""))
+            ""
         ])
 
     # Автоподбор ширины столбцов
@@ -215,32 +201,8 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
         col_letter = get_column_letter(col[0].column)
         ws1.column_dimensions[col_letter].width = min(max(max_len + 3, 11), 40)
 
-    from services.debts import balances, events, HEADERS as DEBT_HEADERS
-    debt_events = wb.create_sheet("Журнал долгов")
-    debt_events.append(DEBT_HEADERS)
-    for event in events():
-        debt_events.append([event.get(h, "") for h in DEBT_HEADERS])
-    debt_balances = wb.create_sheet("Остатки долгов")
-    debt_balances.append(["ID", "Участник", "Контрагент", "Направление", "Остаток KZT", "Срок"])
-    for debt in balances():
-        debt_balances.append([debt["debt_id"], debt["owner"], debt["counterparty"],
-                              debt["direction"], debt["balance"], debt.get("due_date", "")])
-    # Force free text to string: Excel must not execute user input as a formula.
-    for sheet in wb:
-        sheet.freeze_panes = "A2"
-        sheet.auto_filter.ref = sheet.dimensions
-        for row in sheet:
-            for cell in row:
-                if cell.data_type == "f":
-                    cell.data_type = "s"
-        for cell in sheet[1]:
-            cell.font = header_font
-            cell.fill = header_fill
     buf = io.BytesIO()
     wb.save(buf)
     buf.seek(0)
     return buf.getvalue()
 
-
-from services.plot_lock import serialized_plot
-generate_pdf_report = serialized_plot(generate_pdf_report)

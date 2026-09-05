@@ -1,25 +1,70 @@
-"""Durable author-scoped category drafts; old keyboard cannot resolve a new draft."""
-from services import state
-import uuid
+"""Хранилище транзакций, ожидающих уточнения категории (InlineKeyboard или текст)."""
+
+import datetime
+import threading
+
+_lock = threading.RLock()
+_pending: dict[int, dict] = {}
 CLARIFICATION_TTL_MINUTES = 10
 
-def set_clarification(chat_id, transaction, options, message_id=None):
-    token = uuid.uuid4().hex[:10]
-    state.put("clarifications", chat_id, {"transaction": transaction, "options": options,
-               "message_id": message_id, "token": token})
-    return token
 
-def get_clarification(chat_id):
-    return state.get("clarifications", chat_id)
+def set_clarification(chat_id: int, transaction: dict, options: list[dict], message_id: int = None):
+    """
+    options: список словарей вида:
+    [
+      {"label": "🍔 Перекус на работе", "category": "Кафе, рестораны и доставка еды", "subcategory": "Перекус и фастфуд"},
+      {"label": "🏠 Продукты домой", "category": "Еда и продукты", "subcategory": "Супермаркет и рынок"}
+    ]
+    """
+    with _lock:
+        _pending[chat_id] = {
+            "transaction": transaction,
+            "options": options,
+            "created_at": datetime.datetime.utcnow(),
+            "message_id": message_id,
+        }
 
-def has_clarification(chat_id):
-    return get_clarification(chat_id) is not None
 
-def pop_clarification(chat_id):
-    return get_clarification(chat_id)
+def has_clarification(chat_id: int) -> bool:
+    with _lock:
+        if chat_id not in _pending:
+            return False
+        entry = _pending[chat_id]
+        if datetime.datetime.utcnow() - entry["created_at"] > datetime.timedelta(minutes=CLARIFICATION_TTL_MINUTES):
+            del _pending[chat_id]
+            return False
+        return True
 
-def ack_clarification(chat_id):
-    state.delete("clarifications", chat_id)
+
+def get_clarification(chat_id: int) -> dict | None:
+    with _lock:
+        entry = _pending.get(chat_id)
+        if not entry:
+            return None
+        if datetime.datetime.utcnow() - entry["created_at"] > datetime.timedelta(minutes=CLARIFICATION_TTL_MINUTES):
+            del _pending[chat_id]
+            return None
+        return entry
+
+
+def pop_clarification(chat_id: int) -> dict | None:
+    with _lock:
+        entry = _pending.pop(chat_id, None)
+        if not entry:
+            return None
+        if datetime.datetime.utcnow() - entry["created_at"] > datetime.timedelta(minutes=CLARIFICATION_TTL_MINUTES):
+            return None
+        return entry
+
 
 def sweep_expired_clarifications():
-    return [(key, value["transaction"]) for key,value in state.entries("clarifications", CLARIFICATION_TTL_MINUTES*60)]
+    now = datetime.datetime.utcnow()
+    expired = []
+    with _lock:
+        for chat_id in list(_pending.keys()):
+            entry = _pending[chat_id]
+            if now - entry["created_at"] > datetime.timedelta(minutes=CLARIFICATION_TTL_MINUTES):
+                expired.append((chat_id, entry["transaction"]))
+                del _pending[chat_id]
+    return expired
+

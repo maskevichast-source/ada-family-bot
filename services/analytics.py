@@ -1,4 +1,3 @@
-from services.timezone import month_label
 """Аналитический модуль: выявление «утечек бюджета» и анализ микропривычек семьи."""
 
 import datetime
@@ -81,7 +80,7 @@ def analyze_budget_leaks(year: int = None, month: int = None) -> dict:
     total_leaks = sum(g["sum"] for g in leaks.values())
     pct = int((total_leaks / total_expense * 100)) if total_expense > 0 else 0
 
-    month_name = month_label(datetime.date(y, m, 1))
+    month_name = datetime.date(y, m, 1).strftime("%B %Y")
 
     lines = [
         f"🔍 **Анализ «утечек бюджета» за {month_name}:**\n",

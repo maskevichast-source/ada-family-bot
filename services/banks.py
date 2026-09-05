@@ -34,26 +34,27 @@ KNOWN_SOURCES_BY_BANK = {
 VALID_SOURCES_LOWER = {"bcc pay", "kaspi gold", "kaspi red", "forte card", "halyk card", "freedom card", "основная карта"}
 
 
-BANK_NAMES = {
-    "bcc": "BCC", "бцк": "BCC", "центркредит": "BCC", "bccpay": "BCC",
-    "kaspi": "Kaspi", "каспи": "Kaspi", "kaspi gold": "Kaspi", "kaspi red": "Kaspi",
-    "halyk": "Halyk", "халык": "Halyk", "народный": "Halyk",
-    "forte": "Forte", "форте": "Forte", "freedom": "Freedom", "фридом": "Freedom", "ffin": "Freedom",
-    "не указан": "Не указан"}
-
-def normalize_bank(bank):
-    raw = str(bank or "").strip()
-    return BANK_NAMES.get(raw.lower(), raw or "Не указан")
-
 def normalize_bank_source(bank: str | None, source: str | None) -> str:
+    """Привести "source" к одному из известных значений, если оно похоже на
+    что-то другое (например, домен/название магазина) — не трогая уже
+    валидные источники вроде "Kaspi Red".
+
+    Также обрабатывает случай наличных: если bank == "Наличные" — 
+    возвращает "Основная карта" как source, а bank должен быть "Не указан".
+    """
     source_norm = str(source or "").strip()
-    bank_norm = normalize_bank(bank).lower()
-    canonical = KNOWN_SOURCES_BY_BANK.get(bank_norm)
-    # Known banks may not silently keep another bank's source.
-    if canonical:
-        if bank_norm == "kaspi" and source_norm.lower() == "kaspi red":
-            return "Kaspi Red"
-        return canonical
-    if bank_norm in ("наличные","нал","cash"):
+    if source_norm.lower() in VALID_SOURCES_LOWER:
+        return source_norm
+
+    bank_norm = str(bank or "").strip().lower()
+
+    # Обработка наличных
+    if bank_norm in ("наличные", "нал", "cash"):
         return "Основная карта"
+
+    if bank_norm in KNOWN_SOURCES_BY_BANK:
+        return KNOWN_SOURCES_BY_BANK[bank_norm]
+
     return source_norm or "Основная карта"
+
+

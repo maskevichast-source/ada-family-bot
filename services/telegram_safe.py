@@ -1,53 +1,44 @@
-"""Chunk long messages; fall back only on markup errors, not network failures."""
+"""Безопасная отправка сообщений в Telegram — без потери текста из-за битой разметки.
+
+В коде ответы оформлены GitHub-style Markdown (`**жирный**`). Telegram legacy
+Markdown понимает `*жирный*`, поэтому перед отправкой мы мягко конвертируем
+двойные звёздочки в формат Telegram. Если Telegram всё равно ругнётся на
+разметку из-за свободного текста от ИИ — отправляем без parse_mode.
+"""
+
 import re
 from aiogram.exceptions import TelegramBadRequest
 
-def _looks_like_markdown_error(error):
+
+def _looks_like_markdown_error(error: Exception) -> bool:
     text = str(error).lower()
     return "parse" in text or "entit" in text
 
-def _telegram_markdown(text):
+
+def _telegram_markdown(text: str) -> str:
+    # **text** -> *text* для Telegram Markdown. Одинарные * не трогаем.
     return re.sub(r"\*\*(.+?)\*\*", r"*\1*", str(text), flags=re.DOTALL)
 
-def chunks(text, limit=3500):
-    text = str(text)
-    while text:
-        if len(text) <= limit:
-            yield text
-            break
-        split = text.rfind("\n", 0, limit)
-        if split < limit // 2:
-            split = limit
-        yield text[:split]
-        text = text[split:].lstrip("\n")
 
-async def _send(send, text, kwargs):
-    last = None
-    parts = list(chunks(text)) or [" "]
-    for part in parts:
-        options = dict(kwargs)
-        if len(parts) > 1:
-            options["parse_mode"] = None
-        formatted = part if options.get("parse_mode", "Markdown") in (None, "HTML") else _telegram_markdown(part)
-        try:
-            last = await send(formatted, **options)
-        except TelegramBadRequest as error:
-            if not _looks_like_markdown_error(error):
-                raise
-            options["parse_mode"] = None
-            last = await send(part, **options)
-    return last
+async def safe_answer(message, text: str, **kwargs):
+    """Замена message.answer(text) — с откатом на обычный текст при ошибке разметки."""
+    text_to_send = _telegram_markdown(text)
+    try:
+        return await message.answer(text_to_send, **kwargs)
+    except TelegramBadRequest as error:
+        if _looks_like_markdown_error(error):
+            kwargs.pop("parse_mode", None)
+            return await message.answer(text, parse_mode=None, **kwargs)
+        raise
 
-async def safe_answer(message, text, **kwargs):
-    result = await _send(message.answer, text, kwargs)
-    from services.memory import add_chat_message
-    add_chat_message(message.chat.id, "Ада", str(text))
-    return result
 
-async def safe_send_message(bot, chat_id, text, **kwargs):
-    async def send(part, **options):
-        return await bot.send_message(chat_id=chat_id, text=part, **options)
-    result = await _send(send, text, kwargs)
-    from services.memory import add_chat_message
-    add_chat_message(chat_id, "Ада", str(text))
-    return result
+async def safe_send_message(bot, chat_id, text: str, **kwargs):
+    """Замена bot.send_message(chat_id=..., text=...) — с тем же откатом."""
+    text_to_send = _telegram_markdown(text)
+    try:
+        return await bot.send_message(chat_id=chat_id, text=text_to_send, **kwargs)
+    except TelegramBadRequest as error:
+        if _looks_like_markdown_error(error):
+            kwargs.pop("parse_mode", None)
+            return await bot.send_message(chat_id=chat_id, text=text, parse_mode=None, **kwargs)
+        raise

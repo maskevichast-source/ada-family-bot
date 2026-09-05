@@ -1,41 +1,66 @@
-"""Money parsing: preserve signs and decimals; never concatenate unrelated numbers."""
-import math
+"""Парсинг и форматирование денежных сумм."""
+
 import re
 
+
 def parse_amount(raw) -> float:
-    if isinstance(raw, (int, float)):
-        return float(raw) if math.isfinite(raw) else 0.0
-    text = str(raw or "").replace("\u00a0", " ").replace("\u202f", " ").strip()
-    m = re.search(r"(?<!\d)[+-]?\d+(?:[ .,]\d+)*", text)
-    if not m:
+    """Преобразовать сумму из любого формата в float.
+
+    Поддерживает:
+    - "184,400" -> 184400.0 (запятая как разделитель тысяч)
+    - "184 400" -> 184400.0 (пробел как разделитель тысяч)
+    - "184400" -> 184400.0
+    - "184.40" -> 184.4 (точка как десятичный разделитель)
+    - "184,40" -> 184.4 (запятая как десятичный разделитель, 1-2 цифры после)
+    """
+    if raw is None:
         return 0.0
-    number = m.group().strip().replace(" ", "")
-    if "." in number and "," in number:
-        decimal = "." if number.rfind(".") > number.rfind(",") else ","
-        thousands = "," if decimal == "." else "."
-        number = number.replace(thousands, "").replace(decimal, ".")
-    elif "," in number or "." in number:
-        separator = "," if "," in number else "."
-        chunks = number.split(separator)
-        if len(chunks) == 2 and len(chunks[-1]) <= 2:
-            number = ".".join(chunks)
-        elif all(len(x) == 3 for x in chunks[1:]):
-            number = "".join(chunks)
-        else:
-            return 0.0
+
+    text = str(raw).strip()
+    if not text:
+        return 0.0
+
+    # Убираем валюту и лишние символы
+    text = re.sub(r'[тгтенгеkztKZT\s]', '', text, flags=re.IGNORECASE)
+    text = text.replace('₸', '')
+
+    # Определяем: запятая/точка — разделитель тысяч или десятичный
+    # Если после запятой/точки 1-2 цифры — это десятичная часть
+    # Если 3+ цифры — это разделитель тысяч
+
+    # Пробуем найти десятичную часть
+    match = re.match(r'^(\d{1,3}(?:[\s,\.]\d{3})*)([\.,](\d{1,2}))?$', text)
+    if match:
+        integer_part = match.group(1)
+        decimal_part = match.group(3) if match.group(2) else ""
+
+        # Убираем разделители тысяч
+        integer_clean = re.sub(r'[\s,\.]', '', integer_part)
+
+        if decimal_part:
+            return float(f"{integer_clean}.{decimal_part}")
+        return float(integer_clean)
+
+    # Fallback: просто убираем всё кроме цифр и точки
+    clean = re.sub(r'[^\d.]', '', text)
     try:
-        amount = float(number)
-        tail = text[m.end():].strip().lower()
-        if re.match(r"^(?:тыс\b|тысяч\w*\b|к\b|k\b)", tail):
-            amount *= 1000
-        return amount if math.isfinite(amount) else 0.0
+        return float(clean) if clean else 0.0
     except ValueError:
         return 0.0
 
-def to_clean_number(raw):
+
+def to_clean_number(raw) -> float:
+    """Алиас для parse_amount."""
     return parse_amount(raw)
 
-def format_currency(value, currency="KZT"):
-    amount = parse_amount(value)
-    places = 0 if amount.is_integer() else 2
-    return f"{amount:,.{places}f} {currency}".replace(",", " ")
+
+def format_currency(value, currency: str = "KZT") -> str:
+    """Форматировать сумму для отображения."""
+    try:
+        num = float(value)
+        formatted = f"{num:,.0f}".replace(",", " ")
+        return f"{formatted} {currency}"
+    except (ValueError, TypeError):
+        return str(value)
+
+

@@ -1,19 +1,17 @@
-"""Распознавание чеков, фото и PDF через OpenAI Vision с гарантированной конвертацией в JPEG."""
+"""Устойчивое распознавание чеков, изображений и PDF через OpenAI Vision."""
 
 import asyncio
 import base64
 import json
-import logging
 import subprocess
 import tempfile
-import io
 from pathlib import Path
-from PIL import Image
 
 from openai import AsyncOpenAI
+
 from config import OPENAI_API_KEY
 from services.categories import (
-    EXPENSE_CATEGORIES, INCOME_CATEGORIES, TYPE_EXPENSE, TYPE_INCOME,
+    EXPENSE_CATEGORIES, TYPE_EXPENSE, TYPE_INCOME,
     format_category_list, SUBCATEGORIES_MAP, get_time_context_hint,
     is_ambiguous_item,
 )
@@ -26,6 +24,15 @@ _SUBCATEGORIES_VISION_PROMPT = "\n".join(
 VISION_SYSTEM_PROMPT = f"""
 Ты — Ада, помощница семейного финансового чата Влада и Дианы.
 Проанализируй изображение чека, банковского перевода или оплаты.
+
+КОНТЕКСТ ВРЕМЕНИ:
+Текущее время и день недели даны отдельным сообщением. Используй их:
+- Утро (6-10): дорога на работу → транспорт, энергетики
+- Обед (12-15): еда вне дома → кафе, доставка
+- Вечер (18-21): дорога домой, ужин → транспорт, продукты домой
+- Ночь (21+): доставка, вредные привычки
+- Будни: работа, транспорт
+- Выходные: кафе, развлечения, продукты домой
 
 Верни строгий JSON:
 {{
@@ -51,177 +58,150 @@ VISION_SYSTEM_PROMPT = f"""
   ]
 }}
 
-Категории:
+Если несколько покупок — верни несколько элементов. Если нет данных — transactions пустой.
+
+Категории (ТОЛЬКО эти названия):
 {format_category_list(EXPENSE_CATEGORIES)}
 
-Подкатегории:
+СТРОГИЕ ПОДКАТЕГОРИИ:
 {_SUBCATEGORIES_VISION_PROMPT}
+
+ПОДКАТЕГОРИИ:
+- "subcategory" ОБЯЗАН быть из списка выше. НЕ придумывай.
+- Если не уверен — бери ПЕРВУЮ подкатегорию категории.
+
+necessity:
+- Need: еда домой, вода, транспорт на работу, лекарства, ЖКХ, корм питомцу
+- Want: сигареты, энергетики, алкоголь, косметика, кафе, рестораны, доставка, развлечения
+- "Алкоголь, табак и энергетики" → ВСЕГДА Want
+- "Красота и уход" → Want
+- "Развлечения и хобби" → Want
+- Кафе, рестораны, доставка → Want
 
 {BANK_ALIASES_PROMPT}
 
-ВАЖНО:
-- Если на чеке несколько товаров — верни их отдельными элементами в transactions.
-- Если это возврат — type: "{TYPE_INCOME}".
-- Оплата услуг (OpenAI, интернет и т.д.) — это РАСХОД.
-- Если валюта USD/EUR — укажи реальную валюту в currency.
+ТИП ОПЕРАЦИИ:
+- Почти все чеки — РАСХОД (type = "{TYPE_EXPENSE}")
+- Возврат/рефанд или зачисление от другого → ДОХОД (type = "{TYPE_INCOME}")
+- Пополнение СВОЕГО счёта → НЕ доход и НЕ расход, верни transactions пустым
+- Перевод физлицу: если указан товар ("беляш") → классифицируй по товару
+- Энергетики → ВСЕГДА "Алкоголь, табак и энергетики"
+
+НЕОДНОЗНАЧНЫЕ ТОВАРЫ:
+- Самса, пицца, суши, роллы, бургеры, шаурма → могут быть "Еда и продукты" (домой) ИЛИ "Кафе" (в заведении)
+- Если на чеке нет явного указания "на вынос"/"в зале" И время 12:00-15:00 → скорее "Кафе"
+- Если время 18:00+ → скорее "Еда и продукты" (домой)
+- Если НЕ уверен — confidence < 1.0 и alternatives
+
+ТВОЙ ТОН:
+- Умеренный, живой, с лёгкой иронией
+- НЕ грубый, НЕ "ахуевший"
+- Подкалывай мягко, семья доверяет тебе деньги
 """
 
 
-def _parse_json(content: str) -> dict:
+def _parse_json(content: object) -> dict:
     if not isinstance(content, str):
         return {}
-    raw = content.strip()
-    if raw.startswith("```"):
-        raw = raw.removeprefix("```json").removeprefix("```").strip()
-        raw = raw.removesuffix("```").strip()
+    cleaned = content.strip()
+    if cleaned.startswith("```"):
+        cleaned = cleaned.removeprefix("```json").removeprefix("```").strip()
+        cleaned = cleaned.removesuffix("```").strip()
+    parsed = json.loads(cleaned)
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _render_pdf(pdf_path: Path, output_path: Path) -> Path:
+    rendered_prefix = output_path.with_suffix("")
     try:
-        return json.loads(raw)
+        result = subprocess.run(
+            ["pdftoppm", "-f", "1", "-singlefile", "-png", "-r", "150",
+             str(pdf_path), str(rendered_prefix)],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+        if result.returncode == 0:
+            rendered_path = rendered_prefix.with_suffix(".png")
+            if rendered_path.exists():
+                return rendered_path
     except Exception:
+        pass
+    try:
+        import pypdfium2 as pdfium
+        pdf = pdfium.PdfDocument(str(pdf_path))
+        page = pdf[0]
+        image = page.render(scale=2).to_pil()
+        rendered_path = rendered_prefix.with_suffix(".png")
+        image.save(str(rendered_path), "PNG")
+        if rendered_path.exists():
+            return rendered_path
+    except Exception as error:
+        raise RuntimeError(f"Не удалось преобразовать PDF: {error}")
+    raise RuntimeError("PDF не содержит доступной страницы")
+
+
+async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
+                        user_name: str = "Пользователь") -> dict:
+    if not file_bytes:
+        print("[Распознавание] Получен пустой файл")
         return {}
 
-
-def to_jpeg_bytes(raw_bytes: bytes) -> bytes:
-    """Гарантированно преобразует любое изображение (PNG, WebP, HEIC) в чистый JPEG."""
     try:
-        with Image.open(io.BytesIO(raw_bytes)) as img:
-            img = img.convert("RGB")
-            # Сжимаем до разумного размера, чтобы запрос не весил 15 МБ
-            img.thumbnail((1800, 1800))
-            out = io.BytesIO()
-            img.save(out, format="JPEG", quality=88)
-            return out.getvalue()
-    except Exception as e:
-        logging.warning(f"[Pillow Convert Warning]: {e}")
-        return raw_bytes
+        with tempfile.TemporaryDirectory(prefix="receipt_") as temporary_dir:
+            source_path = Path(temporary_dir) / (Path(filename or "receipt").name or "receipt")
+            source_path.write_bytes(file_bytes)
+            suffix = source_path.suffix.lower()
+            image_path = source_path
+            mime_type = {".png": "image/png", ".jpg": "image/jpeg",
+                         ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
+            if suffix == ".pdf":
+                image_path = _render_pdf(source_path, Path(temporary_dir) / "receipt.png")
+                mime_type = "image/png"
+            if mime_type is None:
+                print(f"[Распознавание] Неподдерживаемый формат: {suffix or 'без расширения'}")
+                return {}
 
+            encoded_image = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=2)
 
-def _render_pdf(file_bytes: bytes) -> list[bytes]:
-    """Надёжный рендеринг PDF в список JPEG-страниц."""
-    images = []
-    with tempfile.TemporaryDirectory(prefix="ada_pdf_") as tmp_dir:
-        pdf_path = Path(tmp_dir) / "document.pdf"
-        pdf_path.write_bytes(file_bytes)
+            # Добавляем контекст времени
+            from services.timezone import now_astana
+            now = now_astana()
+            time_hint = get_time_context_hint(now.hour, now.weekday())
 
-        # 1. Пробуем pdftoppm с прямым выводом в JPEG
-        out_prefix = Path(tmp_dir) / "page"
-        try:
-            res = subprocess.run(
-                ["pdftoppm", "-jpeg", "-r", "150", str(pdf_path), str(out_prefix)],
-                capture_output=True, timeout=30, check=False
+            prompt = (
+                f"Файл от {user_name}. Подпись: {caption or 'нет'}.\n"
+                f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
+                f"Контекст: {time_hint}.\n"
+                "Распознай чек и верни JSON."
             )
-            if res.returncode == 0:
-                for img_file in sorted(Path(tmp_dir).glob("page-*.jpg")):
-                    images.append(img_file.read_bytes())
-                if images:
-                    return images
-        except Exception:
-            pass
+            response = await client.chat.completions.create(
+                model="gpt-4o",
+                messages=[
+                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {
+                            "url": f"data:{mime_type};base64,{encoded_image}"}},
+                    ]},
+                ],
+                response_format={"type": "json_object"},
+                max_tokens=900,
+            )
+            result = _parse_json(response.choices[0].message.content)
 
-        # 2. Резервный способ через pypdfium2 + Pillow
-        try:
-            import pypdfium2 as pdfium
-            pdf = pdfium.PdfDocument(str(pdf_path))
-            for i in range(min(len(pdf), 5)):
-                page = pdf[i]
-                bitmap = page.render(scale=2)
-                pil_image = bitmap.to_pil()
-                out = io.BytesIO()
-                pil_image.convert("RGB").save(out, format="JPEG", quality=88)
-                images.append(out.getvalue())
-            return images
-        except Exception as e:
-            logging.error(f"[PDF Render Error]: {e}")
+            # Пост-обработка: проверяем неоднозначность
+            transactions = result.get("transactions", [])
+            for tx in transactions:
+                user_comment = str(tx.get("user_comment", "") or caption)
+                is_ambig, alternatives = is_ambiguous_item(user_comment)
+                if is_ambig and tx.get("confidence", 1.0) >= 0.9:
+                    tx["confidence"] = 0.6
+                    tx["alternatives"] = alternatives
 
-    return images
-
-
-async def parse_receipt(file_bytes: bytes, filename: str = "", caption: str = "", user_name: str = "Пользователь"):
-    if not file_bytes:
-        return {"transactions": [], "reply": "Файл пустой."}
-
-    ext = Path(filename or "file.jpg").suffix.lower()
-    images_bytes = []
-
-    # Определяем, PDF это или изображение
-    if ext == ".pdf" or file_bytes[:5] == b"%PDF-":
-        images_bytes = await asyncio.to_thread(_render_pdf, file_bytes)
-        if not images_bytes:
-            return {"transactions": [], "reply": "Не удалось прочитать страницы PDF. Попробуй сделать скриншот чека."}
-    else:
-        # Любой скриншот (PNG/WebP/JPG) принудительно нормализуем в чистый JPEG
-        jpeg_data = await asyncio.to_thread(to_jpeg_bytes, file_bytes)
-        images_bytes = [jpeg_data]
-
-    client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=1)
-
-    try:
-        from services.timezone import now_astana
-        now = now_astana()
-        time_hint = get_time_context_hint(now.hour, now.weekday())
-
-        content = [
-            {
-                "type": "text",
-                "text": f"Чек от {user_name}. Подпись к чеку: «{caption or 'нет'}».\n"
-                        f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
-                        f"Контекст времени: {time_hint}.\n"
-                        f"Распознай все покупки и суммы чека."
-            }
-        ]
-
-        for img in images_bytes[:5]:
-            b64 = base64.b64encode(img).decode("ascii")
-            content.append({
-                "type": "image_url",
-                "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}
-            })
-
-        # Пробуем gpt-4o, если модель недоступна — пробуем gpt-4o-mini
-        response = None
-        for model_name in ["gpt-4o", "gpt-4o-mini"]:
-            try:
-                response = await client.chat.completions.create(
-                    model=model_name,
-                    messages=[
-                        {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                        {"role": "user", "content": content}
-                    ],
-                    response_format={"type": "json_object"},
-                    max_tokens=4096
-                )
-                if response:
-                    break
-            except Exception as model_err:
-                logging.warning(f"[Model {model_name} failed]: {model_err}")
-                if model_name == "gpt-4o-mini":
-                    raise model_err
-
-        result = _parse_json(response.choices[0].message.content)
-        txs = result.get("transactions", [])
-
-        # Проверка неоднозначности товаров
-        for tx in txs:
-            comm = str(tx.get("user_comment", "") or caption)
-            is_ambig, alts = is_ambiguous_item(comm)
-            if is_ambig and tx.get("confidence", 1.0) >= 0.9:
-                tx["confidence"] = 0.6
-                tx["alternatives"] = alts
-
-        return result
-
-    except Exception as e:
-        err_msg = str(e)
-        logging.exception(f"[Vision Fatal Error]: {err_msg}")
-        
-        # Показываем реальную причину ошибки, если проблема в аккаунте OpenAI
-        if "quota" in err_msg.lower() or "billing" in err_msg.lower():
-            reply_text = "⚠️ В OpenAI закончились средства на балансе (Quota Exceeded). Пополните баланс на platform.openai.com."
-        elif "api_key" in err_msg.lower() or "auth" in err_msg.lower():
-            reply_text = "⚠️ Ошибка авторизации OpenAI: неверный ключ OPENAI_API_KEY."
-        else:
-            reply_text = f"Не удалось разобрать чек ({type(e).__name__}: {err_msg[:90]})."
-
-        return {"transactions": [], "reply": reply_text}
-
-    finally:
-        await client.close()
+            return result
+    except asyncio.TimeoutError:
+        print("[Распознавание] OpenAI не ответил вовремя")
+    except Exception as error:
+        print(f"[Распознавание] Сбой API или формата файла: {error}")
+    return {}
+    
