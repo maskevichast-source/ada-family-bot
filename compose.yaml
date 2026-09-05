@@ -1,0 +1,10 @@
+services:
+  ada:
+    build: .
+    env_file: .env
+    restart: unless-stopped
+    stop_grace_period: 45s
+    volumes:
+      - ada_data:/app/data
+volumes:
+  ada_data:

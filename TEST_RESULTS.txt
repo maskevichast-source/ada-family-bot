@@ -1,0 +1,10 @@
+Local execution: Python 3.13.5; target Railway Docker/CI Python 3.11.
+External Telegram/Sheets/LLM clients are import-shimmed if unavailable.
+Tests use fake Sheets/Telegram/model responses; no live API requests.
+PNG, 2-page PDF, XLSX and multi-page PDF rendering exercised locally.
+Actual supplied workbook: schema verified via fake Sheets; PDF/chart rendered and inspected.
+No dependency installation, Docker build, CI run or Railway deployment performed here.
+
+........................................................................ [ 53%]
+..............................................................           [100%]
+134 passed in 2.80s

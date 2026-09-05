@@ -1,0 +1,7 @@
+__pycache__/
+.pytest_cache/
+.env
+credentials.json
+data/
+chat_history.json
+*.sqlite3*
