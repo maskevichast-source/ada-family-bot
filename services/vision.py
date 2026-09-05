@@ -1,4 +1,4 @@
-"""Распознавание чеков, фото и PDF через OpenAI Vision."""
+"""Распознавание чеков, фото и PDF через OpenAI Vision с гарантированной конвертацией в JPEG."""
 
 import asyncio
 import base64
@@ -6,7 +6,9 @@ import json
 import logging
 import subprocess
 import tempfile
+import io
 from pathlib import Path
+from PIL import Image
 
 from openai import AsyncOpenAI
 from config import OPENAI_API_KEY
@@ -78,39 +80,53 @@ def _parse_json(content: str) -> dict:
         return {}
 
 
+def to_jpeg_bytes(raw_bytes: bytes) -> bytes:
+    """Гарантированно преобразует любое изображение (PNG, WebP, HEIC) в чистый JPEG."""
+    try:
+        with Image.open(io.BytesIO(raw_bytes)) as img:
+            img = img.convert("RGB")
+            # Сжимаем до разумного размера, чтобы запрос не весил 15 МБ
+            img.thumbnail((1800, 1800))
+            out = io.BytesIO()
+            img.save(out, format="JPEG", quality=88)
+            return out.getvalue()
+    except Exception as e:
+        logging.warning(f"[Pillow Convert Warning]: {e}")
+        return raw_bytes
+
+
 def _render_pdf(file_bytes: bytes) -> list[bytes]:
-    """Надёжный рендеринг PDF: сначала pdftoppm, затем pypdfium2."""
+    """Надёжный рендеринг PDF в список JPEG-страниц."""
     images = []
     with tempfile.TemporaryDirectory(prefix="ada_pdf_") as tmp_dir:
         pdf_path = Path(tmp_dir) / "document.pdf"
         pdf_path.write_bytes(file_bytes)
 
-        # 1. Пробуем через pdftoppm (быстро и стабильно на Linux)
+        # 1. Пробуем pdftoppm с прямым выводом в JPEG
         out_prefix = Path(tmp_dir) / "page"
         try:
             res = subprocess.run(
-                ["pdftoppm", "-png", "-r", "150", str(pdf_path), str(out_prefix)],
+                ["pdftoppm", "-jpeg", "-r", "150", str(pdf_path), str(out_prefix)],
                 capture_output=True, timeout=30, check=False
             )
             if res.returncode == 0:
-                for img_file in sorted(Path(tmp_dir).glob("page-*.png")):
+                for img_file in sorted(Path(tmp_dir).glob("page-*.jpg")):
                     images.append(img_file.read_bytes())
                 if images:
                     return images
         except Exception:
             pass
 
-        # 2. Резервный способ через pypdfium2
+        # 2. Резервный способ через pypdfium2 + Pillow
         try:
             import pypdfium2 as pdfium
             pdf = pdfium.PdfDocument(str(pdf_path))
-            for i in range(min(len(pdf), 10)):
+            for i in range(min(len(pdf), 5)):
                 page = pdf[i]
                 bitmap = page.render(scale=2)
                 pil_image = bitmap.to_pil()
-                import io
                 out = io.BytesIO()
-                pil_image.save(out, format="JPEG", quality=90)
+                pil_image.convert("RGB").save(out, format="JPEG", quality=88)
                 images.append(out.getvalue())
             return images
         except Exception as e:
@@ -126,12 +142,15 @@ async def parse_receipt(file_bytes: bytes, filename: str = "", caption: str = ""
     ext = Path(filename or "file.jpg").suffix.lower()
     images_bytes = []
 
+    # Определяем, PDF это или изображение
     if ext == ".pdf" or file_bytes[:5] == b"%PDF-":
         images_bytes = await asyncio.to_thread(_render_pdf, file_bytes)
         if not images_bytes:
-            return {"transactions": [], "reply": "Не удалось прочитать PDF. Попробуй сделать скриншот чека."}
+            return {"transactions": [], "reply": "Не удалось прочитать страницы PDF. Попробуй сделать скриншот чека."}
     else:
-        images_bytes = [file_bytes]
+        # Любой скриншот (PNG/WebP/JPG) принудительно нормализуем в чистый JPEG
+        jpeg_data = await asyncio.to_thread(to_jpeg_bytes, file_bytes)
+        images_bytes = [jpeg_data]
 
     client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=1)
 
@@ -143,34 +162,44 @@ async def parse_receipt(file_bytes: bytes, filename: str = "", caption: str = ""
         content = [
             {
                 "type": "text",
-                "text": f"Чек от {user_name}. Подпись: {caption or 'нет'}.\n"
-                        f"Время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
-                        f"Контекст: {time_hint}.\nРаспознай все операции."
+                "text": f"Чек от {user_name}. Подпись к чеку: «{caption or 'нет'}».\n"
+                        f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
+                        f"Контекст времени: {time_hint}.\n"
+                        f"Распознай все покупки и суммы чека."
             }
         ]
 
-        for img in images_bytes[:5]:  # до 5 страниц
+        for img in images_bytes[:5]:
             b64 = base64.b64encode(img).decode("ascii")
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}", "detail": "high"}
             })
 
-        # max_tokens=4096 (НЕ 12000, иначе OpenAI выдает 400 ошибку!)
-        response = await client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                {"role": "user", "content": content}
-            ],
-            response_format={"type": "json_object"},
-            max_tokens=4096
-        )
+        # Пробуем gpt-4o, если модель недоступна — пробуем gpt-4o-mini
+        response = None
+        for model_name in ["gpt-4o", "gpt-4o-mini"]:
+            try:
+                response = await client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                        {"role": "user", "content": content}
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=4096
+                )
+                if response:
+                    break
+            except Exception as model_err:
+                logging.warning(f"[Model {model_name} failed]: {model_err}")
+                if model_name == "gpt-4o-mini":
+                    raise model_err
 
         result = _parse_json(response.choices[0].message.content)
         txs = result.get("transactions", [])
 
-        # Проверка неоднозначности
+        # Проверка неоднозначности товаров
         for tx in txs:
             comm = str(tx.get("user_comment", "") or caption)
             is_ambig, alts = is_ambiguous_item(comm)
@@ -181,7 +210,18 @@ async def parse_receipt(file_bytes: bytes, filename: str = "", caption: str = ""
         return result
 
     except Exception as e:
-        logging.exception(f"[Vision Error]: {e}")
-        return {"transactions": [], "reply": "Не удалось разобрать чек. Попробуй сделать фото чётче или введи текстом."}
+        err_msg = str(e)
+        logging.exception(f"[Vision Fatal Error]: {err_msg}")
+        
+        # Показываем реальную причину ошибки, если проблема в аккаунте OpenAI
+        if "quota" in err_msg.lower() or "billing" in err_msg.lower():
+            reply_text = "⚠️ В OpenAI закончились средства на балансе (Quota Exceeded). Пополните баланс на platform.openai.com."
+        elif "api_key" in err_msg.lower() or "auth" in err_msg.lower():
+            reply_text = "⚠️ Ошибка авторизации OpenAI: неверный ключ OPENAI_API_KEY."
+        else:
+            reply_text = f"Не удалось разобрать чек ({type(e).__name__}: {err_msg[:90]})."
+
+        return {"transactions": [], "reply": reply_text}
+
     finally:
         await client.close()
