@@ -1,3 +1,4 @@
+from services.timezone import month_label
 """Обработка текстовых сообщений от пользователя (все интенты)."""
 
 import asyncio
@@ -8,6 +9,7 @@ from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, B
 from aiogram import types
 
 from config import get_authorized_user_name
+from services import reminders as reminder_service, debts, state
 from services.categories import (
     TYPE_EXPENSE, TYPE_INCOME,
     EXPENSE_CATEGORIES, INCOME_CATEGORIES,
@@ -35,9 +37,9 @@ from services.charts import generate_expense_chart
 from services.limits_ai import generate_limits_from_history
 from services.weather import get_weather_forecast
 from services.telegram_safe import safe_answer
-from services.pending_receipts import has_pending, pop_pending
+from services.pending_receipts import has_pending, pop_pending, ack_pending
 from services.pending_clarifications import (
-    set_clarification, get_clarification, pop_clarification,
+    set_clarification, get_clarification, pop_clarification, ack_clarification,
 )
 from services.memory import get_chat_history, add_chat_message
 from services.voice import transcribe_voice
@@ -48,19 +50,13 @@ from services.price_tracker import fetch_product_info, detect_marketplace
 
 
 def _to_number_or_blank(value):
-    if value is None:
-        return 0
-    try:
-        return float(value)
-    except (ValueError, TypeError):
-        return 0
+    return parse_amount(value)
 
 
 def _format_currency(value):
-    try:
-        return f"{float(value):,.0f}".replace(",", " ")
-    except (ValueError, TypeError):
-        return str(value)
+    from services.money import parse_amount
+    amount = parse_amount(value)
+    return f"{amount:,.{0 if amount.is_integer() else 2}f}".replace(",", " ")
 
 
 def _extract_marketplace_url(text: str) -> str | None:
@@ -93,10 +89,10 @@ def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
     return "\n".join(lines)
 
 
-def _build_clarification_keyboard(options: list[dict]) -> InlineKeyboardMarkup:
+def _build_clarification_keyboard(options: list[dict], token: str) -> InlineKeyboardMarkup:
     buttons = []
     for idx, opt in enumerate(options):
-        buttons.append([InlineKeyboardButton(text=opt["label"], callback_data=f"clarify_opt:{idx}")])
+        buttons.append([InlineKeyboardButton(text=opt["label"], callback_data=f"clarify_opt:{token}:{idx}")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -124,107 +120,6 @@ def _should_ask_clarification(text: str, parsed: dict, options: list[dict] | Non
     return True
 
 
-def _is_add_reminder_command(raw_text: str) -> bool:
-    low = raw_text.lower().replace("ё", "е").strip()
-    if any(x in low for x in ["покажи", "список", "какие", "удали", "удалить", "отмени", "убери"]):
-        return False
-    return (
-        low.startswith("напомни")
-        or low.startswith("напомнить")
-        or "поставь напоминание" in low
-        or "добавь напоминание" in low
-        or "создай напоминание" in low
-    )
-
-
-def _extract_reminder_text(raw_text: str) -> str:
-    t = raw_text.strip()
-    low = t.lower().replace("ё", "е")
-
-    markers = [
-        "о том, что нужно",
-        "о том что нужно",
-        "о том, что",
-        "о том что",
-        "что нужно",
-        "чтобы",
-        "про то, что",
-        "про то что",
-    ]
-    for marker in markers:
-        idx = low.find(marker)
-        if idx >= 0:
-            return t[idx + len(marker):].strip(" .—-«»") or "Напоминание"
-
-    cleaned = re.sub(r"(?i)\bнапомни(ть)?\b", "", t).strip()
-    cleaned = re.sub(r"(?i)\b(сегодня|завтра|послезавтра)\b", "", cleaned).strip()
-    cleaned = re.sub(r"(?i)\b(в|на)\s+\d{1,2}(:\d{2})?\b", "", cleaned).strip()
-    cleaned = re.sub(r"(?i)\b(утра|утром|дня|днем|вечера|вечером)\b", "", cleaned).strip()
-    return cleaned.strip(" .—-«»") or "Напоминание"
-
-
-def _extract_reminder_target(raw_text: str, user_name: str) -> str:
-    low = raw_text.lower().replace("ё", "е")
-
-    # "у Дианы взять крем" — это задача текущему пользователю, а не Диане.
-    if any(x in low for x in ["для дианы", "диане напомни", "напомни диане"]):
-        return "Диана"
-    if any(x in low for x in ["для влада", "владу напомни", "напомни владу", "владиславу напомни"]):
-        return "Влад"
-
-    return user_name or "Семья"
-
-
-async def _try_handle_reminder_directly(message: Message, text: str, user_name: str, chat_id: int) -> bool:
-    """Надёжный локальный перехват простых напоминаний.
-
-    Это чинит кейс со скринов: бот не должен говорить "добавила", если строка
-    не появилась в Reminders.
-    """
-    if not _is_add_reminder_command(text):
-        return False
-
-    remind_dt = parse_ru_relative_datetime(text)
-    if not remind_dt:
-        res = "Во сколько поставить напоминание? Например: «сегодня в 21:00» или «завтра в 9 утра»."
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return True
-
-    target = _extract_reminder_target(text, user_name)
-    reminder_text = _extract_reminder_text(text)
-
-    try:
-        saved = await asyncio.to_thread(
-            add_reminder,
-            target,
-            remind_dt.strftime("%Y-%m-%d %H:%M:%S"),
-            reminder_text,
-            "once",
-        )
-        active = await asyncio.to_thread(get_pending_reminders)
-        saved_id = saved.get("reminder_id") or saved.get("id")
-        exists = any((r.get("reminder_id") or r.get("id")) == saved_id for r in active)
-        if not exists:
-            raise RuntimeError("Напоминание добавлено, но не найдено при повторном чтении Reminders.")
-
-        who = "тебе" if target == user_name else f"для {target}"
-        res = (
-            f"Готово, поставила {who} на {remind_dt.strftime('%d.%m %H:%M')} — "
-            f"{reminder_text}. Проверила: запись есть в таблице."
-        )
-    except Exception as e:
-        print(f"[Напоминания] Не удалось сохранить: {e}")
-        res = (
-            "Не смогла сохранить напоминание в таблицу. "
-            "Я не буду делать вид, что всё записала — проверь доступ к Google Sheets."
-        )
-
-    add_chat_message(chat_id, "Ада", res)
-    await safe_answer(message, res)
-    return True
-
-
 async def handle_category_clarification_callback(callback: types.CallbackQuery):
     chat_id = callback.message.chat.id
     data = callback.data
@@ -232,17 +127,19 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
     if not data.startswith("clarify_opt:"):
         return
 
-    idx = int(data.split(":")[1])
-    clarification = pop_clarification(chat_id)
-
-    if not clarification:
-        await callback.answer("Уточнение устарело. Запиши заново.", show_alert=True)
+    key = state.dialogue_key(chat_id, callback.from_user.id)
+    clarification = get_clarification(key)
+    parts = data.split(":")
+    if not clarification or len(parts) != 3 or parts[1] != clarification.get("token"):
+        await callback.answer("Это чужое или устаревшее уточнение.", show_alert=True)
         return
-
+    try:
+        idx = int(parts[2])
+    except ValueError:
+        await callback.answer("Неверный выбор."); return
     options = clarification.get("options", [])
-    if idx >= len(options):
-        await callback.answer("Ошибка выбора.")
-        return
+    if idx < 0 or idx >= len(options):
+        await callback.answer("Неверный выбор."); return
 
     chosen = options[idx]
     tx = clarification["transaction"]
@@ -251,8 +148,8 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
     tx["necessity"] = chosen.get("necessity") or normalize_necessity(tx.get("necessity"), tx["category"])
 
     await asyncio.to_thread(append_transaction, tx)
+    ack_clarification(key)
     report = _format_confirmation_report(tx, f"Категория выбрана: {chosen['label']}.")
-    add_chat_message(chat_id, "Ада", report)
 
     try:
         await callback.message.edit_text(report)
@@ -262,6 +159,7 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
         except Exception:
             pass
 
+    add_chat_message(chat_id, "Ада", report)
     await callback.answer("Записано!")
 
 
@@ -273,6 +171,8 @@ async def handle_voice(message: Message):
     voice = message.voice or message.audio
     if not voice:
         return
+    if (voice.file_size or 0) > 20 * 1024 * 1024:
+        await safe_answer(message, "Аудио слишком большое. Максимум 20 МБ."); return
     try:
         file = await message.bot.get_file(voice.file_id)
         downloaded = await message.bot.download_file(file.file_path)
@@ -297,87 +197,54 @@ async def handle_voice(message: Message):
 async def _process_text_message(message: Message, text: str):
     user_name = get_authorized_user_name(message.from_user.id, message.from_user.first_name) or message.from_user.first_name or "Пользователь"
     chat_id = message.chat.id
-    add_chat_message(chat_id, user_name, text)
+    if not text.startswith("/"):
+        add_chat_message(chat_id, user_name, text)
     t_clean = text.strip().lower()
+    key = state.dialogue_key(chat_id, message.from_user.id)
 
-    # 1. Чек ожидает комментария
-    if has_pending(chat_id):
-        pending = pop_pending(chat_id)
-        if pending:
-            transactions, receipt_user = pending
-            lines = ["📸 **Записано по чеку:**"]
-            for tx in transactions:
-                original_item = str(tx.get("user_comment", "") or "").strip()
-                if original_item and original_item != text:
-                    tx["user_comment"] = f"{original_item} ({text})"
-                else:
-                    tx["user_comment"] = text
-                tx["user"] = receipt_user
-                await asyncio.to_thread(append_transaction, tx)
-                lines.append(
-                    f"• {_format_currency(tx.get('amount'))} {tx.get('currency')} | "
-                    f"{tx.get('bank')} | {tx.get('category')} ({tx['user_comment']})"
-                )
-            rep = "\n".join(lines)
-            add_chat_message(chat_id, "Ада", rep)
-            await safe_answer(message, rep)
+    # Explicit commands have precedence over a receipt comment/draft.
+    try:
+        if await reminder_service.handle(message, text, user_name):
             return
-
-    # 2. Перехват ответа на уточнение
-    clarification = get_clarification(chat_id)
-    if clarification:
-        matched_opt = None
-        for opt in clarification.get("options", []):
-            words = re.findall(r'\w+', opt["label"].lower())
-            if any(w in t_clean for w in words if len(w) > 3):
-                matched_opt = opt
-                break
-        if not matched_opt:
-            if any(k in t_clean for k in ["работ", "кафе", "собой", "перекус", "офис", "зал", "спорт"]):
-                matched_opt = clarification["options"][0]
-            elif any(k in t_clean for k in ["дом", "продукт", "семь", "каждый день", "обычн"]):
-                matched_opt = clarification["options"][-1]
-
-        if matched_opt:
-            pop_clarification(chat_id)
-            tx = clarification["transaction"]
-            tx["category"] = matched_opt["category"]
-            tx["subcategory"] = matched_opt.get("subcategory", "")
-            tx["user_comment"] = f"{tx.get('user_comment', '')} ({text})".strip()
-            tx["necessity"] = matched_opt.get("necessity") or normalize_necessity(tx.get("necessity"), tx["category"])
-            await asyncio.to_thread(append_transaction, tx)
-            report = _format_confirmation_report(tx, f"Поняла, это {matched_opt['label']}!")
-            add_chat_message(chat_id, "Ада", report)
-            await safe_answer(message, report)
+        if await debts.handle(message, text, user_name):
             return
+    except Exception:
+        import logging
+        logging.exception("Could not persist family action")
+        await safe_answer(message, "Не удалось подтвердить сохранение. Проверь список перед повтором; "
+                          "ошибка доступа к таблице не означает, что записи нет.")
+        return
 
-    # Прямой надёжный перехват добавления напоминаний — без зависимости от ИИ.
-    # Стоит после pending receipt/clarification, чтобы не украсть комментарий к чеку.
-    if await _try_handle_reminder_directly(message, text, user_name, chat_id):
+
+    # Drafts are in LLM context; unrelated speech must not be consumed as a receipt comment.
+    from services import edits
+    if await edits.handle_confirmation(message, text):
+        return
+
+    if has_pending(key) and t_clean in {"без комментария", "без комментариев", "сохрани чек"}:
+        await resolve_pending(message, {"intent":"receipt_comment", "comment":"без комментария"}, text)
         return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 0: МГНОВЕННАЯ СМЕНА БАНКА ПОСЛЕДНЕЙ ТРАТЫ ──
-    bank_match = re.search(r'(?:измени|поменяй|запиши|исправь)?\s*(?:что\s+это\s+)?(?:оплата\s+через|банк\s+на|карту\s+на|с\s+карты|банк)\s+([a-zA-Zа-яА-Я]+)', t_clean)
+    bank_match = re.fullmatch(r'(?:измени|поменяй|исправь)\s+(?:банк|карту)(?:\s+(?:в\s+)?последн\w+\s+(?:записи|трате|покупке))?\s+(?:на\s+)?([a-zA-Zа-яА-Я]+)[.!]?', t_clean)
     if bank_match:
         target_bank = bank_match.group(1).upper()
-        if target_bank in ["BCC", "KASPI", "HALYK", "FORTE", "FREEDOM", "НАЛОМ", "НАЛИЧНЫЕ", "БЦК", "КАСПИ"]:
+        if target_bank in ["BCC", "KASPI", "HALYK", "FORTE", "FREEDOM", "НАЛОМ", "НАЛИЧНЫЕ", "БЦК", "КАСПИ", "ХАЛЫК", "ФОРТЕ", "ФРИДОМ", "НАРОДНЫЙ"]:
             if target_bank in ["БЦК"]: target_bank = "BCC"
             if target_bank in ["КАСПИ"]: target_bank = "Kaspi"
             if target_bank in ["НАЛОМ", "НАЛИЧНЫЕ"]: target_bank = "Наличные"
 
-            updated_rec = await asyncio.to_thread(update_last_transaction_bank_and_source, target_bank)
+            updated_rec = await asyncio.to_thread(update_last_transaction_bank_and_source, target_bank, user_name)
             if updated_rec:
                 res = f"✅ Исправила в последней записи ({updated_rec.get('user_comment')}, {_format_currency(updated_rec.get('amount'))} KZT): банк изменён на **{updated_rec.get('bank')}** ({updated_rec.get('source')})."
             else:
                 res = "Не нашла последнюю запись в таблице для изменения банка."
-            add_chat_message(chat_id, "Ада", res)
             await safe_answer(message, res)
             return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 1: ДЕТЕКТОР УТЕЧЕК БЮДЖЕТА ──
     if t_clean in {"/leaks", "утечки"} or any(k in t_clean for k in ["утечки бюджета", "микротраты", "куда уходят деньги", "куда утекают деньги", "мелкие траты", "на что уходит мелочь"]):
         leak_data = await asyncio.to_thread(analyze_budget_leaks)
-        add_chat_message(chat_id, "Ада", leak_data["text"])
         await safe_answer(message, leak_data["text"])
         return
 
@@ -422,7 +289,8 @@ async def _process_text_message(message: Message, text: str):
         return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 5: ПОГОДА ──
-    if any(k in t_clean for k in ["погода", "погоду", "прогноз", "зонт"]):
+    if (any(k in t_clean for k in ["погода", "погоду", "прогноз погоды"])
+            and not re.search(r"купил|купила|потратил|оплатил|добавь", t_clean)):
         target = "today"
         if "недел" in t_clean or "5 дней" in t_clean or "выходн" in t_clean:
             target = "week"
@@ -433,7 +301,6 @@ async def _process_text_message(message: Message, text: str):
 
         forecast = await get_weather_forecast(target=target)
         res = forecast or "Не удалось связаться с погодной станцией Open-Meteo."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -441,32 +308,6 @@ async def _process_text_message(message: Message, text: str):
     if t_clean in {"debug", "/debug"}:
         debug_text = await asyncio.to_thread(debug_transactions_snapshot)
         await safe_answer(message, f"```\n{debug_text}\n```")
-        return
-
-    # ── ПРЯМОЙ ПЕРЕХВАТ 7: РАЗДЕЛИТЬ ТРАНЗАКЦИЮ ──
-    if "раздели" in t_clean and "транзакцию" in t_clean:
-        match = re.search(r"раздели\s+транзакцию\s+(\d+)[\s:]*(.+?)[\s]*\|\s*(.+?)", text, re.IGNORECASE)
-        if match:
-            target_amount = float(match.group(1))
-            part1_desc = match.group(2).strip()
-            part2_desc = match.group(3).strip()
-            p1_match = re.match(r"(.+?)\s*[-—]\s*(\d+)", part1_desc)
-            p2_match = re.match(r"(.+?)\s*[-—]\s*(\d+)", part2_desc)
-            if p1_match and p2_match:
-                part1_cat = normalize_category(p1_match.group(1).strip(), EXPENSE_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
-                part1_amt = float(p1_match.group(2))
-                part2_cat = normalize_category(p2_match.group(1).strip(), EXPENSE_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
-                part2_amt = float(p2_match.group(2))
-                success = await asyncio.to_thread(
-                    split_last_transaction_by_amount,
-                    target_amount, part1_amt, part1_cat, part1_desc,
-                    part2_amt, part2_cat, part2_desc
-                )
-                res = f"Разделила: {part1_cat} — {part1_amt} тг, {part2_cat} — {part2_amt} тг." if success else "Не нашла такую транзакцию."
-                add_chat_message(chat_id, "Ада", res)
-                await safe_answer(message, res)
-                return
-        await safe_answer(message, "Формат: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>")
         return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 8: ЦЕНЫ ПО ССЫЛКЕ ──
@@ -489,7 +330,6 @@ async def _process_text_message(message: Message, text: str):
             )
         else:
             res = "Не смогла разобрать ссылку на товар."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -498,36 +338,46 @@ async def _process_text_message(message: Message, text: str):
     except Exception:
         pass
 
-    # ── ЗАПРОС К ИИ ──
-    (
-        history,
-        limits,
-        reminders,
-        shopping_list,
-        trips,
-        subscriptions,
-        installments,
-    ) = await asyncio.gather(
-        asyncio.to_thread(get_last_200_transactions),
-        asyncio.to_thread(get_category_limits),
-        asyncio.to_thread(get_pending_reminders),
-        asyncio.to_thread(get_shopping_items),
-        asyncio.to_thread(get_planned_trips),
-        asyncio.to_thread(get_active_subscriptions),
-        asyncio.to_thread(get_installments),
-    )
+    # Complete conversational context, including drafts, debts and today's full history.
+    from services.context import collect
+    context = await collect(message)
     chat_history = get_chat_history(chat_id)
-
-    parsed = await parse_and_analyze(
-        user_text=text, user_name=user_name,
-        history=history, chat_history=chat_history,
-        shopping_list=shopping_list, limits=limits,
-        reminders=reminders, trips=trips,
-        subscriptions=subscriptions, installments=installments,
-    )
+    parsed = await parse_and_analyze(user_text=text, user_name=user_name,
+                                     chat_history=chat_history, **context)
 
     intent = parsed.get("intent", "chat")
     reply = parsed.get("reply", "")
+
+    if await reminder_service.handle_model(message, parsed, user_name):
+        return
+    if await debts.handle_model(message, parsed, user_name):
+        return
+    if intent in {"receipt_comment", "resolve_clarification"}:
+        await resolve_pending(message, parsed, text)
+        return
+    if intent == "get_weather":
+        target = parsed.get("weather_target", "today")
+        if target not in {"today","tomorrow","after_tomorrow","week"}:
+            target = "today"
+        forecast = await get_weather_forecast(target=target)
+        await safe_answer(message, forecast or "Погодный сервис сейчас недоступен.")
+        return
+    if intent == "split_transaction":
+        split = parsed.get("split") or {}
+        parts = split.get("parts") or []
+        if len(parts) != 2:
+            await safe_answer(message,"Укажи две категории и суммы частей."); return
+        try:
+            success = await asyncio.to_thread(split_last_transaction_by_amount,
+                parse_amount(split.get("amount")), parse_amount(parts[0].get("amount")),
+                parts[0].get("category"), parts[0].get("comment",""),
+                parse_amount(parts[1].get("amount")), parts[1].get("category"), parts[1].get("comment",""),
+                split.get("transaction_id",""), f"SPLIT_{chat_id}_{message.message_id}")
+        except ValueError:
+            success = False
+        await safe_answer(message, "✅ Разделила операцию на две категории." if success else
+                          "Не удалось разделить: нужна одна исходная запись и точное совпадение суммы частей.")
+        return
 
     # Блокировка кнопок при командах удаления
     is_delete_or_edit_command = any(k in t_clean for k in ["удали", "удалить", "поменяй", "измени", "исправь", "замени", "отмени"])
@@ -535,7 +385,8 @@ async def _process_text_message(message: Message, text: str):
     ambig_options = parsed.get("clarification_options") or get_ambiguous_options(text)
     if (
         not is_delete_or_edit_command
-        and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0)
+        and (intent in {"need_clarification", "transaction"})
+        and parse_amount((parsed.get("transaction") or {}).get("amount", 0)) > 0
         and _should_ask_clarification(text, parsed, ambig_options)
     ):
         tx = parsed.get("transaction") or {}
@@ -563,10 +414,15 @@ async def _process_text_message(message: Message, text: str):
         else:
             prompt_text = reply
 
-        kb = _build_clarification_keyboard(ambig_options)
-        set_clarification(chat_id, tx, ambig_options)
-        add_chat_message(chat_id, "Ада", prompt_text)
-        await message.answer(prompt_text, reply_markup=kb)
+        tx["transaction_id"] = f"TG_{chat_id}_{message.message_id}_0"
+        older = get_clarification(key)
+        if older and older.get("transaction", {}).get("transaction_id") != tx["transaction_id"]:
+            await asyncio.to_thread(append_transaction, older["transaction"])
+            ack_clarification(key)
+            await safe_answer(message, "Предыдущую ожидающую категорию сохранила в её резервную категорию, чтобы не потерять операцию.")
+        token = set_clarification(key, tx, ambig_options)
+        kb = _build_clarification_keyboard(ambig_options, token)
+        await safe_answer(message, prompt_text, reply_markup=kb)
         return
 
     # Если ИИ/локальные правила пометили как need_clarification, но код решил,
@@ -574,36 +430,18 @@ async def _process_text_message(message: Message, text: str):
     if intent == "need_clarification" and (parsed.get("transaction") or {}).get("amount"):
         intent = "transaction"
 
-    # ── УДАЛЕНИЕ И ПРАВКА ЗАПИСЕЙ ──
-    if intent in {"delete_transaction", "correct_any_record"} or is_delete_or_edit_command:
-        updates = parsed.get("updates", [])
-        if updates:
-            results = []
-            for upd in updates:
-                worksheet = upd.get("worksheet", "Transactions")
-                search_query = upd.get("search_query", "")
-                action = upd.get("action", "update")
-                if action == "delete":
-                    deleted = await asyncio.to_thread(delete_record_by_keyword, worksheet, search_query)
-                    results.append("удалила" if deleted else "не нашла")
-                else:
-                    column = upd.get("column_to_update", "")
-                    new_value = upd.get("new_value", "")
-                    updated = await asyncio.to_thread(find_and_update_record, worksheet, search_query, column, new_value)
-                    results.append("обновила" if updated else "не нашла")
-            res = reply or f"Результат: {', '.join(results)}."
-            add_chat_message(chat_id, "Ада", res)
-            await safe_answer(message, res)
+    # Newest-first keyword lookup retained, but mutation is confirmed by stable ID.
+    if intent in {"delete_transaction", "correct_any_record"}:
+        # Support legacy model output targeting Reminders through common editor.
+        updates = parsed.get("updates") or []
+        reminder_updates = [op for op in updates if op.get("worksheet") == "Reminders"]
+        if reminder_updates:
+            if len(reminder_updates) != len(updates) or any(op.get("action") != "delete" for op in reminder_updates):
+                await safe_answer(message,"Изменяй напоминания отдельным запросом."); return
+            await reminder_service.handle_model(message, {"intent":"delete_reminder",
+                "search_query": reminder_updates[0].get("search_query","")},user_name)
             return
-
-        query = parsed.get("search_query", "") or text
-        deleted = await asyncio.to_thread(delete_record_by_keyword, "Transactions", query)
-        if deleted:
-            res = f"Удалила покупку: {deleted.get('category')} на {_format_currency(deleted.get('amount'))} тг ({deleted.get('user_comment')})."
-        else:
-            res = reply or "Не нашла такую запись в таблице для удаления."
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
+        await edits.propose(message, parsed)
         return
 
     # ── СВОДКА И БАЛАНС ЗА МЕСЯЦ ──
@@ -629,7 +467,7 @@ async def _process_text_message(message: Message, text: str):
                 cat = str(t.get("cat") or "Прочее")
                 by_category[cat] = by_category.get(cat, 0) + amt
 
-        lines = [f"📊 **Сводка за {now.strftime('%B %Y')}:**"]
+        lines = [f"📊 **Сводка за {month_label(now)}:**"]
         lines.append(f"💰 Доходы: {_format_currency(total_income)} тг")
         lines.append(f"💸 Расходы: {_format_currency(total_expense)} тг")
         lines.append(f"📈 Баланс: {_format_currency(total_income - total_expense)} тг\n")
@@ -641,7 +479,6 @@ async def _process_text_message(message: Message, text: str):
             lines.append("  _(В этом месяце расходов ещё не записано)_")
 
         res = "\n".join(lines)
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -652,13 +489,17 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, reply or "Не поняла, что записывать.")
             return
 
+        tx["transaction_id"] = f"TG_{chat_id}_{message.message_id}_0"
         tx_type = str(tx.get("type") or TYPE_EXPENSE).strip().upper()
+        tx_type = TYPE_INCOME if tx_type in {"INCOME", "ДОХОД"} else TYPE_EXPENSE
+        tx["type"] = tx_type
         valid_categories = INCOME_CATEGORIES if tx_type == TYPE_INCOME else EXPENSE_CATEGORIES
         fallback_cat = FALLBACK_INCOME_CATEGORY if tx_type == TYPE_INCOME else FALLBACK_EXPENSE_CATEGORY
 
         cat = normalize_category(tx.get("category"), valid_categories, fallback_cat)
         tx["category"] = cat
-        _, valid_sub = validate_transaction_category_subcategory(cat, tx.get("subcategory"), valid_categories, fallback_cat)
+        cat, valid_sub = validate_transaction_category_subcategory(cat, tx.get("subcategory"), valid_categories, fallback_cat)
+        tx["category"] = cat
         tx["subcategory"] = valid_sub or normalize_subcategory(None, cat, "")
         tx["necessity"] = normalize_necessity(tx.get("necessity"), cat)
         tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
@@ -684,7 +525,6 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, "Не смогла записать трату в таблицу. Не буду делать вид, что записала — проверь Google Sheets.")
             return
         report = _format_confirmation_report(tx, reply)
-        add_chat_message(chat_id, "Ада", report)
         await safe_answer(message, report)
         return
 
@@ -692,18 +532,17 @@ async def _process_text_message(message: Message, text: str):
     if intent == "add_installment":
         data = parsed.get("installment", {})
         if data:
-            await asyncio.to_thread(add_installment, data)
-        res = reply or "Записала рассрочку."
-        add_chat_message(chat_id, "Ада", res)
+            data["user"] = user_name
+            data["id"] = f"INST_{chat_id}_{message.message_id}"
+        saved = await asyncio.to_thread(add_installment, data) if data else None
+        res = "Записала рассрочку." if saved else "Не смогла сохранить рассрочку."
         await safe_answer(message, res)
         return
 
     if intent == "close_installment":
         query = parsed.get("search_query", "")
-        if query:
-            await asyncio.to_thread(close_installment, query)
-        res = reply or "Закрыла рассрочку."
-        add_chat_message(chat_id, "Ада", res)
+        saved = await asyncio.to_thread(close_installment, query) if query else None
+        res = "Закрыла рассрочку." if saved else "Не нашла рассрочку или не удалось сохранить изменение."
         await safe_answer(message, res)
         return
 
@@ -720,7 +559,6 @@ async def _process_text_message(message: Message, text: str):
             res = "\n".join(lines)
         else:
             res = "Нет активных рассрочек."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -733,23 +571,20 @@ async def _process_text_message(message: Message, text: str):
         day = int(parse_amount(sub.get("day_of_month", parsed.get("day_of_month", now_astana().day))) or now_astana().day)
         if name and amount > 0:
             try:
-                saved = await asyncio.to_thread(add_or_update_subscription, name, amount, bank, max(1, min(day, 31)))
-                res = reply or f"Записала подписку {saved.get('name', name)}: {_format_currency(amount)} тг/мес, день списания — {max(1, min(day, 31))}."
+                saved = await asyncio.to_thread(add_or_update_subscription, name, amount, bank, day, sub.get("paid_this_month") is True)
+                res = f"Записала подписку {saved.get('name', name)}: {_format_currency(amount)} тг/мес, день списания — {max(1, min(day, 31))}."
             except Exception as e:
                 print(f"[Подписки] Ошибка сохранения: {e}")
                 res = "Не смогла сохранить подписку в таблицу. Проверь Google Sheets."
         else:
-            res = reply or "Не хватает названия или суммы подписки."
-        add_chat_message(chat_id, "Ада", res)
+            res = "Не хватает названия или суммы подписки."
         await safe_answer(message, res)
         return
 
     if intent == "cancel_subscription":
         name = parsed.get("subscription_name", "")
-        if name:
-            await asyncio.to_thread(deactivate_subscription, name)
-        res = reply or "Отменила подписку."
-        add_chat_message(chat_id, "Ада", res)
+        saved = await asyncio.to_thread(deactivate_subscription, name) if name else None
+        res = "Отменила подписку." if saved else "Не нашла подписку или не удалось сохранить изменение."
         await safe_answer(message, res)
         return
 
@@ -762,75 +597,21 @@ async def _process_text_message(message: Message, text: str):
             res = "\n".join(lines)
         else:
             res = "Нет активных подписок."
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    # НАПОМИНАНИЯ
-    if intent == "add_reminder":
-        target = parsed.get("reminder_target", user_name)
-        times = parsed.get("reminder_times", [])
-        text_rem = parsed.get("reminder_text", "")
-        recurrence = parsed.get("recurrence", "once")
-        if not times:
-            await safe_answer(message, reply or "Во сколько поставить напоминание?")
-            return
-        try:
-            saved_ids = []
-            for time_str in times:
-                saved = await asyncio.to_thread(add_reminder, target, time_str, text_rem, recurrence)
-                saved_ids.append(saved.get("reminder_id") or saved.get("id"))
-            active = await asyncio.to_thread(get_pending_reminders)
-            active_ids = {(r.get("reminder_id") or r.get("id")) for r in active}
-            if any(saved_id not in active_ids for saved_id in saved_ids if saved_id):
-                raise RuntimeError("Не все напоминания найдены после записи.")
-        except Exception as e:
-            print(f"[Напоминания] Ошибка сохранения: {e}")
-            await safe_answer(message, "Не смогла сохранить напоминание в таблицу. Не буду врать, что записала — проверь Google Sheets.")
-            return
-        res = reply or "Поставила напоминание и проверила, что оно сохранилось."
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    if intent == "delete_reminder":
-        query = parsed.get("search_query", "")
-        if query:
-            await asyncio.to_thread(delete_record_by_keyword, "Reminders", query)
-        res = reply or "Удалила напоминание."
-        add_chat_message(chat_id, "Ада", res)
-        await safe_answer(message, res)
-        return
-
-    if intent == "get_reminders":
-        items = await asyncio.to_thread(get_pending_reminders)
-        if items:
-            lines = ["📋 **Активные напоминания:**"]
-            for item in items:
-                lines.append(f"- {item.get('target_user')}: {item.get('text')} ({item.get('remind_at')})")
-            res = "\n".join(lines)
-        else:
-            res = "Нет активных напоминаний."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
     # СПИСОК ПОКУПОК
     if intent == "add_shopping":
         items = parsed.get("shopping_items", [])
-        if items:
-            await asyncio.to_thread(add_shopping_items, items, user_name)
-        res = reply or "Добавила в список покупок."
-        add_chat_message(chat_id, "Ада", res)
+        saved = await asyncio.to_thread(add_shopping_items, items, user_name) if items else []
+        res = f"Добавила в список покупок: {len(saved)}." if saved else "Не определила товары для добавления."
         await safe_answer(message, res)
         return
 
     if intent == "clear_shopping":
         items = parsed.get("shopping_items", [])
-        if items:
-            await asyncio.to_thread(mark_shopping_items_done, items)
-        res = reply or "Убрала из списка."
-        add_chat_message(chat_id, "Ада", res)
+        removed = await asyncio.to_thread(mark_shopping_items_done, items) if items else []
+        res = f"Вычеркнула из списка: {len(removed)}." if removed else "Не нашла товары для вычёркивания."
         await safe_answer(message, res)
         return
 
@@ -843,7 +624,6 @@ async def _process_text_message(message: Message, text: str):
             res = "\n".join(lines)
         else:
             res = "Список покупок пуст."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -853,10 +633,8 @@ async def _process_text_message(message: Message, text: str):
         dates = parsed.get("dates", "")
         budget = _to_number_or_blank(parsed.get("budget", 0))
         notes = parsed.get("notes", "")
-        if destination:
-            await asyncio.to_thread(add_trip_plan, destination, dates, budget, notes)
-        res = reply or "Записала поездку."
-        add_chat_message(chat_id, "Ада", res)
+        saved = await asyncio.to_thread(add_trip_plan, destination, dates, budget, notes) if destination else None
+        res = "Записала поездку." if saved else "Не определила место поездки."
         await safe_answer(message, res)
         return
 
@@ -869,7 +647,6 @@ async def _process_text_message(message: Message, text: str):
             res = "\n".join(lines)
         else:
             res = "Нет запланированных поездок."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -883,7 +660,6 @@ async def _process_text_message(message: Message, text: str):
             res = "\n".join(lines)
         else:
             res = "Лимиты не заданы."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -900,7 +676,6 @@ async def _process_text_message(message: Message, text: str):
         except Exception as error:
             print(f"[Лимиты] Ошибка генерации: {error}")
             res = "Не удалось сгенерировать лимиты."
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
@@ -916,15 +691,61 @@ async def _process_text_message(message: Message, text: str):
         transactions = await asyncio.to_thread(get_transactions_for_period, start, end)
         incomes = [t for t in transactions if str(t.get("type")) == TYPE_INCOME]
         total = sum(_to_number_or_blank(t.get("amt")) for t in incomes)
-        lines = [f"💰 **Доходы за {now.strftime('%B %Y')}:** {_format_currency(total)} тг"]
+        lines = [f"💰 **Доходы за {month_label(now)}:** {_format_currency(total)} тг"]
         for t in incomes:
             lines.append(f"  - {t.get('cat')}: {_format_currency(t.get('amt'))} тг ({t.get('comm')})")
         res = "\n".join(lines)
-        add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
     # ОБЫЧНЫЙ ЧАТ
     res = reply or "Чем могу помочь?"
-    add_chat_message(chat_id, "Ада", res)
     await safe_answer(message, res)
+
+
+async def resolve_pending(message, parsed, text):
+    key = state.dialogue_key(message.chat.id, message.from_user.id)
+    if parsed["intent"] == "resolve_clarification":
+        draft = get_clarification(key)
+        try:
+            index = int(parsed.get("clarification_index"))
+            if not draft or not 0 <= index < len(draft["options"]): raise ValueError()
+        except (TypeError, ValueError):
+            await safe_answer(message,"Не нашла ожидающий выбор категории. Пришли новую операцию."); return
+        tx, option = draft["transaction"], draft["options"][index]
+        tx.update(category=option["category"], subcategory=option.get("subcategory",""),
+                  necessity=option.get("necessity") or normalize_necessity(tx.get("necessity"),option["category"]))
+        await asyncio.to_thread(append_transaction,tx)
+        ack_clarification(key)
+        await safe_answer(message,_format_confirmation_report(tx,f"Категория: {option['label']}"))
+        return
+    pending = pop_pending(key)
+    if not pending:
+        await safe_answer(message,"У тебя нет ожидающего комментария чека."); return
+    transactions, owner = pending
+    comment = str(parsed.get("comment") or text)
+    if comment.lower().strip() in {"без комментария","без комментариев"}:
+        comment = ""
+    for update in parsed.get("receipt_updates") or []:
+        try:
+            index = int(update.get("index"))
+            if not 0 <= index < len(transactions): continue
+        except (TypeError,ValueError):
+            continue
+        tx = transactions[index]
+        valid = INCOME_CATEGORIES if tx.get("type") == TYPE_INCOME else EXPENSE_CATEGORIES
+        fallback = FALLBACK_INCOME_CATEGORY if valid is INCOME_CATEGORIES else FALLBACK_EXPENSE_CATEGORY
+        cat, sub = validate_transaction_category_subcategory(update.get("category"),update.get("subcategory"),valid,fallback)
+        tx.update(category=cat,subcategory=sub,necessity=normalize_necessity(update.get("necessity"),cat))
+    for tx in transactions:
+        existing = str(tx.get("user_comment") or "")
+        if comment and comment not in existing:
+            tx["user_comment"] = f"{existing} ({comment})".strip()
+        tx["user"] = owner
+    # Persist enriched comment/categories before first write; retry cannot lose amendments.
+    state.put("receipts",key,{"transactions":transactions,"user_name":owner})
+    for tx in transactions:
+        await asyncio.to_thread(append_transaction,tx)
+    ack_pending(key)
+    await safe_answer(message,"📸 Сохранила чек:\n\n" + "\n".join(
+        f"{_format_currency(tx['amount'])} KZT · {tx['category']} · {tx.get('user_comment','')}" for tx in transactions))
