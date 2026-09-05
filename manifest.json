@@ -1,0 +1,33 @@
+{
+  "patch": "ada-input-and-reminder-hotfix",
+  "target": "previous ada_railway_group_release.zip; not the original main ZIP",
+  "replace": [
+    "run.py",
+    "handlers/media_handler.py",
+    "services/vision.py",
+    "services/voice.py",
+    "services/pending_receipts.py"
+  ],
+  "add": [
+    "services/document_reader.py",
+    "services/ingest_models.py",
+    "services/receipt_flow.py",
+    "services/reminder_edit.py",
+    "services/input_hotfix.py"
+  ],
+  "local_tests": 70,
+  "live_api_verified": false,
+  "current_github_snapshot_available": false,
+  "files_sha256": {
+    "handlers/media_handler.py": "7c44557179df1de14f1be7f9ade8e895d8ff0811805c42c61d5cfbb4f83a8c68",
+    "run.py": "4077c1b721f1f44b31f01d1988447c92a734fdbd6b7ab77d568ab15e2a18cd54",
+    "services/document_reader.py": "3a8d3d8ed92dc0e952af7b4625bfcdc4162456df0b1dee14aab634a25738edef",
+    "services/ingest_models.py": "ffcb60432197cb39b417037ae127dcbf0a69dda5dc2ce98df57a0c89ecfbe4ee",
+    "services/input_hotfix.py": "9f318083ca9f595b64d506fbd40f1e36ca20387e4393d32e55d2e6f46d97803f",
+    "services/pending_receipts.py": "2d20f97ef80dfb386523f4ee12e9d550c8db325ca8e30f2ff3f58a6f9df4b370",
+    "services/receipt_flow.py": "76e427248436b6e42fe0da9f1f9d946709034e180a7643210d1aaa6b1365123f",
+    "services/reminder_edit.py": "ab315c625c900d08c0e904ea6988652a8a65e298f571f0ee82782cee37007197",
+    "services/vision.py": "df719c4324a0d329d8549714bcd98ad5b715c5159e686efc447a5b2a42615f87",
+    "services/voice.py": "e9bd2e67abd5089260916478db0d24d7d9ee6d50aa3189687ee4b847c6e9e368"
+  }
+}

@@ -1,0 +1,10 @@
+Targeted hotfix verification, not a full live Railway regression test.
+70 local cases. Python 3.13.5; deployment target remains Python 3.11.
+Original uploaded source + simulated prior-release state/reminder/handler contracts.
+Telegram, Google Sheets, OpenAI and DeepSeek responses mocked; import shims used.
+Real Pillow/PDFium/PyMuPDF and ffmpeg exercised locally.
+Four supplied debug screenshots decoded as images; no external OCR API called.
+No live deploy, full dependency installation, current GitHub clone or production logs available.
+
+......................................................................   [100%]
+70 passed in 4.49s
