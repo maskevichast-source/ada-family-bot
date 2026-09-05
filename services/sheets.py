@@ -257,6 +257,7 @@ def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
 
             if matched:
                 result.append({
+                    "transaction_id": r.get("transaction_id", ""),
                     "date": r.get("date"),
                     "user": r.get("user"),
                     "type": r.get("type") or TYPE_EXPENSE,
@@ -474,7 +475,7 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
 def process_due_subscriptions(now: datetime.datetime) -> list:
     due_processed = []
     try:
-        ws = get_db().worksheet("Subscriptions")
+        ws = _get_or_create_subscriptions_sheet()
         records = _get_all_records_safe(ws)
         current_month_prefix = now.strftime("%Y-%m")
         today_str = now.strftime("%Y-%m-%d")
@@ -608,46 +609,111 @@ def add_installment(data: dict | None = None, **kwargs):
 def close_installment(search_query: str) -> bool:
     return find_and_update_record("Installments", search_query, INSTALLMENT_STATUS_COLUMN, "closed", search_from_recent=True)
 
+SUBSCRIPTION_HEADERS = ["id", "name", "amount", "bank", "day_of_month", "last_paid", "status", "last_warning"]
+
+
+def _get_or_create_subscriptions_sheet():
+    ws = _get_or_create_worksheet("Subscriptions", SUBSCRIPTION_HEADERS, rows=100, cols=len(SUBSCRIPTION_HEADERS))
+    headers = ws.row_values(1)
+    # Миграция старой схемы из 7 колонок: добавляем last_warning в H.
+    if len(headers) < len(SUBSCRIPTION_HEADERS):
+        for col_idx, header in enumerate(SUBSCRIPTION_HEADERS, start=1):
+            if col_idx > len(headers) or not headers[col_idx - 1]:
+                ws.update_cell(1, col_idx, header)
+    return ws
+
+
 def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month: int):
-    try:
-        ws = get_db().worksheet("Subscriptions")
-        records = _get_all_records_safe(ws)
-        now = datetime.datetime.now(ASTANA_TZ)
-        today_str = now.strftime("%Y-%m-%d")
-        for idx, r in enumerate(records, start=2):
-            if str(r.get("name")).lower() == name.lower():
-                ws.update_cell(idx, 3, parse_amount(amount))
-                ws.update_cell(idx, 5, day_of_month)
-                ws.update_cell(idx, 6, today_str)
-                ws.update_cell(idx, 7, "active")
-                return
-        sub_id = f"SUB_{now.strftime('%Y%m%d_%H%M%S')}"
-        ws.append_row([sub_id, name, parse_amount(amount), bank, day_of_month, today_str, "active"], table_range=_table_range(7))
-    except Exception as e:
-        print(f"[Подписки] Ошибка: {e}")
+    ws = _get_or_create_subscriptions_sheet()
+    records = _get_all_records_safe(ws)
+    now = datetime.datetime.now(ASTANA_TZ)
+    today_str = now.strftime("%Y-%m-%d")
+    clean_name = str(name or "").strip()
+    if not clean_name:
+        raise ValueError("Название подписки пустое")
+    day = max(1, min(int(parse_amount(day_of_month) or 1), 31))
+    amt = parse_amount(amount)
+    for idx, r in enumerate(records, start=2):
+        if str(r.get("name", "")).strip().lower() == clean_name.lower():
+            ws.update_cell(idx, 3, amt)
+            ws.update_cell(idx, 4, bank or "Не указан")
+            ws.update_cell(idx, 5, day)
+            ws.update_cell(idx, 7, "active")
+            return {"id": r.get("id"), "name": clean_name, "amount": amt, "bank": bank or "Не указан", "day_of_month": day, "status": "active"}
+    sub_id = f"SUB_{now.strftime('%Y%m%d_%H%M%S')}"
+    row = [sub_id, clean_name, amt, bank or "Не указан", day, today_str, "active", ""]
+    ws.append_row(row, table_range=_table_range(len(SUBSCRIPTION_HEADERS)), value_input_option="USER_ENTERED")
+    return {"id": sub_id, "name": clean_name, "amount": amt, "bank": bank or "Не указан", "day_of_month": day, "status": "active"}
+
 
 def get_active_subscriptions():
     try:
-        ws = get_db().worksheet("Subscriptions")
+        ws = _get_or_create_subscriptions_sheet()
         records = _get_all_records_safe(ws)
-        return [r for r in records if str(r.get("status")).lower() == "active"]
+        return [r for r in records if str(r.get("status") or "").strip().lower() == "active"]
     except Exception as e:
         print(f"[Подписки] Ошибка чтения: {e}")
         return []
 
+
 def deactivate_subscription(name: str):
     try:
-        ws = get_db().worksheet("Subscriptions")
+        ws = _get_or_create_subscriptions_sheet()
         records = _get_all_records_safe(ws)
-        name_lower = str(name).lower()
+        name_lower = str(name or "").lower()
         for idx, r in enumerate(records, start=2):
-            if str(r.get("status")).lower() == "active" and name_lower in str(r.get("name", "")).lower():
+            if str(r.get("status") or "").lower() == "active" and name_lower in str(r.get("name", "")).lower():
                 ws.update_cell(idx, 7, "cancelled")
                 return r
         return None
     except Exception as e:
         print(f"[Подписки] Ошибка отмены: {e}")
         return None
+
+
+def mark_subscription_warning_sent(row_idx: int, warning_date: str):
+    try:
+        ws = _get_or_create_subscriptions_sheet()
+        ws.update_cell(row_idx, 8, warning_date)
+    except Exception as e:
+        print(f"[Подписки] Не смогла отметить предупреждение: {e}")
+
+
+def get_subscription_warnings(now: datetime.datetime, days_before: int = 2) -> list[dict]:
+    """Вернуть подписки, о которых пора предупредить за N дней до списания."""
+    try:
+        ws = _get_or_create_subscriptions_sheet()
+        records = _get_all_records_safe(ws)
+        today = now.date()
+        warnings = []
+        for idx, r in enumerate(records, start=2):
+            if str(r.get("status") or "").strip().lower() != "active":
+                continue
+            try:
+                raw_day = int(parse_amount(r.get("day_of_month", 1)) or 1)
+                year, month = today.year, today.month
+                import calendar
+                day = min(max(raw_day, 1), calendar.monthrange(year, month)[1])
+                due = datetime.date(year, month, day)
+                if due < today:
+                    month = 1 if month == 12 else month + 1
+                    year = year + 1 if today.month == 12 else year
+                    day = min(max(raw_day, 1), calendar.monthrange(year, month)[1])
+                    due = datetime.date(year, month, day)
+                if (due - today).days != days_before:
+                    continue
+                if str(r.get("last_warning", "")).strip() == today.strftime("%Y-%m-%d"):
+                    continue
+                item = dict(r)
+                item["row_idx"] = idx
+                item["due_date"] = due.strftime("%Y-%m-%d")
+                warnings.append(item)
+            except Exception as row_error:
+                print(f"[Подписки] Ошибка предупреждения строки {idx}: {row_error}")
+        return warnings
+    except Exception as e:
+        print(f"[Подписки] Ошибка чтения предупреждений: {e}")
+        return []
 
 def normalize_existing_family_table_values() -> dict:
     """Разовая мягкая санация старых строк без изменения структуры таблицы.

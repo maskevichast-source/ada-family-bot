@@ -77,7 +77,7 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 Отвечай ТОЛЬКО валидным JSON-объектом.
 
 Обязательные поля:
-- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "chat"
+- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "chat"
 - "reply": "короткий живой ответ на русском"
 
 Для transaction:
@@ -96,6 +96,10 @@ SYSTEM_PROMPT_TEMPLATE = f"""
   "user_comment": строка,
   "ai_comment": строка
 }}
+
+Для add_subscription:
+- "subscription": {"name": "название", "amount": число, "bank": "Kaspi/BCC/Forte/Halyk/Freedom/Не указан", "day_of_month": число 1-31}
+- Также можно продублировать "subscription_name" строкой.
 
 Для add_reminder:
 - "reminder_target": "Влад" | "Диана" | "Семья"

@@ -249,17 +249,34 @@ def normalize_subcategory(raw: str | None, category: str | None, fallback: str =
     return valid_subs[0] if valid_subs else fallback
 
 
-def validate_transaction_category_subcategory(category: str, subcategory: str) -> tuple[str, str]:
-    norm_cat = normalize_category(category, EXPENSE_CATEGORIES, FALLBACK_EXPENSE_CATEGORY)
+def validate_transaction_category_subcategory(
+    category: str,
+    subcategory: str | None,
+    categories: list[str] | None = None,
+    fallback: str | None = None,
+) -> tuple[str, str]:
+    """Проверить связку категория/подкатегория.
+
+    Для доходов подкатегорий из расходного справочника нет, поэтому возвращаем
+    пустую подкатегорию, а не случайную подкатегорию fallback-расходов.
+    """
+    categories = categories or EXPENSE_CATEGORIES
+    fallback = fallback or (FALLBACK_INCOME_CATEGORY if categories is INCOME_CATEGORIES else FALLBACK_EXPENSE_CATEGORY)
+    norm_cat = normalize_category(category, categories, fallback)
+
     valid_subs = SUBCATEGORIES_MAP.get(norm_cat, [])
     if not valid_subs:
         return norm_cat, ""
+
+    sub_raw = str(subcategory or "").strip()
     for sub in valid_subs:
-        if sub.lower() == str(subcategory).strip().lower():
+        if sub.lower() == sub_raw.lower():
             return norm_cat, sub
-    correct_cat = SUBCATEGORY_TO_CATEGORY.get(subcategory)
-    if correct_cat:
-        return correct_cat, subcategory
+
+    correct_cat = SUBCATEGORY_TO_CATEGORY.get(sub_raw)
+    if correct_cat and correct_cat in categories:
+        return correct_cat, sub_raw
+
     return norm_cat, valid_subs[0]
 
 

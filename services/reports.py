@@ -149,7 +149,7 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
     if m == 12:
         end_date = datetime.date(y + 1, 1, 1).strftime("%Y-%m-%d")
     else:
-        end_date = datetime.date(y + 1, 1, 1).strftime("%Y-%m-%d")
+        end_date = datetime.date(y, m + 1, 1).strftime("%Y-%m-%d")
 
     transactions = get_transactions_for_period(start_date, end_date)
 
@@ -177,7 +177,7 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
 
     for t in transactions:
         ws1.append([
-            str(t.get("date", ""))[:19],
+            str(t.get("transaction_id", "")),
             str(t.get("date", "")),
             str(t.get("user", "")),
             str(t.get("type", "")),
