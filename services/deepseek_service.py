@@ -98,7 +98,7 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 }}
 
 Для add_subscription:
-- "subscription": {"name": "название", "amount": число, "bank": "Kaspi/BCC/Forte/Halyk/Freedom/Не указан", "day_of_month": число 1-31}
+- "subscription": {{"name": "название", "amount": число, "bank": "Kaspi/BCC/Forte/Halyk/Freedom/Не указан", "day_of_month": число 1-31}}
 - Также можно продублировать "subscription_name" строкой.
 
 Для add_reminder:
