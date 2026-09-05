@@ -21,13 +21,17 @@ HEADERS_JSON = {
 
 
 def detect_marketplace(url: str) -> Optional[str]:
-    u = url.lower()
-    if any(d in u for d in ["wildberries.ru", "wildberries.kz", "wb.ru", "wb.kz"]):
-        return "Wildberries"
-    if any(d in u for d in ["kaspi.kz", "l.kaspi.kz"]):
-        return "Kaspi"
-    if any(d in u for d in ["ozon.ru", "ozon.kz"]):
-        return "Ozon"
+    from urllib.parse import urlparse
+    parsed = urlparse(url)
+    if parsed.scheme not in {"http", "https"} or parsed.username or parsed.password or parsed.port not in {None, 80, 443}:
+        return None
+    host = (parsed.hostname or "").lower()
+    for name, domains in {
+        "Wildberries": ("wildberries.ru", "wildberries.kz", "wb.ru", "wb.kz"),
+        "Kaspi": ("kaspi.kz",), "Ozon": ("ozon.ru", "ozon.kz")
+    }.items():
+        if any(host == domain or host.endswith("." + domain) for domain in domains):
+            return name
     return None
 
 
@@ -62,13 +66,17 @@ def get_wb_basket_host(nm_id: int) -> str:
 
 
 async def resolve_redirects(url: str) -> tuple[str, str]:
-    try:
-        async with AsyncSession(impersonate="chrome124") as session:
-            resp = await session.get(url, allow_redirects=True, timeout=10)
+    from urllib.parse import urljoin
+    async with AsyncSession(impersonate="chrome124") as session:
+        for _ in range(5):
+            if not detect_marketplace(url):
+                raise ValueError("Перенаправление вне разрешённого магазина")
+            resp = await session.get(url, allow_redirects=False, timeout=10)
+            if resp.status_code in {301, 302, 303, 307, 308}:
+                url = urljoin(url, resp.headers.get("location", ""))
+                continue
             return str(resp.url), resp.text
-    except Exception as e:
-        print(f"[PriceTracker Redirect] Ошибка для {url}: {e}")
-        return url, ""
+    raise ValueError("Слишком много перенаправлений")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

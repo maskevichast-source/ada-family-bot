@@ -45,106 +45,110 @@ _WEEKDAYS_RU = {
 
 
 def parse_flexible_datetime(value):
-    """Устойчиво разобрать время напоминания/табличную дату.
-
-    Возвращает datetime с таймзоной Астаны, либо None, если разобрать не удалось.
-    """
     if isinstance(value, datetime.datetime):
-        return value if value.tzinfo else value.replace(tzinfo=ASTANA_TZ)
-
-    text = str(value).strip()
-    if not text:
-        return None
-
-    for fmt in (
-        "%Y-%m-%d %H:%M:%S",
-        "%Y-%m-%d %H:%M",
-        "%d.%m.%Y %H:%M:%S",
-        "%d.%m.%Y %H:%M",
-        "%m/%d/%Y %H:%M:%S",
-        "%m/%d/%Y %H:%M",
-    ):
+        return value.astimezone(ASTANA_TZ) if value.tzinfo else value.replace(tzinfo=ASTANA_TZ)
+    if isinstance(value, datetime.date):
+        return datetime.datetime.combine(value, datetime.time(), ASTANA_TZ)
+    text = str(value or "").strip()
+    try:
+        dt = datetime.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return dt.astimezone(ASTANA_TZ) if dt.tzinfo else dt.replace(tzinfo=ASTANA_TZ)
+    except ValueError:
+        pass
+    for fmt in ("%d.%m.%Y %H:%M:%S", "%d.%m.%Y %H:%M", "%d.%m.%Y",
+                "%m/%d/%Y %H:%M:%S", "%m/%d/%Y %H:%M"):
         try:
             return datetime.datetime.strptime(text, fmt).replace(tzinfo=ASTANA_TZ)
         except ValueError:
-            continue
+            pass
     return None
 
-
-def parse_ru_relative_datetime(text: str, base_now: datetime.datetime | None = None) -> datetime.datetime | None:
-    """Парсит бытовые русские даты для напоминаний.
-
-    Примеры:
-    - сегодня в 21:00
-    - сегодня в девять вечера
-    - завтра в 9 утра
-    - послезавтра в 18:30
-    - в понедельник в 10
-    """
-    if not text:
-        return None
-
+def parse_ru_relative_datetime(text, base_now=None):
     now = base_now or now_astana()
-    t = str(text).lower().replace("ё", "е")
-    target_date = now.date()
+    if not now.tzinfo:
+        now = now.replace(tzinfo=ASTANA_TZ)
+    t = str(text or "").lower().replace("ё", "е")
+    relative = re.search(r"через\s+(\d+|полчаса|час|минуту|день|[а-я]+)(?:\s+(мин\w*|час\w*|дн\w*|день))?", t)
+    if relative:
+        token, unit = relative.groups()
+        n = int(token) if token.isdigit() else _RU_NUMBERS.get(token)
+        if token == "полчаса":
+            n, unit = 30, "мин"
+        elif token in ("час", "минуту", "день"):
+            n, unit = 1, token
+        if n and unit:
+            seconds = 60 if unit.startswith("мин") else 3600 if unit.startswith("час") else 86400
+            return now + datetime.timedelta(seconds=n * seconds)
+        return None
 
-    if "послезавтра" in t:
-        target_date = now.date() + datetime.timedelta(days=2)
-    elif "завтра" in t:
-        target_date = now.date() + datetime.timedelta(days=1)
-    elif "сегодня" in t:
-        target_date = now.date()
+    target = now.date()
+    explicit = False
+    date_match = re.search(r"\b(\d{1,2})\.(\d{1,2})\.(\d{4})\b", t)
+    short_date = re.search(r"(?:\bна|\bдата)\s+(\d{1,2})\.(\d{1,2})(?![.\d])", t)
+    try:
+        if date_match:
+            d, m, y = map(int, date_match.groups())
+            target = datetime.date(y, m, d)
+            t = t[:date_match.start()] + t[date_match.end():]
+            explicit = True
+        elif short_date:
+            d, m = map(int, short_date.groups())
+            target = datetime.date(now.year, m, d)
+            t = t[:short_date.start()] + t[short_date.end():]
+            explicit = True
+        elif "послезавтра" in t:
+            target += datetime.timedelta(days=2); explicit = True
+        elif "завтра" in t:
+            target += datetime.timedelta(days=1); explicit = True
+        elif "сегодня" in t:
+            explicit = True
+        else:
+            for word, weekday in _WEEKDAYS_RU.items():
+                if re.search(rf"\b{word}\b", t):
+                    target += datetime.timedelta(days=(weekday-now.weekday()) % 7)
+                    explicit = True
+                    break
+    except ValueError:
+        return None
+    # Reject unsupported date expressions rather than scheduling a guessed day.
+    if not explicit and re.search(r"\b\d{1,2}\s+(?:январ|феврал|март|апрел|ма[йя]|июн|июл|август|сентябр|октябр|ноябр|декабр)|следующ", t):
+        return None
+    matches = list(re.finditer(r"(?<![\d.])(\d{1,2})[:.](\d{2})(?![\d.])", t))
+    if len(matches) > 1:
+        return None
+    hour, minute = None, 0
+    if matches:
+        hour, minute = map(int, matches[0].groups())
     else:
-        for word, weekday in _WEEKDAYS_RU.items():
-            if re.search(rf"\b{re.escape(word)}\b", t):
-                days_ahead = (weekday - now.weekday()) % 7
-                if days_ahead == 0:
-                    days_ahead = 7
-                target_date = now.date() + datetime.timedelta(days=days_ahead)
-                break
-
-    hour = None
-    minute = 0
-
-    # "21:00", "в 9:30", "на 9"
-    m = re.search(r"(?:\bв\b|\bна\b)?\s*(\d{1,2})(?::(\d{2}))", t)
-    if not m:
-        m = re.search(r"(?:\bв\b|\bна\b)\s+(\d{1,2})(?!\d)", t)
-    if m:
-        hour = int(m.group(1))
-        minute = int(m.group(2) if m.lastindex and m.lastindex >= 2 and m.group(2) else 0)
-
-    # "в девять", "на девять"
-    if hour is None:
-        m = re.search(r"(?:\bв\b|\bна\b)\s+([а-я]+)", t)
-        if m:
-            hour = _RU_NUMBERS.get(m.group(1))
-            minute = 0
-
+        for m in re.finditer(r"\b(?:в|во|на)\s+(\d{1,2}|[а-я]+)\b", t):
+            token = m.group(1)
+            h = int(token) if token.isdigit() else _RU_NUMBERS.get(token)
+            if h is not None:
+                if hour is not None:
+                    return None
+                hour = h
     if hour is None:
         return None
-
-    if any(x in t for x in ["вечера", "вечером"]) and 1 <= hour <= 11:
+    if re.search(r"вечер|\bдня\b|\bднем\b", t) and 1 <= hour <= 11:
         hour += 12
-    if any(x in t for x in ["дня", "днем"]) and 1 <= hour <= 7:
-        hour += 12
-    if any(x in t for x in ["утра", "утром"]) and hour == 12:
+    if re.search(r"утр", t) and hour == 12:
         hour = 0
-
-    if not (0 <= hour <= 23 and 0 <= minute <= 59):
+    if not 0 <= hour <= 23 or not 0 <= minute <= 59:
         return None
-
-    result = datetime.datetime.combine(
-        target_date,
-        datetime.time(hour=hour, minute=minute),
-        tzinfo=ASTANA_TZ,
-    )
-
-    has_explicit_day = (
-        any(x in t for x in ["сегодня", "завтра", "послезавтра"])
-        or any(re.search(rf"\b{re.escape(w)}\b", t) for w in _WEEKDAYS_RU)
-    )
-    if not has_explicit_day and result <= now:
-        result += datetime.timedelta(days=1)
-
+    result = datetime.datetime.combine(target, datetime.time(hour, minute), ASTANA_TZ)
+    if result <= now:
+        if explicit:
+            # A named weekday today means the next occurrence.
+            if any(re.search(rf"\b{w}\b", t) for w in _WEEKDAYS_RU):
+                result += datetime.timedelta(days=7)
+            else:
+                return None
+        else:
+            result += datetime.timedelta(days=1)
     return result
+
+
+MONTH_NAMES_RU = ("январь", "февраль", "март", "апрель", "май", "июнь",
+                  "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь")
+def month_label(value):
+    return f"{MONTH_NAMES_RU[value.month-1]} {value.year}"

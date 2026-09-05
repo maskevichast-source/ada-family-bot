@@ -22,6 +22,7 @@ async def transcribe_voice(file_bytes: bytes, filename: str = "voice.oga") -> st
     """
     if not file_bytes:
         return ""
+    client = None
     try:
         client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=2)
         transcript = await client.audio.transcriptions.create(
@@ -34,3 +35,6 @@ async def transcribe_voice(file_bytes: bytes, filename: str = "voice.oga") -> st
         print(f"[Голос] Не удалось распознать: {error}")
         return ""
 
+    finally:
+        if client is not None:
+            await client.close()

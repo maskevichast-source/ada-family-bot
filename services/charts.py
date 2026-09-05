@@ -1,3 +1,4 @@
+from services.timezone import month_label
 """Комплексная визуализация финансов — графики для Power BI и Telegram."""
 
 import io
@@ -10,17 +11,11 @@ import matplotlib.pyplot as plt
 
 from services.sheets import get_transactions_for_period, get_category_limits
 from services.categories import TYPE_EXPENSE, TYPE_INCOME
+from services.timezone import now_astana, parse_flexible_datetime
 
 
-def _parse_date(date_str: str) -> datetime:
-    try:
-        return datetime.strptime(str(date_str), "%Y-%m-%d %H:%M:%S")
-    except (ValueError, TypeError):
-        try:
-            return datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
-        except (ValueError, TypeError):
-            return datetime.now()
-
+def _parse_date(date_str):
+    return parse_flexible_datetime(date_str)
 
 def _group_by_day(transactions: list) -> dict:
     daily = defaultdict(float)
@@ -30,6 +25,8 @@ def _group_by_day(transactions: list) -> dict:
         try:
             amt = float(str(t.get("amt", 0)).replace(",", "."))
             d = _parse_date(t.get("date"))
+            if d is None:
+                continue
             daily[d.strftime("%Y-%m-%d")] += amt
         except (ValueError, TypeError):
             pass
@@ -103,7 +100,7 @@ def _get_month_range(year: int, month: int) -> tuple[str, str]:
 
 
 def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
-    now = datetime.now()
+    now = now_astana()
     year = year or now.year
     month = month or now.month
 
@@ -142,30 +139,31 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
 
     fig = plt.figure(figsize=(16, 12), facecolor=COLORS['bg'])
     fig.suptitle(
-        f'📊 Семейный бюджет — {datetime(year, month, 1).strftime("%B %Y").capitalize()}',
+        f'Семейный бюджет — {month_label(datetime(year, month, 1)).capitalize()}',
         fontsize=18, fontweight='bold', color=COLORS['text'], y=0.98
     )
 
-    # 1. Круговая диаграмма по категориям (Защита от нулевой суммы)
+    # 1. Category panel: horizontal bars avoid colliding labels on tiny pie slices.
     ax1 = fig.add_subplot(2, 3, 1)
-    ax1.set_facecolor(COLORS['bg'])
+    ax1.set_facecolor(COLORS["bg"])
     top_cats = list(by_cat.items())[:8]
-    other = sum(v for _, v in list(by_cat.items())[8:])
+    other = sum(v for _,v in list(by_cat.items())[8:])
     if other > 0:
         top_cats.append(("Прочее", other))
-
-    labels1 = [cat[:20] for cat, _ in top_cats]
-    values1 = [v for _, v in top_cats]
-    colors1 = COLORS['primary'][:len(labels1)]
-
-    if sum(values1) > 0:
-        ax1.pie(
-            values1, labels=labels1, autopct=lambda pct: f'{pct:.1f}%' if pct > 3 else '',
-            colors=colors1, startangle=90, textprops={'color': COLORS['text'], 'fontsize': 8}
-        )
-    else:
-        ax1.text(0.5, 0.5, "Трат пока нет", color=COLORS['text'], ha='center', va='center')
-    ax1.set_title('Расходы по категориям', color=COLORS['text'], fontsize=12, pad=10)
+    labels1 = [cat[:24] for cat,_ in top_cats]
+    values1 = [v for _,v in top_cats]
+    if values1:
+        bars = ax1.barh(labels1, values1, color=COLORS["primary"][:len(values1)], height=.6)
+        ax1.invert_yaxis()
+        maximum = max(values1)
+        ax1.set_xlim(0, maximum*1.3)
+        for bar,value in zip(bars,values1):
+            ax1.text(bar.get_width()+maximum*.025,bar.get_y()+bar.get_height()/2,
+                     f"{value:,.0f}".replace(","," "),va="center",fontsize=7,color=COLORS["text"])
+    ax1.tick_params(colors=COLORS["text"],labelsize=7)
+    ax1.grid(axis="x",alpha=.15)
+    ax1.set_xlabel("Сумма, тг",color=COLORS["text"],fontsize=9)
+    ax1.set_title("Расходы по категориям",color=COLORS["text"],fontsize=12,pad=10)
 
     # 2. Столбчатая диаграмма по дням
     ax2 = fig.add_subplot(2, 3, 2)
@@ -221,7 +219,7 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
     for cat, spent in by_cat.items():
         limit = limits.get(cat, 0)
         if limit > 0:
-            pct = min(spent / limit * 100, 150)
+            pct = spent / limit * 100
             limit_data.append((cat[:18], spent, limit, pct))
 
     limit_data = sorted(limit_data, key=lambda x: -x[3])[:10]
@@ -233,9 +231,10 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
             for p in pcts
         ]
 
-        bars4 = ax4.barh(cats_l, pcts, color=bar_colors, alpha=0.85, height=0.6)
+        bars4 = ax4.barh(cats_l, [min(p,150) for p in pcts], color=bar_colors, alpha=0.85, height=0.6)
         ax4.axvline(x=100, color=COLORS['limit'], linestyle='--', linewidth=2, label='Лимит 100%')
-        ax4.set_xlabel('% от лимита', color=COLORS['text'], fontsize=9)
+        ax4.set_xlim(0,195)
+        ax4.set_xlabel('% лимита (столбцы до 150%, подписи — факт)', color=COLORS['text'], fontsize=9)
         ax4.set_title('Выполнение лимитов', color=COLORS['text'], fontsize=12, pad=10)
         ax4.tick_params(colors=COLORS['text'], labelsize=7)
         ax4.grid(axis='x', alpha=0.2, color=COLORS['grid'])
@@ -305,7 +304,7 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
 
 
 def generate_trend_chart(months_back: int = 3) -> bytes | None:
-    now = datetime.now()
+    now = now_astana()
     monthly_data = defaultdict(float)
 
     for i in range(months_back, -1, -1):
@@ -351,3 +350,7 @@ def generate_trend_chart(months_back: int = 3) -> bytes | None:
     buf.seek(0)
     plt.close(fig)
     return buf.getvalue()
+
+from services.plot_lock import serialized_plot
+generate_expense_chart = serialized_plot(generate_expense_chart)
+generate_trend_chart = serialized_plot(generate_trend_chart)
