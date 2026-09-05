@@ -6,6 +6,10 @@ import datetime
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
 from aiogram.types import BufferedInputFile
+try:
+    from aiogram.client.default import DefaultBotProperties
+except Exception:
+    DefaultBotProperties = None
 
 from config import TELEGRAM_BOT_TOKEN, FAMILY_CHAT_ID, VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID
 from handlers.text_handler import (
@@ -15,20 +19,26 @@ from handlers.media_handler import handle_media
 from services.sheets import (
     get_pending_reminders, mark_reminder_done, append_transaction,
     ensure_power_bi_dimension_table, process_due_subscriptions,
-    normalize_existing_family_table_values,
+    normalize_existing_family_table_values, get_subscription_warnings,
+    mark_subscription_warning_sent, get_transactions_for_period,
+    save_category_limits,
 )
-from services.categories import FALLBACK_EXPENSE_CATEGORY
+from services.categories import FALLBACK_EXPENSE_CATEGORY, TYPE_INCOME
 from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
 from services.pending_clarifications import sweep_expired_clarifications
 from services.timezone import ASTANA_TZ, parse_flexible_datetime
 from services.weather import get_weather_forecast, get_tomorrow_forecast
-from services.charts import generate_expense_chart
+from services.charts import generate_expense_chart, generate_trend_chart
 from services.reports import generate_pdf_report, generate_excel_export
 from services.analytics import analyze_budget_leaks
+from services.limits_ai import generate_limits_from_history
 from services.timezone import now_astana
 
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
+if DefaultBotProperties:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
+else:
+    bot = Bot(token=TELEGRAM_BOT_TOKEN, parse_mode="Markdown")
 dp = Dispatcher()
 
 
@@ -99,6 +109,8 @@ async def cmd_help(message: types.Message):
         "📋 Команды:\n"
         "/start — начать работу\n"
         "/chart — график расходов за месяц\n"
+        "/trend — динамика расходов по месяцам\n"
+        "/chatid — показать ID текущего чата\n"
         "/leaks — анализ утечек бюджета (микротраты)\n"
         "/report — скачать PDF-буклет за месяц\n"
         "/export — скачать выписку в Excel (.xlsx)\n"
@@ -115,6 +127,16 @@ async def cmd_help(message: types.Message):
     )
 
 
+@dp.message(Command("chatid"))
+async def cmd_chatid(message: types.Message):
+    await safe_answer(
+        message,
+        f"chat_id: `{message.chat.id}`\n"
+        f"user_id: `{message.from_user.id if message.from_user else ''}`\n"
+        "Скопируй chat_id в FAMILY_CHAT_ID."
+    )
+
+
 @dp.message(Command("chart"))
 async def cmd_chart(message: types.Message):
     try:
@@ -127,6 +149,20 @@ async def cmd_chart(message: types.Message):
     except Exception as error:
         print(f"[График] Ошибка: {error}")
         await safe_answer(message, "Не удалось построить график.")
+
+
+@dp.message(Command("trend"))
+async def cmd_trend(message: types.Message):
+    try:
+        image_bytes = await asyncio.to_thread(generate_trend_chart)
+        if image_bytes:
+            photo = BufferedInputFile(image_bytes, filename="trend.png")
+            await message.answer_photo(photo=photo, caption="📈 Динамика расходов по месяцам.")
+        else:
+            await safe_answer(message, "Нет данных для графика динамики.")
+    except Exception as error:
+        print(f"[Trend] Ошибка: {error}")
+        await safe_answer(message, "Не удалось построить график динамики.")
 
 
 @dp.message(Command("leaks"))
@@ -221,6 +257,17 @@ async def check_subscriptions():
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             if now.minute == 5:
+                warnings = await asyncio.to_thread(get_subscription_warnings, now, 2)
+                for item in warnings:
+                    await safe_send_message(
+                        bot, chat_id=FAMILY_CHAT_ID,
+                        text=(
+                            f"⚠️ Через 2 дня списание подписки: **{item.get('name')}** — "
+                            f"{_format_currency(item.get('amount'))} тг ({item.get('bank')})."
+                        )
+                    )
+                    await asyncio.to_thread(mark_subscription_warning_sent, item.get("row_idx"), now.strftime("%Y-%m-%d"))
+
                 due = await asyncio.to_thread(process_due_subscriptions, now)
                 if due:
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=f"💳 Автосписание подписок: {', '.join(due)}.")
@@ -303,6 +350,94 @@ async def sweep_clarifications():
             print(f"[Clarifications] Ошибка: {e}")
         await asyncio.sleep(60)
 
+def _month_range(year: int, month: int) -> tuple[str, str]:
+    start = datetime.date(year, month, 1).strftime("%Y-%m-%d")
+    if month == 12:
+        end = datetime.date(year + 1, 1, 1).strftime("%Y-%m-%d")
+    else:
+        end = datetime.date(year, month + 1, 1).strftime("%Y-%m-%d")
+    return start, end
+
+
+def _period_summary_text(title: str, start: str, end: str) -> str:
+    txs = get_transactions_for_period(start, end)
+    income = 0.0
+    expense = 0.0
+    by_cat = {}
+    for t in txs:
+        amt = float(t.get("amt") or 0)
+        if str(t.get("type")) == TYPE_INCOME:
+            income += amt
+        else:
+            expense += amt
+            cat = str(t.get("cat") or "Прочее")
+            by_cat[cat] = by_cat.get(cat, 0.0) + amt
+
+    lines = [f"📊 **{title}**"]
+    lines.append(f"💰 Доходы: {_format_currency(income)} тг")
+    lines.append(f"💸 Расходы: {_format_currency(expense)} тг")
+    lines.append(f"📈 Баланс: {_format_currency(income - expense)} тг")
+    if by_cat:
+        top = sorted(by_cat.items(), key=lambda x: -x[1])[:5]
+        lines.append("\nТоп категорий:")
+        for cat, amount in top:
+            lines.append(f"- {cat}: {_format_currency(amount)} тг")
+    return "\n".join(lines)
+
+
+async def finance_report_scheduler():
+    """Еженедельный и месячный автоотчёт в семейный чат."""
+    sent_weekly = None
+    sent_monthly = None
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            today = now.date().isoformat()
+
+            # Еженедельный дайджест — по понедельникам в 09:10 за последние 7 дней.
+            if now.weekday() == 0 and now.hour == 9 and now.minute >= 10 and sent_weekly != today:
+                start_dt = (now.date() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                end_dt = (now.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                text = await asyncio.to_thread(_period_summary_text, "Еженедельный финансовый дайджест", start_dt, end_dt)
+                await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
+                sent_weekly = today
+
+            # Месячный дайджест — 1-го числа в 09:15 за прошлый месяц.
+            if now.day == 1 and now.hour == 9 and now.minute >= 15 and sent_monthly != today:
+                prev_month_last_day = now.date().replace(day=1) - datetime.timedelta(days=1)
+                start_dt, end_dt = _month_range(prev_month_last_day.year, prev_month_last_day.month)
+                text = await asyncio.to_thread(
+                    _period_summary_text,
+                    f"Месячный отчёт за {prev_month_last_day.strftime('%m.%Y')}",
+                    start_dt,
+                    end_dt,
+                )
+                await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
+                sent_monthly = today
+        except Exception as e:
+            print(f"[Автоотчёты] Ошибка: {e}")
+        await asyncio.sleep(60)
+
+
+async def monthly_limits_scheduler():
+    """Автоподтверждение/перегенерация лимитов 1-го числа."""
+    sent_for = None
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            month_key = now.strftime("%Y-%m")
+            if now.day == 1 and now.hour == 9 and now.minute >= 20 and sent_for != month_key:
+                new_limits = await generate_limits_from_history()
+                if new_limits:
+                    await safe_send_message(
+                        bot, chat_id=FAMILY_CHAT_ID,
+                        text=f"✅ Лимиты на {month_key} автоматически обновлены и подтверждены."
+                    )
+                sent_for = month_key
+        except Exception as e:
+            print(f"[Автолимиты] Ошибка: {e}")
+        await asyncio.sleep(60)
+
 
 async def main():
     await asyncio.to_thread(ensure_power_bi_dimension_table)
@@ -312,6 +447,8 @@ async def main():
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
     asyncio.create_task(weather_scheduler())
+    asyncio.create_task(finance_report_scheduler())
+    asyncio.create_task(monthly_limits_scheduler())
     asyncio.create_task(sweep_pending_receipts())
     asyncio.create_task(sweep_clarifications())
     await dp.start_polling(bot)
