@@ -2,9 +2,6 @@
 
 import asyncio
 import datetime
-import logging
-import os
-import contextlib
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
@@ -14,10 +11,7 @@ try:
 except Exception:
     DefaultBotProperties = None
 
-from config import TELEGRAM_BOT_TOKEN, FAMILY_CHAT_ID, VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID, validate_settings
-from services import reminders as reminder_service, state
-from services.pending_receipts import ack_pending
-from services.pending_clarifications import ack_clarification
+from config import TELEGRAM_BOT_TOKEN, FAMILY_CHAT_ID, VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID
 from handlers.text_handler import (
     handle_text, handle_voice, handle_category_clarification_callback
 )
@@ -41,8 +35,6 @@ from services.analytics import analyze_budget_leaks
 from services.limits_ai import generate_limits_from_history
 from services.timezone import now_astana
 
-validate_settings()
-
 if DefaultBotProperties:
     bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
 else:
@@ -65,11 +57,7 @@ class FamilyPrivacyMiddleware(BaseMiddleware):
         allowed_users = {str(x) for x in (VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID) if x}
         allowed_user = bool(user and str(user.id) in allowed_users)
 
-        if allowed_user and (allowed_chat or (chat and getattr(chat.type, "value", chat.type) == "private")):
-            if str(getattr(event, "text", "") or "").startswith("/"):
-                from services.memory import add_chat_message
-                from config import get_authorized_user_name
-                add_chat_message(chat.id, get_authorized_user_name(user.id), event.text)
+        if allowed_chat or allowed_user:
             return await handler(event, data)
 
         # Молча игнорируем callback, а в личке коротко объясняем.
@@ -81,35 +69,15 @@ class FamilyPrivacyMiddleware(BaseMiddleware):
         return None
 
 
-class SerialActionMiddleware(BaseMiddleware):
-    """One mutation at a time; offline state and Sheets writes share a single worker."""
-    def __init__(self):
-        self.lock = asyncio.Lock()
-
-    async def __call__(self, handler, event, data):
-        async with self.lock:
-            try:
-                return await handler(event, data)
-            except Exception:
-                logging.exception("Update failed")
-                message = getattr(event, "message", None) or event
-                if getattr(message, "chat", None):
-                    with contextlib.suppress(Exception):
-                        await safe_answer(message, "Не удалось завершить действие. Проверь список записей перед повтором. "
-                                          "Проверяй подтверждение записи; ожидающие чеки можно уточнить повторно.")
-                return None
-
-serial_actions = SerialActionMiddleware()
-dp.message.outer_middleware(FamilyPrivacyMiddleware())
-dp.callback_query.outer_middleware(FamilyPrivacyMiddleware())
-dp.message.outer_middleware(serial_actions)
-dp.callback_query.outer_middleware(serial_actions)
+dp.message.middleware(FamilyPrivacyMiddleware())
+dp.callback_query.middleware(FamilyPrivacyMiddleware())
 
 
 def _format_currency(value):
-    from services.money import parse_amount
-    amount = parse_amount(value)
-    return f"{amount:,.{0 if amount.is_integer() else 2}f}".replace(",", " ")
+    try:
+        return f"{float(value):,.0f}".replace(",", " ")
+    except (ValueError, TypeError):
+        return str(value)
 
 
 @dp.message(Command("start"))
@@ -122,8 +90,7 @@ async def cmd_start(message: types.Message):
         "• Анализ «утечек бюджета» (/leaks)\n"
         "• Экспорт отчётов в PDF (/report) и Excel (/export)\n"
         "• Лимиты бюджета по категориям\n"
-        "• Долги и частичные возвраты (/debts, /debts_help)\n"
-        "• Напоминания в группе: Владу, Диане или обоим\n"
+        "• Напоминания (разовые, ежедневные, ежемесячные)\n"
         "• Список покупок\n"
         "• Рассрочки и Kaspi Red\n"
         "• Подписки и регулярные платежи\n"
@@ -144,9 +111,6 @@ async def cmd_help(message: types.Message):
         "/chart — график расходов за месяц\n"
         "/trend — динамика расходов по месяцам\n"
         "/chatid — показать ID текущего чата\n"
-        "/reminders — список активных напоминаний\n"
-        "/debts — остатки долгов семьи\n"
-        "/debts_help — как записывать долги и возвраты\n"
         "/leaks — анализ утечек бюджета (микротраты)\n"
         "/report — скачать PDF-буклет за месяц\n"
         "/export — скачать выписку в Excel (.xlsx)\n"
@@ -203,7 +167,7 @@ async def cmd_trend(message: types.Message):
 
 @dp.message(Command("leaks"))
 async def cmd_leaks(message: types.Message):
-    leak_data = await asyncio.to_thread(analyze_budget_leaks)
+    leak_data = analyze_budget_leaks()
     await safe_answer(message, leak_data["text"])
 
 
@@ -234,7 +198,7 @@ async def cmd_export(message: types.Message):
 @dp.message(Command("debug"))
 async def cmd_debug(message: types.Message):
     from services.sheets import debug_transactions_snapshot
-    debug_text = await asyncio.to_thread(debug_transactions_snapshot)
+    debug_text = debug_transactions_snapshot()
     await safe_answer(message, f"```\n{debug_text}\n```")
 
 
@@ -262,9 +226,29 @@ async def handle_all_messages(message: types.Message):
 async def check_reminders():
     while True:
         try:
-            await reminder_service.deliver_due(bot)
-        except Exception:
-            logging.exception("Reminder loop failed")
+            now = datetime.datetime.now(ASTANA_TZ)
+            reminders = await asyncio.to_thread(get_pending_reminders)
+            for rem in reminders:
+                try:
+                    rem_time = parse_flexible_datetime(rem.get("remind_at"))
+                    if rem_time and now >= rem_time:
+                        target_user = str(rem.get("target_user", "")) or "Семья"
+                        text = str(rem.get("text", ""))
+                        recurrence = str(rem.get("recurrence", "once"))
+                        remind_at = str(rem.get("remind_at", ""))
+                        row_idx = rem.get("row_idx", 0)
+                        try:
+                            await safe_send_message(
+                                bot, chat_id=FAMILY_CHAT_ID,
+                                text=f"⏰ Напоминание для {target_user}: {text}"
+                            )
+                        except Exception as send_err:
+                            print(f"[Напоминания] Не удалось отправить: {send_err}")
+                        await asyncio.to_thread(mark_reminder_done, row_idx, recurrence, remind_at)
+                except Exception as e:
+                    print(f"[Напоминания] Ошибка обработки: {e}")
+        except Exception as e:
+            print(f"[Напоминания] Ошибка цикла: {e}")
         await asyncio.sleep(60)
 
 
@@ -272,8 +256,7 @@ async def check_subscriptions():
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
-            hour_key = now.strftime("%Y-%m-%dT%H")
-            if now.minute >= 5 and not state.get("scheduler", "subscriptions:" + hour_key):
+            if now.minute == 5:
                 warnings = await asyncio.to_thread(get_subscription_warnings, now, 2)
                 for item in warnings:
                     await safe_send_message(
@@ -286,7 +269,6 @@ async def check_subscriptions():
                     await asyncio.to_thread(mark_subscription_warning_sent, item.get("row_idx"), now.strftime("%Y-%m-%d"))
 
                 due = await asyncio.to_thread(process_due_subscriptions, now)
-                state.put("scheduler", "subscriptions:" + hour_key, True)
                 if due:
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=f"💳 Автосписание подписок: {', '.join(due)}.")
         except Exception as e:
@@ -305,19 +287,19 @@ async def weather_scheduler():
 
             # 08:30 — утренний прогноз
             if (now.hour == 8 and now.minute >= 30) or (now.hour == 9 and now.minute == 0):
-                if not state.get("scheduler", "weather_morning:" + today_str):
+                if sent_morning_today != today_str:
                     forecast = await get_weather_forecast(target="today")
                     if forecast:
                         await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
-                        state.put("scheduler", "weather_morning:" + today_str, True)
+                        sent_morning_today = today_str
 
             # 22:30 — вечерний прогноз на завтра
             if (now.hour == 22 and now.minute >= 30) or (now.hour == 23 and now.minute == 0):
-                if not state.get("scheduler", "weather_evening:" + today_str):
+                if sent_evening_today != today_str:
                     forecast = await get_tomorrow_forecast()
                     if forecast:
                         await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
-                        state.put("scheduler", "weather_evening:" + today_str, True)
+                        sent_evening_today = today_str
 
         except Exception as e:
             print(f"[Погода-Шедулер] Ошибка: {e}")
@@ -328,33 +310,44 @@ async def weather_scheduler():
 async def sweep_pending_receipts():
     while True:
         try:
-            async with serial_actions.lock:
-                for key, transactions, user_name in sweep_expired():
-                    for tx in transactions:
-                        tx["user"] = user_name
-                        tx["user_comment"] = tx.get("user_comment") or "(без комментария — авто-сохранение)"
-                        await asyncio.to_thread(append_transaction, tx)
-                    ack_pending(key)
-                    await safe_send_message(bot, state.chat_from_key(key),
-                                            f"⏰ Сохранила {len(transactions)} позиций чека без дополнительного комментария.")
-        except Exception:
-            logging.exception("Receipt sweep failed; unsaved drafts retained")
+            expired = sweep_expired()
+            for chat_id, transactions, user_name in expired:
+                for tx in transactions:
+                    tx["user"] = user_name
+                    tx["user_comment"] = tx.get("user_comment", "") or "(без комментария — авто-сохранение)"
+                    await asyncio.to_thread(append_transaction, tx)
+                try:
+                    await safe_send_message(
+                        bot, chat_id=chat_id,
+                        text=f"⏰ Автоматически сохранила {len(transactions)} чек(ов) без комментария."
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[Pending] Ошибка: {e}")
         await asyncio.sleep(60)
 
 
 async def sweep_clarifications():
     while True:
         try:
-            async with serial_actions.lock:
-                for key, tx in sweep_expired_clarifications():
-                    if not tx.get("category"):
-                        tx["category"] = FALLBACK_EXPENSE_CATEGORY
-                    await asyncio.to_thread(append_transaction, tx)
-                    ack_clarification(key)
-                    await safe_send_message(bot, state.chat_from_key(key),
-                        f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category')}")
-        except Exception:
-            logging.exception("Clarification sweep failed; unsaved drafts retained")
+            expired = sweep_expired_clarifications()
+            for chat_id, tx in expired:
+                if not tx.get("category"):
+                    tx["category"] = FALLBACK_EXPENSE_CATEGORY
+                comm = tx.get("user_comment", "")
+                tx["user_comment"] = f"{comm} (автосохранение: {tx['category']})".strip()
+
+                await asyncio.to_thread(append_transaction, tx)
+                try:
+                    await safe_send_message(
+                        bot, chat_id=chat_id,
+                        text=f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category')} (не дождалась ответа)"
+                    )
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"[Clarifications] Ошибка: {e}")
         await asyncio.sleep(60)
 
 def _month_range(year: int, month: int) -> tuple[str, str]:
@@ -402,15 +395,15 @@ async def finance_report_scheduler():
             today = now.date().isoformat()
 
             # Еженедельный дайджест — по понедельникам в 09:10 за последние 7 дней.
-            if now.weekday() == 0 and now.hour == 9 and now.minute >= 10 and not state.get("scheduler", "weekly:" + today):
+            if now.weekday() == 0 and now.hour == 9 and now.minute >= 10 and sent_weekly != today:
                 start_dt = (now.date() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-                end_dt = now.date().strftime("%Y-%m-%d")
+                end_dt = (now.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
                 text = await asyncio.to_thread(_period_summary_text, "Еженедельный финансовый дайджест", start_dt, end_dt)
                 await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
-                state.put("scheduler", "weekly:" + today, True)
+                sent_weekly = today
 
             # Месячный дайджест — 1-го числа в 09:15 за прошлый месяц.
-            if now.day == 1 and now.hour == 9 and now.minute >= 15 and not state.get("scheduler", "monthly:" + today):
+            if now.day == 1 and now.hour == 9 and now.minute >= 15 and sent_monthly != today:
                 prev_month_last_day = now.date().replace(day=1) - datetime.timedelta(days=1)
                 start_dt, end_dt = _month_range(prev_month_last_day.year, prev_month_last_day.month)
                 text = await asyncio.to_thread(
@@ -420,7 +413,7 @@ async def finance_report_scheduler():
                     end_dt,
                 )
                 await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
-                state.put("scheduler", "monthly:" + today, True)
+                sent_monthly = today
         except Exception as e:
             print(f"[Автоотчёты] Ошибка: {e}")
         await asyncio.sleep(60)
@@ -433,51 +426,33 @@ async def monthly_limits_scheduler():
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             month_key = now.strftime("%Y-%m")
-            if (os.getenv("AUTO_GENERATE_LIMITS", "true").lower() == "true"
-                    and now.day == 1 and now.hour == 9 and now.minute >= 20
-                    and not state.get("scheduler", "limits:" + month_key)):
+            if now.day == 1 and now.hour == 9 and now.minute >= 20 and sent_for != month_key:
                 new_limits = await generate_limits_from_history()
                 if new_limits:
                     await safe_send_message(
                         bot, chat_id=FAMILY_CHAT_ID,
                         text=f"✅ Лимиты на {month_key} автоматически обновлены и подтверждены."
                     )
-                if new_limits:
-                    state.put("scheduler", "limits:" + month_key, True)
+                sent_for = month_key
         except Exception as e:
             print(f"[Автолимиты] Ошибка: {e}")
         await asyncio.sleep(60)
 
 
 async def main():
-    from services.preflight import check_schema, initialize_optional
-    logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"),
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # Read-only check first. Missing optional worksheets are then created idempotently.
-    await asyncio.to_thread(check_schema)
-    await asyncio.to_thread(initialize_optional)
-    from services.debts import worksheet as debt_worksheet
-    await asyncio.to_thread(reminder_service.worksheet)
-    await asyncio.to_thread(debt_worksheet)
-    # Original startup features retained, now additive/idempotent rather than destructive.
     await asyncio.to_thread(ensure_power_bi_dimension_table)
-    stats = await asyncio.to_thread(normalize_existing_family_table_values)
-    logging.info("Startup normalization: %s", stats)
-    tasks = [asyncio.create_task(fn(), name=fn.__name__) for fn in (
-        check_reminders, check_subscriptions, weather_scheduler, finance_report_scheduler,
-        monthly_limits_scheduler, sweep_pending_receipts, sweep_clarifications)]
-    try:
-        await bot.delete_webhook(drop_pending_updates=False)
-        logging.info("Ada ready: polling, group reminders, 7 background workers")
-        await dp.start_polling(bot)
-    finally:
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
-        await bot.session.close()
+    # Исправляет уже накопленные D/expense в таблице без изменения схемы.
+    await asyncio.to_thread(normalize_existing_family_table_values)
+
+    asyncio.create_task(check_reminders())
+    asyncio.create_task(check_subscriptions())
+    asyncio.create_task(weather_scheduler())
+    asyncio.create_task(finance_report_scheduler())
+    asyncio.create_task(monthly_limits_scheduler())
+    asyncio.create_task(sweep_pending_receipts())
+    asyncio.create_task(sweep_clarifications())
+    await dp.start_polling(bot)
 
 
 if __name__ == "__main__":
-    from services.runtime import worker_lock
-    with worker_lock():
-        asyncio.run(main())
+    asyncio.run(main())

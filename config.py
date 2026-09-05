@@ -15,10 +15,9 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
-FAMILY_CHAT_ID = _env_int("FAMILY_CHAT_ID", 0)
-CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
-STATE_DIR = os.getenv("ADA_STATE_DIR") or os.getenv("RAILWAY_VOLUME_MOUNT_PATH") or "./data"
-CHAT_HISTORY_FILE = os.getenv("CHAT_HISTORY_FILE", os.path.join(STATE_DIR, "chat_history.json"))
+FAMILY_CHAT_ID = _env_int("FAMILY_CHAT_ID", -5349521972)
+CREDENTIALS_FILE = "credentials.json"
+CHAT_HISTORY_FILE = os.getenv("CHAT_HISTORY_FILE", "chat_history.json")
 
 # Приватный семейный бот: в таблицу должны попадать нормальные семейные имена,
 # а не короткие Telegram first_name вроде "D".
@@ -73,7 +72,7 @@ def normalize_family_user_name(raw_name: str | None) -> str | None:
 
 
 def get_authorized_user_name(user_id, fallback_name: str | None = None):
-    """Возвращает имя члена семьи только по доверенному Telegram ID.
+    """Возвращает имя члена семьи по Telegram ID или по безопасному алиасу.
 
     Старый интерфейс get_authorized_user_name(user_id) сохранён: второй аргумент
     необязательный, поэтому существующие вызовы не ломаются.
@@ -85,23 +84,8 @@ def get_authorized_user_name(user_id, fallback_name: str | None = None):
     if DIANA_TELEGRAM_ID and uid == str(DIANA_TELEGRAM_ID):
         return "Диана"
 
+    by_fallback = normalize_family_user_name(fallback_name)
+    if by_fallback:
+        return by_fallback
+
     return None
-
-
-def validate_settings():
-    required = {
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "GOOGLE_SHEETS_KEY": GOOGLE_SHEETS_KEY,
-        "DEEPSEEK_API_KEY": DEEPSEEK_API_KEY,
-        "OPENAI_API_KEY": OPENAI_API_KEY,
-        "VLAD_TELEGRAM_ID": VLAD_TELEGRAM_ID,
-        "DIANA_TELEGRAM_ID": DIANA_TELEGRAM_ID,
-        "FAMILY_CHAT_ID": FAMILY_CHAT_ID,
-    }
-    missing = [key for key, value in required.items() if not value]
-    if missing:
-        raise RuntimeError("Не заданы настройки: " + ", ".join(missing))
-    if not all(str(x).isdigit() and int(x) > 0 for x in (VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID)):
-        raise RuntimeError("Telegram ID участников должны быть положительными числами")
-    if str(VLAD_TELEGRAM_ID) == str(DIANA_TELEGRAM_ID):
-        raise RuntimeError("Telegram ID участников должны различаться")

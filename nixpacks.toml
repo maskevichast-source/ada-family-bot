@@ -1,5 +1,2 @@
-[variables]
-NIXPACKS_PYTHON_VERSION = "3.11"
-
-[start]
-cmd = "python run.py"
+[phases.setup]
+aptPkgs = ["poppler-utils"]
