@@ -24,7 +24,7 @@ from services.sheets import (
     get_pending_reminders, add_reminder,
     add_shopping_items, get_shopping_items, mark_shopping_items_done,
     add_trip_plan, get_planned_trips,
-    get_active_subscriptions, deactivate_subscription,
+    get_active_subscriptions, deactivate_subscription, add_or_update_subscription,
     add_installment, get_installments, close_installment,
     split_last_transaction_by_amount, find_and_update_record, delete_record_by_keyword,
     get_transactions_for_period, find_recent_duplicate_transaction,
@@ -44,6 +44,7 @@ from services.voice import transcribe_voice
 from services.timezone import now_astana, parse_ru_relative_datetime
 from services.analytics import analyze_budget_leaks
 from services.reports import generate_pdf_report, generate_excel_export
+from services.price_tracker import fetch_product_info, detect_marketplace
 
 
 def _to_number_or_blank(value):
@@ -60,6 +61,15 @@ def _format_currency(value):
         return f"{float(value):,.0f}".replace(",", " ")
     except (ValueError, TypeError):
         return str(value)
+
+
+def _extract_marketplace_url(text: str) -> str | None:
+    urls = re.findall(r"https?://\S+", text or "")
+    for url in urls:
+        clean = url.rstrip(".,);]\n")
+        if detect_marketplace(clean):
+            return clean
+    return None
 
 
 def _format_confirmation_report(tx: dict, ai_comment: str = "") -> str:
@@ -459,6 +469,30 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, "Формат: раздели транзакцию <сумма>: <категория> — <сумма> | <категория> — <сумма>")
         return
 
+    # ── ПРЯМОЙ ПЕРЕХВАТ 8: ЦЕНЫ ПО ССЫЛКЕ ──
+    product_url = _extract_marketplace_url(text)
+    if product_url:
+        try:
+            await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+        except Exception:
+            pass
+        info = await fetch_product_info(product_url)
+        if info:
+            stock = "в наличии" if info.get("in_stock") else "нет в наличии"
+            price = _format_currency(info.get("price", 0)) if info.get("price") else "цена не найдена"
+            res = (
+                f"🛒 **{info.get('marketplace')}**\n"
+                f"{info.get('title')}\n"
+                f"Цена: {price} тг\n"
+                f"Статус: {stock}\n"
+                f"{info.get('url')}"
+            )
+        else:
+            res = "Не смогла разобрать ссылку на товар."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
+        return
+
     try:
         await message.bot.send_chat_action(chat_id=chat_id, action="typing")
     except Exception:
@@ -624,7 +658,7 @@ async def _process_text_message(message: Message, text: str):
 
         cat = normalize_category(tx.get("category"), valid_categories, fallback_cat)
         tx["category"] = cat
-        _, valid_sub = validate_transaction_category_subcategory(cat, tx.get("subcategory"))
+        _, valid_sub = validate_transaction_category_subcategory(cat, tx.get("subcategory"), valid_categories, fallback_cat)
         tx["subcategory"] = valid_sub or normalize_subcategory(None, cat, "")
         tx["necessity"] = normalize_necessity(tx.get("necessity"), cat)
         tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
@@ -691,6 +725,25 @@ async def _process_text_message(message: Message, text: str):
         return
 
     # ПОДПИСКИ
+    if intent == "add_subscription":
+        sub = parsed.get("subscription") or {}
+        name = sub.get("name") or parsed.get("subscription_name", "")
+        amount = parse_amount(sub.get("amount", parsed.get("amount", 0)))
+        bank = sub.get("bank") or parsed.get("bank", "Не указан")
+        day = int(parse_amount(sub.get("day_of_month", parsed.get("day_of_month", now_astana().day))) or now_astana().day)
+        if name and amount > 0:
+            try:
+                saved = await asyncio.to_thread(add_or_update_subscription, name, amount, bank, max(1, min(day, 31)))
+                res = reply or f"Записала подписку {saved.get('name', name)}: {_format_currency(amount)} тг/мес, день списания — {max(1, min(day, 31))}."
+            except Exception as e:
+                print(f"[Подписки] Ошибка сохранения: {e}")
+                res = "Не смогла сохранить подписку в таблицу. Проверь Google Sheets."
+        else:
+            res = reply or "Не хватает названия или суммы подписки."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
+        return
+
     if intent == "cancel_subscription":
         name = parsed.get("subscription_name", "")
         if name:

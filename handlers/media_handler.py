@@ -82,7 +82,7 @@ async def handle_media(message: Message):
         cat = normalize_category(raw_cat, valid_categories, fallback_cat)
         tx["category"] = cat
         raw_sub = tx.get("subcategory")
-        _, valid_sub = validate_transaction_category_subcategory(cat, raw_sub)
+        _, valid_sub = validate_transaction_category_subcategory(cat, raw_sub, valid_categories, fallback_cat)
         tx["subcategory"] = valid_sub or normalize_subcategory(None, cat, "")
         tx["necessity"] = normalize_necessity(tx.get("necessity"), cat)
         tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
