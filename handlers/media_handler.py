@@ -1,58 +1,111 @@
-"""Photo, image-document, multi-page PDF and audio-document -> validated author-scoped flow."""
+"""Обработка фото, изображений файлом и PDF-чеков."""
+
 import asyncio
-import hashlib
 import logging
 from pathlib import Path
+
 from config import get_authorized_user_name
 from services.telegram_safe import safe_answer
 from services.vision import parse_receipt
-from services.document_reader import is_audio, MAX_FILE
-from services.receipt_flow import offer
+from services.sheets import append_transaction
 from services.memory import add_chat_message
+from services.categories import (
+    TYPE_EXPENSE, TYPE_INCOME,
+    EXPENSE_CATEGORIES, INCOME_CATEGORIES,
+    FALLBACK_EXPENSE_CATEGORY, FALLBACK_INCOME_CATEGORY,
+    normalize_category, normalize_subcategory,
+    validate_transaction_category_subcategory,
+)
+from services.banks import normalize_bank_source
+from services.sheets import normalize_necessity
+from services.pending_receipts import set_pending
+
+
+def _format_currency(value):
+    try:
+        return f"{float(value):,.0f}".replace(",", " ")
+    except Exception:
+        return str(value)
+
 
 async def handle_media(message):
-    uid=getattr(message,"from_user",None)
-    owner=get_authorized_user_name(uid.id) if uid else None
-    if not owner:
-        await safe_answer(message,"Нет доступа к семейным данным.");return
-    caption=str(getattr(message,"caption",None) or "")
-    add_chat_message(message.chat.id,owner,"[Документ] "+caption)
-    photos=getattr(message,"photo",None)
-    doc=getattr(message,"document",None)
-    item=photos[-1] if photos else doc
+    uid = getattr(message, "from_user", None)
+    raw_uid = uid.id if uid else None
+    raw_fn = getattr(uid, "first_name", "") or ""
+    owner = get_authorized_user_name(raw_uid, raw_fn) or "Пользователь"
+    chat_id = message.chat.id
+    caption = str(getattr(message, "caption", None) or "").strip()
+
+    photos = getattr(message, "photo", None)
+    doc = getattr(message, "document", None)
+    item = photos[-1] if photos else doc
+
     if item is None:
-        await safe_answer(message,"Пришли фото, изображение файлом, PDF, голосовое или аудиофайл.");return
-    if (getattr(item,"file_size",0) or 0)>MAX_FILE:
-        await safe_answer(message,"Файл больше 20 МБ. Раздели его на части.");return
+        await safe_answer(message, "Пришли фото чека или PDF-документ.")
+        return
+
     try:
-        file=await message.bot.get_file(item.file_id)
-        downloaded=await message.bot.download_file(file.file_path)
-        data=downloaded.read()
-    except Exception:
-        logging.exception("HF_DOWNLOAD_FAILED")
-        await safe_answer(message,"Не удалось скачать файл из Telegram. Ничего не записала; попробуй повторить отправку.");return
-    name=Path(getattr(doc,"file_name","") or "receipt.jpg").name
-    if is_audio(data,name,getattr(doc,"mime_type","")):
+        await message.bot.send_chat_action(chat_id=chat_id, action="typing")
+        file = await message.bot.get_file(item.file_id)
+        downloaded = await message.bot.download_file(file.file_path)
+        data = downloaded.read()
+    except Exception as e:
+        logging.exception(f"[Media Download Error]: {e}")
+        await safe_answer(message, "Не удалось скачать файл из Telegram. Попробуй ещё раз.")
+        return
+
+    filename = Path(getattr(doc, "file_name", "") or "receipt.jpg").name
+
+    # Голосовые файлы отправленные документом
+    if filename.lower().endswith((".mp3", ".m4a", ".wav", ".ogg", ".oga")):
         from services.voice import transcribe_voice
         from handlers.text_handler import _process_text_message
-        text=await transcribe_voice(data,name)
-        if not text:
-            await safe_answer(message,"Не удалось распознать аудио целиком. Ничего не записала; пришли короткое голосовое или текст.");return
-        await safe_answer(message,"🎤 "+text,parse_mode=None)
-        await _process_text_message(message,text)
+        text = await transcribe_voice(data, filename)
+        if text:
+            await safe_answer(message, f"🎤 «{text}»")
+            await _process_text_message(message, text)
+        else:
+            await safe_answer(message, "Не удалось распознать аудио.")
         return
-    try:
-        result=await parse_receipt(data,name,caption,owner)
-        if result.get("debt"):
-            from services.debts import handle_model
-            await handle_model(message,{"intent":"debt","debt":result["debt"]},owner);return
-        rows=result.get("transactions") or []
-        if not rows:
-            await safe_answer(message,result.get("reply") or "Не вижу читаемых операций. Пришли чёткий документ или введи сумму текстом.",parse_mode=None)
-            return
-        await offer(message,rows,owner,caption,hashlib.sha256(data).hexdigest(),
-                    result.get("payment_status") in {"failed","pending"} or result.get("needs_review") is True)
-    except Exception:
-        logging.exception("HF_DOCUMENT_FAILED")
-        await safe_answer(message,"Не удалось подготовить документ. Не подтверждаю запись. "
-                          "В логах Railway — HF_DOCUMENT_FAILED; /receipts покажет сохранённые черновики.",parse_mode=None)
+
+    # Распознавание чека
+    result = await parse_receipt(data, filename, caption, owner)
+    transactions = result.get("transactions") or []
+
+    if not transactions:
+        await safe_answer(message, result.get("reply") or "Не нашла операций на чеке. Пришли чёткое фото.")
+        return
+
+    # Заполнение и валидация полей
+    validated = []
+    for tx in transactions:
+        tx_type = str(tx.get("type") or TYPE_EXPENSE).strip().upper()
+        valid_cats = INCOME_CATEGORIES if tx_type == TYPE_INCOME else EXPENSE_CATEGORIES
+        fallback = FALLBACK_INCOME_CATEGORY if tx_type == TYPE_INCOME else FALLBACK_EXPENSE_CATEGORY
+
+        cat = normalize_category(tx.get("category"), valid_cats, fallback)
+        tx["category"] = cat
+        _, sub = validate_transaction_category_subcategory(cat, tx.get("subcategory"))
+        tx["subcategory"] = sub or normalize_subcategory(None, cat, "")
+        tx["necessity"] = normalize_necessity(tx.get("necessity"), cat)
+        tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
+
+        tx["user"] = owner
+        tx["currency"] = "KZT"
+        if not tx.get("funds_type"): tx["funds_type"] = "Собственные"
+        if not tx.get("resource"): tx["resource"] = "Карта"
+        if not tx.get("user_comment"): tx["user_comment"] = caption or ""
+        validated.append(tx)
+
+    # Если была подпись — записываем сразу
+    if caption:
+        for tx in validated:
+            append_transaction(tx)
+        lines = [f"📸 **Записано по чеку ({len(validated)} поз.):**"]
+        for tx in validated:
+            lines.append(f"• {_format_currency(tx.get('amount'))} KZT | {tx.get('category')} ({tx.get('user_comment')})")
+        await safe_answer(message, "\n".join(lines))
+    else:
+        # Ждем комментарий
+        set_pending(chat_id, validated, owner)
+        await safe_answer(message, f"📸 Распознала {len(validated)} покупок в чеке на сумму {_format_currency(sum(t.get('amount', 0) for t in validated))} KZT. Напиши комментарий (или «без комментария»), и я сохраню.")
