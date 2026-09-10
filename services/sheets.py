@@ -7,7 +7,7 @@ import gspread
 from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
 from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE, normalize_family_user_name
-from services.categories import TYPE_EXPENSE, SUBCATEGORIES_MAP, DEFAULT_EXPENSE_LIMITS
+from services.categories import TYPE_EXPENSE, TYPE_INCOME, is_income_type, SUBCATEGORIES_MAP, DEFAULT_EXPENSE_LIMITS
 from services.money import parse_amount, to_clean_number
 from services.banks import normalize_bank_source
 from services.timezone import parse_flexible_datetime, ASTANA_TZ
@@ -39,11 +39,6 @@ def _get_all_records_safe(ws):
 
 
 def _get_or_create_worksheet(title: str, headers: list[str], rows: int = 50, cols: int | None = None):
-    """Получить лист или создать его с корректной шапкой.
-
-    Если лист уже есть, но пустой — шапка добавляется. Если первый заголовок
-    старого Reminders был "id", он приводится к "reminder_id" без потери строк.
-    """
     db = get_db()
     try:
         ws = db.worksheet(title)
@@ -115,13 +110,11 @@ def append_transaction(data: dict):
     else:
         data["user"] = normalize_family_user_name(data.get("user")) or str(data.get("user")).strip()
 
-    raw_type = str(data.get("type") or "").strip().lower()
-    if raw_type in {"income", "доход", "in"}:
-        data["type"] = "ДОХОД"
-    elif raw_type in {"expense", "расход", "out", ""}:
-        data["type"] = TYPE_EXPENSE
+    raw_type = data.get("type")
+    if is_income_type(raw_type):
+        data["type"] = TYPE_INCOME
     else:
-        data["type"] = str(data.get("type")).strip().upper()
+        data["type"] = TYPE_EXPENSE
 
     if not data.get("currency"):
         data["currency"] = "KZT"
@@ -209,7 +202,7 @@ def debug_transactions_snapshot(limit: int = 6) -> str:
             "Последние записи:",
         ]
         for r in non_empty[-limit:]:
-            lines.append(f"- {r.get('date')} | {r.get('user')} | {r.get('amount')} KZT | {r.get('category')} ({r.get('subcategory')})")
+            lines.append(f"- {r.get('date')} | {r.get('user')} | {r.get('amount')} KZT | {r.get('type')} | {r.get('category')} ({r.get('subcategory')})")
         return "\n".join(lines)
     except Exception as e:
         return f"Ошибка снятия диагностики: {e}"
@@ -222,7 +215,7 @@ def get_last_200_transactions():
         non_empty = [r for r in records if str(r.get("transaction_id", "")).strip()]
         return [{
             "date": r.get("date"), "user": r.get("user"),
-            "type": r.get("type") or TYPE_EXPENSE,
+            "type": TYPE_INCOME if is_income_type(r.get("type")) else TYPE_EXPENSE,
             "amt": parse_amount(r.get("amount")),
             "curr": r.get("currency"), "bank": r.get("bank"), "cat": r.get("category"),
             "subcat": r.get("subcategory"), "nec": r.get("necessity"), "comm": r.get("user_comment")
@@ -260,7 +253,7 @@ def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
                     "transaction_id": r.get("transaction_id", ""),
                     "date": r.get("date"),
                     "user": r.get("user"),
-                    "type": r.get("type") or TYPE_EXPENSE,
+                    "type": TYPE_INCOME if is_income_type(r.get("type")) else TYPE_EXPENSE,
                     "amt": parse_amount(r.get("amount", 0)),
                     "curr": r.get("currency", "KZT"),
                     "bank": r.get("bank", ""),
@@ -569,6 +562,7 @@ def get_installments():
 INSTALLMENT_COLUMNS = ["id", "date", "user", "bank", "kind", "description", "total_amount", "monthly_payment", "payments_count", "next_payment", "status"]
 INSTALLMENT_STATUS_COLUMN = INSTALLMENT_COLUMNS.index("status") + 1
 
+
 def _get_or_create_installments_sheet():
     db = get_db()
     try:
@@ -580,6 +574,7 @@ def _get_or_create_installments_sheet():
     if not ws.row_values(1):
         ws.append_row(INSTALLMENT_COLUMNS)
     return ws
+
 
 def add_installment(data: dict | None = None, **kwargs):
     payload = dict(data or {})
@@ -606,8 +601,10 @@ def add_installment(data: dict | None = None, **kwargs):
         print(f"[Рассрочки] Ошибка записи: {error}")
         return None
 
+
 def close_installment(search_query: str) -> bool:
     return find_and_update_record("Installments", search_query, INSTALLMENT_STATUS_COLUMN, "closed", search_from_recent=True)
+
 
 SUBSCRIPTION_HEADERS = ["id", "name", "amount", "bank", "day_of_month", "last_paid", "status", "last_warning"]
 
@@ -615,7 +612,6 @@ SUBSCRIPTION_HEADERS = ["id", "name", "amount", "bank", "day_of_month", "last_pa
 def _get_or_create_subscriptions_sheet():
     ws = _get_or_create_worksheet("Subscriptions", SUBSCRIPTION_HEADERS, rows=100, cols=len(SUBSCRIPTION_HEADERS))
     headers = ws.row_values(1)
-    # Миграция старой схемы из 7 колонок: добавляем last_warning в H.
     if len(headers) < len(SUBSCRIPTION_HEADERS):
         for col_idx, header in enumerate(SUBSCRIPTION_HEADERS, start=1):
             if col_idx > len(headers) or not headers[col_idx - 1]:
@@ -680,7 +676,6 @@ def mark_subscription_warning_sent(row_idx: int, warning_date: str):
 
 
 def get_subscription_warnings(now: datetime.datetime, days_before: int = 2) -> list[dict]:
-    """Вернуть подписки, о которых пора предупредить за N дней до списания."""
     try:
         ws = _get_or_create_subscriptions_sheet()
         records = _get_all_records_safe(ws)
@@ -715,14 +710,8 @@ def get_subscription_warnings(now: datetime.datetime, days_before: int = 2) -> l
         print(f"[Подписки] Ошибка чтения предупреждений: {e}")
         return []
 
-def normalize_existing_family_table_values() -> dict:
-    """Разовая мягкая санация старых строк без изменения структуры таблицы.
 
-    Исправляет уже записанные значения:
-    - Transactions.user: D/d/Diana -> Диана, Vlad/Vladislav -> Влад
-    - Transactions.type: expense/income -> РАСХОД/ДОХОД
-    - Reminders.target_user и ShoppingList.added_by — те же алиасы.
-    """
+def normalize_existing_family_table_values() -> dict:
     stats = {"transactions_users": 0, "transactions_types": 0, "reminders": 0, "shopping": 0}
 
     # Transactions
@@ -735,13 +724,9 @@ def normalize_existing_family_table_values() -> dict:
                 ws.update_cell(idx, 3, normalized_user)
                 stats["transactions_users"] += 1
 
-            raw_type = str(r.get("type") or "").strip().lower()
-            new_type = None
-            if raw_type in {"expense", "расход", "out"}:
-                new_type = "РАСХОД"
-            elif raw_type in {"income", "доход", "in"}:
-                new_type = "ДОХОД"
-            if new_type and new_type != r.get("type"):
+            raw_type = r.get("type")
+            new_type = TYPE_INCOME if is_income_type(raw_type) else TYPE_EXPENSE
+            if new_type != r.get("type"):
                 ws.update_cell(idx, 4, new_type)
                 stats["transactions_types"] += 1
     except Exception as e:
@@ -775,7 +760,6 @@ def normalize_existing_family_table_values() -> dict:
 
 
 def add_trip_plan(destination: str, dates: str, budget: float, notes: str):
-    # Сохраняем схему Trips как в текущей таблице/PowerBI: trip_id, destination, dates, budget.
     headers = ["trip_id", "destination", "dates", "budget"]
     try:
         ws = _get_or_create_worksheet("Trips", headers, rows=50, cols=4)
@@ -862,11 +846,6 @@ def mark_shopping_items_done(items_to_remove: list):
 
 
 def add_reminder(target_user: str, remind_at_str: str, text: str, recurrence: str = "once") -> dict:
-    """Добавляет напоминание и возвращает сохранённую запись.
-
-    Важно: исключения не проглатываются. Хендлер должен честно сказать, если
-    Google Sheets не сохранил строку.
-    """
     headers = ["reminder_id", "created_at", "target_user", "remind_at", "text", "status", "recurrence"]
     ws = _get_or_create_worksheet("Reminders", headers, rows=100, cols=7)
 
@@ -909,7 +888,6 @@ def get_pending_reminders():
             remind_at = r.get("remind_at")
             text = r.get("text")
 
-            # Старые строки без статуса, но с датой и текстом, считаем активными.
             if status in {"pending", "active", ""} and remind_at and text:
                 r["row_idx"] = idx
                 if not r.get("status"):
