@@ -1,16 +1,15 @@
-"""Обработка фото, PDF и скриншотов чеков."""
+"""Обработка фото, PDF и скриншотов чеков и переводов."""
 
 import asyncio
 
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message
 from services.vision import parse_receipt
 from services.sheets import append_transaction, normalize_necessity
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending
-from services.pending_clarifications import set_clarification
 from config import get_authorized_user_name
 from services.categories import (
-    TYPE_EXPENSE, TYPE_INCOME,
+    TYPE_EXPENSE, TYPE_INCOME, is_income_type,
     EXPENSE_CATEGORIES, INCOME_CATEGORIES,
     FALLBACK_EXPENSE_CATEGORY, FALLBACK_INCOME_CATEGORY,
     normalize_category, normalize_subcategory,
@@ -27,7 +26,6 @@ def _format_currency(value):
 
 
 def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> str:
-    """Формирует аккуратный список записанных по чеку трат (как на Скриншоте 2)."""
     lines = ["📸 **Записано по чеку:**"]
     for tx in transactions:
         amt = _format_currency(tx.get("amount", 0))
@@ -36,7 +34,8 @@ def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> st
         cat = tx.get("category", "")
         comm = str(tx.get("user_comment") or "").strip()
         comm_str = f" ({comm})" if comm else ""
-        lines.append(f"• {amt} {curr} | {bank} | {cat}{comm_str}")
+        sign = "+ " if is_income_type(tx.get("type")) else ""
+        lines.append(f"• {sign}{amt} {curr} | {bank} | {cat}{comm_str}")
     if ai_comment:
         lines.append(f"\n💬 {ai_comment}")
     return "\n".join(lines)
@@ -60,7 +59,7 @@ async def handle_media(message: Message):
         file_bytes = file_bytes.read()
         filename = doc.file_name or f"{doc.file_id}.pdf"
     else:
-        await safe_answer(message, "Не распознал формат файла. Пришли фото или PDF.")
+        await safe_answer(message, "Не распознала формат файла. Пришли фото или PDF.")
         return
 
     result = await parse_receipt(file_bytes, filename, caption, user_name)
@@ -71,19 +70,32 @@ async def handle_media(message: Message):
         await safe_answer(message, reply or "Не удалось распознать чек.")
         return
 
-    # Валидация и заполнение ВСЕХ полей
     validated_transactions = []
+    has_income = False
+
     for tx in transactions:
-        tx_type = str(tx.get("type") or TYPE_EXPENSE).strip().upper()
-        valid_categories = INCOME_CATEGORIES if tx_type == TYPE_INCOME else EXPENSE_CATEGORIES
-        fallback_cat = FALLBACK_INCOME_CATEGORY if tx_type == TYPE_INCOME else FALLBACK_EXPENSE_CATEGORY
+        is_income = is_income_type(tx.get("type"))
+        if is_income:
+            has_income = True
+            tx["type"] = TYPE_INCOME
+            valid_categories = INCOME_CATEGORIES
+            fallback_cat = FALLBACK_INCOME_CATEGORY
+        else:
+            tx["type"] = TYPE_EXPENSE
+            valid_categories = EXPENSE_CATEGORIES
+            fallback_cat = FALLBACK_EXPENSE_CATEGORY
 
         raw_cat = tx.get("category")
         cat = normalize_category(raw_cat, valid_categories, fallback_cat)
         tx["category"] = cat
-        raw_sub = tx.get("subcategory")
-        _, valid_sub = validate_transaction_category_subcategory(cat, raw_sub, valid_categories, fallback_cat)
-        tx["subcategory"] = valid_sub or normalize_subcategory(None, cat, "")
+
+        if not is_income:
+            raw_sub = tx.get("subcategory")
+            _, valid_sub = validate_transaction_category_subcategory(cat, raw_sub, valid_categories, fallback_cat)
+            tx["subcategory"] = valid_sub or normalize_subcategory(None, cat, "")
+        else:
+            tx["subcategory"] = ""
+
         tx["necessity"] = normalize_necessity(tx.get("necessity"), cat)
         tx["source"] = normalize_bank_source(tx.get("bank"), tx.get("source"))
         if not tx.get("bank"): tx["bank"] = "Не указан"
@@ -92,40 +104,41 @@ async def handle_media(message: Message):
         if not tx.get("resource"): tx["resource"] = "Карта"
         tx["user"] = user_name
         if not tx.get("merchant"): tx["merchant"] = ""
-        if not tx.get("user_comment"): tx["user_comment"] = caption or ""
+        if not tx.get("user_comment"): tx["user_comment"] = caption or ("Пополнение/доход" if is_income else "")
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
 
         validated_transactions.append(tx)
 
-    # Проверяем, есть ли транзакции с низкой confidence (если пользователь не дал подпись)
+    # Доходы записываем сразу и гарантированно в Google Sheets
+    if has_income or caption:
+        for tx in validated_transactions:
+            if caption:
+                tx["user_comment"] = caption
+            tx["user"] = user_name
+            await asyncio.to_thread(append_transaction, tx)
+        report = _format_receipt_report(validated_transactions, reply)
+        await safe_answer(message, report)
+        return
+
+    # Проверяем транзакции с низкой уверенностью для обычных чеков без подписи
     low_confidence_txs = [
         tx for tx in validated_transactions
         if float(tx.get("confidence", 1.0)) < 0.8 and tx.get("alternatives")
     ]
 
-    if low_confidence_txs and not caption:
-        # Не теряем остальные позиции чека: весь чек ждёт короткий комментарий/уточнение.
-        # Раньше в pending_clarification уходила только одна позиция, а остальные могли потеряться.
+    if low_confidence_txs:
         set_pending(chat_id, validated_transactions, user_name)
         await safe_answer(
             message,
             (
                 f"Распознала {len(validated_transactions)} позиций, но по одной категории сомневаюсь. "
-                "Напиши короткий комментарий к чеку или уточни категорию — и я сохраню всё вместе."
+                "Напиши короткий комментарий к чеку — и я сохраню всё вместе."
             ),
         )
         return
 
-    if caption:
-        for tx in validated_transactions:
-            tx["user_comment"] = caption
-            tx["user"] = user_name
-            await asyncio.to_thread(append_transaction, tx)
-        report = _format_receipt_report(validated_transactions, reply)
-        await safe_answer(message, report)
-    else:
-        set_pending(chat_id, validated_transactions, user_name)
-        await safe_answer(
-            message,
-            reply or f"Распознала {len(validated_transactions)} покупок. Напиши комментарий к чеку, и я запишу."
-        )
+    set_pending(chat_id, validated_transactions, user_name)
+    await safe_answer(
+        message,
+        reply or f"Распознала {len(validated_transactions)} покупок. Напиши комментарий к чеку, и я запишу."
+    )
