@@ -23,7 +23,7 @@ from services.sheets import (
     mark_subscription_warning_sent, get_transactions_for_period,
     save_category_limits,
 )
-from services.categories import FALLBACK_EXPENSE_CATEGORY, TYPE_INCOME
+from services.categories import FALLBACK_EXPENSE_CATEGORY, TYPE_INCOME, is_income_type
 from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
 from services.pending_clarifications import sweep_expired_clarifications
@@ -43,11 +43,7 @@ dp = Dispatcher()
 
 
 class FamilyPrivacyMiddleware(BaseMiddleware):
-    """Пускает к боту только семейный чат или разрешённые Telegram ID.
-
-    Бот приватный: даже если токен/username узнает посторонний, он не сможет
-    читать отчёты, писать траты или смотреть таблицу.
-    """
+    """Пускает к боту только семейный чат или разрешённые Telegram ID."""
 
     async def __call__(self, handler, event, data):
         chat = getattr(event, "chat", None) or getattr(getattr(event, "message", None), "chat", None)
@@ -60,7 +56,6 @@ class FamilyPrivacyMiddleware(BaseMiddleware):
         if allowed_chat or allowed_user:
             return await handler(event, data)
 
-        # Молча игнорируем callback, а в личке коротко объясняем.
         if hasattr(event, "answer") and chat:
             try:
                 await event.answer("Это приватный семейный бот.")
@@ -350,6 +345,7 @@ async def sweep_clarifications():
             print(f"[Clarifications] Ошибка: {e}")
         await asyncio.sleep(60)
 
+
 def _month_range(year: int, month: int) -> tuple[str, str]:
     start = datetime.date(year, month, 1).strftime("%Y-%m-%d")
     if month == 12:
@@ -366,7 +362,7 @@ def _period_summary_text(title: str, start: str, end: str) -> str:
     by_cat = {}
     for t in txs:
         amt = float(t.get("amt") or 0)
-        if str(t.get("type")) == TYPE_INCOME:
+        if is_income_type(t.get("type")):
             income += amt
         else:
             expense += amt
@@ -441,7 +437,6 @@ async def monthly_limits_scheduler():
 
 async def main():
     await asyncio.to_thread(ensure_power_bi_dimension_table)
-    # Исправляет уже накопленные D/expense в таблице без изменения схемы.
     await asyncio.to_thread(normalize_existing_family_table_values)
 
     asyncio.create_task(check_reminders())
