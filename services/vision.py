@@ -11,7 +11,7 @@ from openai import AsyncOpenAI
 
 from config import OPENAI_API_KEY
 from services.categories import (
-    EXPENSE_CATEGORIES, TYPE_EXPENSE, TYPE_INCOME,
+    EXPENSE_CATEGORIES, INCOME_CATEGORIES, TYPE_EXPENSE, TYPE_INCOME,
     format_category_list, SUBCATEGORIES_MAP, get_time_context_hint,
     is_ambiguous_item,
 )
@@ -23,20 +23,14 @@ _SUBCATEGORIES_VISION_PROMPT = "\n".join(
 
 VISION_SYSTEM_PROMPT = f"""
 Ты — Ада, помощница семейного финансового чата Влада и Дианы.
-Проанализируй изображение чека, банковского перевода или оплаты.
+Проанализируй изображение чека, квитанции, банковского перевода, зарплатного листа или экрана приложения банка.
 
 КОНТЕКСТ ВРЕМЕНИ:
-Текущее время и день недели даны отдельным сообщением. Используй их:
-- Утро (6-10): дорога на работу → транспорт, энергетики
-- Обед (12-15): еда вне дома → кафе, доставка
-- Вечер (18-21): дорога домой, ужин → транспорт, продукты домой
-- Ночь (21+): доставка, вредные привычки
-- Будни: работа, транспорт
-- Выходные: кафе, развлечения, продукты домой
+Текущее время и день недели даны отдельным сообщением. Используй их для контекста.
 
 Верни строгий JSON:
 {{
-  "reply": "Короткий комментарий на русском",
+  "reply": "Короткий живой комментарий на русском",
   "transactions": [
     {{
       "amount": 500,
@@ -58,45 +52,36 @@ VISION_SYSTEM_PROMPT = f"""
   ]
 }}
 
-Если несколько покупок — верни несколько элементов. Если нет данных — transactions пустой.
-
-Категории (ТОЛЬКО эти названия):
+КАТЕГОРИИ РАСХОДОВ (используй ТОЛЬКО эти названия):
 {format_category_list(EXPENSE_CATEGORIES)}
 
-СТРОГИЕ ПОДКАТЕГОРИИ:
+КАТЕГОРИИ ДОХОДОВ (для пополнений, переводов и зарплат):
+{format_category_list(INCOME_CATEGORIES)}
+
+СТРОГИЕ ПОДКАТЕГОРИИ РАСХОДОВ:
 {_SUBCATEGORIES_VISION_PROMPT}
 
 ПОДКАТЕГОРИИ:
-- "subcategory" ОБЯЗАН быть из списка выше. НЕ придумывай.
-- Если не уверен — бери ПЕРВУЮ подкатегорию категории.
+- Для расходов "subcategory" ОБЯЗАН быть из списка выше. НЕ придумывай новые.
+- Для доходов "subcategory" оставь пустой строкой "".
 
 necessity:
-- Need: еда домой, вода, транспорт на работу, лекарства, ЖКХ, корм питомцу
+- Need: еда домой, вода, транспорт на работу, лекарства, ЖКХ, товары для ремонта дома, корм питомцу
 - Want: сигареты, энергетики, алкоголь, косметика, кафе, рестораны, доставка, развлечения
 - "Алкоголь, табак и энергетики" → ВСЕГДА Want
 - "Красота и уход" → Want
 - "Развлечения и хобби" → Want
-- Кафе, рестораны, доставка → Want
 
 {BANK_ALIASES_PROMPT}
 
 ТИП ОПЕРАЦИИ:
-- Почти все чеки — РАСХОД (type = "{TYPE_EXPENSE}")
-- Возврат/рефанд или зачисление от другого → ДОХОД (type = "{TYPE_INCOME}")
-- Пополнение СВОЕГО счёта → НЕ доход и НЕ расход, верни transactions пустым
-- Перевод физлицу: если указан товар ("беляш") → классифицируй по товару
-- Энергетики → ВСЕГДА "Алкоголь, табак и энергетики"
+- Покупки и оплата счетов — РАСХОД (type = "{TYPE_EXPENSE}")
+- Входящий перевод, зарплата, аванс, бонус, пополнение баланса или возврат — ДОХОД (type = "{TYPE_INCOME}")
+- Для доходов category выбери из списка доходов (например "Зарплата", "Подарки и переводы (входящие)", "Кэшбэк и прочие поступления")
 
-НЕОДНОЗНАЧНЫЕ ТОВАРЫ:
-- Самса, пицца, суши, роллы, бургеры, шаурма → могут быть "Еда и продукты" (домой) ИЛИ "Кафе" (в заведении)
-- Если на чеке нет явного указания "на вынос"/"в зале" И время 12:00-15:00 → скорее "Кафе"
-- Если время 18:00+ → скорее "Еда и продукты" (домой)
-- Если НЕ уверен — confidence < 1.0 и alternatives
-
-ТВОЙ ТОН:
-- Умеренный, живой, с лёгкой иронией
-- НЕ грубый, НЕ "ахуевший"
-- Подкалывай мягко, семья доверяет тебе деньги
+КОММЕНТАРИИ:
+- Анализируй контекст. Если видно, что это зарплата или важный перевод — порадуйся за семью.
+- Тон живой, тёплый, аккуратный, без лишней навязчивости.
 """
 
 
@@ -163,7 +148,6 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
             encoded_image = base64.b64encode(image_path.read_bytes()).decode("ascii")
             client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=2)
 
-            # Добавляем контекст времени
             from services.timezone import now_astana
             now = now_astana()
             time_hint = get_time_context_hint(now.hour, now.weekday())
@@ -172,7 +156,7 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                 f"Файл от {user_name}. Подпись: {caption or 'нет'}.\n"
                 f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
                 f"Контекст: {time_hint}.\n"
-                "Распознай чек и верни JSON."
+                "Распознай чек/скриншот перевода и верни JSON."
             )
             response = await client.chat.completions.create(
                 model="gpt-4o",
@@ -189,7 +173,6 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
             )
             result = _parse_json(response.choices[0].message.content)
 
-            # Пост-обработка: проверяем неоднозначность
             transactions = result.get("transactions", [])
             for tx in transactions:
                 user_comment = str(tx.get("user_comment", "") or caption)
@@ -204,4 +187,3 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
     except Exception as error:
         print(f"[Распознавание] Сбой API или формата файла: {error}")
     return {}
-    
