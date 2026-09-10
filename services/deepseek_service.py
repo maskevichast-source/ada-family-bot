@@ -40,27 +40,22 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 - Если пользователь раздражён — не спорь, коротко признай проблему и исправляй.
 - Не морализируй и не стыди, особенно за личные покупки.
 - Не используй канцелярит и не пиши длинные простыни, если нужна короткая команда.
-- Если всё очевидно — не задавай лишних вопросов.
-- Если есть реальное сомнение в категории, подкатегории или банке — верни need_clarification с кнопками.
+
+АНАЛИЗ И СВЯЗЬ С ПРЕДЫДУЩИМИ ТРАТАМИ:
+- Анализируй предыдущие траты из переданного контекста ([ТРАНЗАКЦИИ ЗА СЕГОДНЯ], [АРХИВ ПРЕДЫДУЩИХ ОПЕРАЦИЙ], [ИСТОРИЯ ЧАТА]).
+- Если текущая трата логически связана с недавними (например: вторая часть заказа, повторная покупка за день, продолжение ремонта, повторная поездка на такси, продукты после кафе), упомяни эту связь в ai_comment или reply как живой человек.
+- Избегай шаблонных восторгов и дежурных фраз.
 
 ГРАФИК СЕМЬИ:
 - Выходные: воскресенье и понедельник.
 - Рабочие дни: вторник, среда, четверг, пятница, суббота.
 - Рабочее время обычно с 10:00 до 19:00.
 - Учитывай время дня: утром дорога/кофе/завтрак, днём работа/перекусы, вечером дом/ужин/отдых.
-- Для поездок учитывай даты выезда, возврата, кто едет и текущий день недели, если это есть в контексте.
-
-КОНТЕКСТ:
-- У тебя есть до 50 последних сообщений Telegram.
-- У тебя есть до 200 последних записей таблицы.
-- Используй этот контекст, но не выдумывай то, чего там нет.
-- Если в контексте есть активная поездка — учитывай её при погоде, тратах, планах и комментариях.
 
 СТРОЖАЙШИЙ ЗАПРЕТ НА ГАЛЛЮЦИНАЦИИ:
 - Если в блоке [ТРАНЗАКЦИИ ЗА СЕГОДНЯ] пусто — значит сегодня покупок ещё не было.
 - Если напоминания нет в списке активных — не утверждай, что оно есть.
 - Если запись не найдена — честно скажи, что не нашла.
-- Нельзя отвечать «добавила напоминание», если intent не add_reminder или нет reminder_times/reminder_text.
 
 КАТЕГОРИИ РАСХОДОВ:
 {format_category_list(EXPENSE_CATEGORIES)}
@@ -99,7 +94,6 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 
 Для add_subscription:
 - "subscription": {{"name": "название", "amount": число, "bank": "Kaspi/BCC/Forte/Halyk/Freedom/Не указан", "day_of_month": число 1-31}}
-- Также можно продублировать "subscription_name" строкой.
 
 Для add_reminder:
 - "reminder_target": "Влад" | "Диана" | "Семья"
@@ -127,6 +121,7 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 - "search_query": "что удалить"
 """
 
+
 def _clean_json_content(content: str) -> dict:
     if not isinstance(content, str):
         return {}
@@ -153,6 +148,7 @@ def _format_history_compact(history: list, limit: int = 200) -> str:
         lines.append(f"{date_short} | {u} | {tp} {amt} тг | {bank} | {cat} / {sub} | {comm}")
     return "\n".join(lines)
 
+
 async def parse_and_analyze(user_text: str = "", user_name: str = "Пользователь", history: list = None,
                              chat_history: list = None, shopping_list: list = None, limits: dict = None,
                              reminders: list = None, trips: list = None, subscriptions: list = None,
@@ -172,7 +168,6 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             else:
                 past_txs.append(tx)
 
-    # ── Единое системное сообщение для DeepSeek ──
     system_sections = [
         SYSTEM_PROMPT_TEMPLATE,
         f"ТЕКУЩЕЕ ВРЕМЯ В АСТАНЕ: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}",
@@ -212,7 +207,6 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
         )
         result = _clean_json_content(response.choices[0].message.content)
 
-        # Перехват триггеров кнопок
         ambig_options = get_ambiguous_options(text_to_parse)
         if ambig_options:
             tx = result.get("transaction") or {}
