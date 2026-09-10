@@ -1,8 +1,4 @@
-"""Простой прогноз погоды для Астаны через Open-Meteo.
-
-Формат специально короткий: семья должна быстро понять день, осадки и одежду,
-а не читать метеосводку на пол-экрана.
-"""
+"""Простой и читаемый прогноз погоды для Астаны через Open-Meteo."""
 
 import asyncio
 import datetime
@@ -14,34 +10,65 @@ ASTANA_LATITUDE = 51.169392
 ASTANA_LONGITUDE = 71.449074
 
 WEATHER_DESCRIPTIONS = {
-    0: "ясно ☀️",
-    1: "почти ясно 🌤",
-    2: "облачно с прояснениями ⛅",
-    3: "пасмурно ☁️",
-    45: "туман 🌫",
-    48: "туман/изморозь 🌫",
-    51: "морось 🌧",
-    53: "морось 🌧",
-    55: "сильная морось 🌧",
-    56: "ледяная морось 🌧",
-    57: "ледяная морось 🌧",
-    61: "небольшой дождь 🌦",
-    63: "дождь 🌧",
-    65: "сильный дождь 🌧",
-    66: "ледяной дождь 🌧",
-    67: "ледяной дождь 🌧",
-    71: "небольшой снег 🌨",
-    73: "снег 🌨",
-    75: "сильный снег ❄️",
-    77: "снежная крупа ❄️",
-    80: "ливень 🌦",
-    81: "ливень 🌧",
-    82: "сильный ливень 🌧",
-    85: "снежный ливень 🌨",
-    86: "сильный снежный ливень ❄️",
-    95: "гроза ⛈",
-    96: "гроза с градом ⛈",
-    99: "гроза с сильным градом ⛈",
+    0: "ясно",
+    1: "почти ясно",
+    2: "облачно с прояснениями",
+    3: "пасмурно",
+    45: "туман",
+    48: "туман/изморозь",
+    51: "морось",
+    53: "морось",
+    55: "сильная морось",
+    56: "ледяная морось",
+    57: "ледяная морось",
+    61: "небольшой дождь",
+    63: "дождь",
+    65: "сильный дождь",
+    66: "ледяной дождь",
+    67: "ледяной дождь",
+    71: "небольшой снег",
+    73: "снег",
+    75: "сильный снег",
+    77: "снежная крупа",
+    80: "ливень",
+    81: "ливень",
+    82: "сильный ливень",
+    85: "снежный ливень",
+    86: "сильный снежный ливень",
+    95: "гроза",
+    96: "гроза с градом",
+    99: "гроза с сильным градом",
+}
+
+WEATHER_EMOJIS = {
+    0: "☀️",
+    1: "🌤",
+    2: "⛅",
+    3: "☁️",
+    45: "🌫",
+    48: "🌫",
+    51: "🌧",
+    53: "🌧",
+    55: "🌧",
+    56: "🌧",
+    57: "🌧",
+    61: "🌦",
+    63: "🌧",
+    65: "🌧",
+    66: "🌧",
+    67: "🌧",
+    71: "🌨",
+    73: "🌨",
+    75: "❄️",
+    77: "❄️",
+    80: "🌦",
+    81: "🌧",
+    82: "🌧",
+    85: "🌨",
+    86: "❄️",
+    95: "⛈",
+    96: "⛈",
+    99: "⛈",
 }
 
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -49,9 +76,22 @@ WEEKDAYS_RU = ["понедельник", "вторник", "среда", "чет
 
 def _describe(code: object) -> str:
     try:
-        return WEATHER_DESCRIPTIONS.get(int(code), "непонятно по небу")
+        return WEATHER_DESCRIPTIONS.get(int(code), "переменная облачность")
     except (TypeError, ValueError):
-        return "непонятно по небу"
+        return "переменная облачность"
+
+
+def _code_to_emoji(code: object, hour: int = 12) -> str:
+    try:
+        c = int(code)
+    except (TypeError, ValueError):
+        return "⛅"
+    if hour >= 21 or hour < 6:
+        if c in (0, 1):
+            return "🌙"
+        if c == 2:
+            return "☁️"
+    return WEATHER_EMOJIS.get(c, "⛅")
 
 
 def _num(value):
@@ -84,30 +124,30 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _clothes_advice(temp_min: float | None, temp_max: float | None, rain: int | None, wind: float | None) -> str:
+def _clothes_advice(temp_min: float | None, temp_max: float | None, wind: float | None) -> str:
     if temp_max is None:
-        return "Что надеть: ориентируйтесь по фактической температуре за окном."
+        return "Ориентируйтесь по фактической температуре за окном."
 
     parts = []
     if temp_max <= -15:
-        parts.append("очень тёплая куртка, шапка и перчатки")
+        parts.append("Очень тёплая зимняя куртка, шапка, шарф и тёплые перчатки")
     elif temp_max <= -5:
-        parts.append("зимняя куртка и шапка")
+        parts.append("Зимняя тёплая куртка, шапка и перчатки")
     elif temp_max <= 5:
-        parts.append("тёплая куртка")
+        parts.append("Тёплая демисезонная куртка, шапка")
     elif temp_max <= 12:
-        parts.append("куртка или плотная ветровка")
-    elif temp_max <= 20:
-        parts.append("худи/лёгкая куртка")
+        parts.append("Куртка или плотная ветровка")
+    elif temp_max <= 18:
+        parts.append("Худи, свитшот или лёгкая куртка")
+    elif temp_max <= 23:
+        parts.append("Лёгкая одежда (футболка/рубашка), вечером накиньте кофту")
     else:
-        parts.append("лёгкая одежда")
+        parts.append("Лёгкая одежда (футболка/шорты)")
 
-    if rain is not None and rain >= 45:
-        parts.append("зонт лучше взять")
     if wind is not None and wind >= 30:
-        parts.append("будет ветрено — капюшон или шарф пригодятся")
+        parts.append("на улице ветрено — капюшон пригодится")
 
-    return "Что надеть: " + ", ".join(parts) + "."
+    return ", ".join(parts) + "."
 
 
 def _day_title(dt: datetime.date, today: datetime.date) -> str:
@@ -119,14 +159,7 @@ def _day_title(dt: datetime.date, today: datetime.date) -> str:
 
 
 async def get_weather_forecast(target: str = "today", days: int = 1) -> str | None:
-    """Вернуть короткий прогноз.
-
-    target:
-    - today
-    - tomorrow
-    - after_tomorrow
-    - week
-    """
+    """Вернуть короткий и структурированный прогноз."""
     try:
         req_days = 7 if target in {"week", "after_tomorrow"} or days >= 4 else (2 if target == "tomorrow" else 1)
         data = await asyncio.to_thread(_request_open_meteo, req_days)
@@ -137,14 +170,17 @@ async def get_weather_forecast(target: str = "today", days: int = 1) -> str | No
         if target == "week" or days >= 4:
             daily = data.get("daily", {})
             times = daily.get("time", [])
-            lines = ["📅 Погода в Астане на неделю:"]
+            lines = ["📅 **Погода в Астане на неделю:**\n"]
             for i, d_str in enumerate(times[:7]):
                 dt = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
                 t_min = _num(daily.get("temperature_2m_min", [None])[i])
                 t_max = _num(daily.get("temperature_2m_max", [None])[i])
-                desc = _describe(daily.get("weather_code", [None])[i])
+                code = daily.get("weather_code", [None])[i]
+                desc = _describe(code)
+                emoji = _code_to_emoji(code, 12)
                 rain = daily.get("precipitation_probability_max", [None])[i]
-                lines.append(f"• {_day_title(dt, today_date)}: {_format_temp(t_min)}…{_format_temp(t_max)}, {desc}, осадки {rain}%")
+                rain_info = f", осадки {rain}%" if rain is not None and rain > 20 else ""
+                lines.append(f"• {_day_title(dt, today_date)}: {_format_temp(t_min)}…{_format_temp(t_max)} {emoji} ({desc}{rain_info})")
             lines.append("\nЕсли планируете поездку — скажи куда и когда, я сверю прогноз под даты.")
             return "\n".join(lines)
 
@@ -163,19 +199,19 @@ async def get_weather_forecast(target: str = "today", days: int = 1) -> str | No
 
         temps, rains, winds = [], [], []
         hours = [9, 12, 15, 18, 21]
-        if offset == 0:
-            hours = [h for h in hours if h >= now.hour] or [18, 21]
 
         cur = data.get("current", {})
-        lines = [f"🌤 Погода в Астане на {title}"]
+        lines = [f"🌤 Погода в Астане на {title}:"]
 
         if offset == 0:
-            lines.append(
-                f"Сейчас: {_format_temp(cur.get('temperature_2m'))}, {_describe(cur.get('weather_code'))}. "
-                f"Ощущается как {_format_temp(cur.get('apparent_temperature'))}."
-            )
+            cur_temp = _format_temp(cur.get("temperature_2m"))
+            cur_app = _format_temp(cur.get("apparent_temperature"))
+            cur_desc = _describe(cur.get("weather_code"))
+            lines.append(f"Сейчас: {cur_temp}, {cur_desc} (ощущается как {cur_app}).\n")
+        else:
+            lines.append("")
 
-        period_names = {9: "утро", 12: "день", 15: "день", 18: "вечер", 21: "вечер"}
+        lines.append("Динамика дня:")
         for h in hours:
             key = f"{date_str}T{h:02d}:00"
             idx = hourly_map.get(key)
@@ -185,16 +221,26 @@ async def get_weather_forecast(target: str = "today", days: int = 1) -> str | No
             rain = hourly["precipitation_probability"][idx]
             wind = _num(hourly["wind_speed_10m"][idx])
             code = hourly["weather_code"][idx]
+            emoji = _code_to_emoji(code, h)
+
             if temp is not None:
                 temps.append(temp)
-            rains.append(rain)
+            if rain is not None:
+                rains.append(rain)
             if wind is not None:
                 winds.append(wind)
-            lines.append(f"• {period_names.get(h, str(h))} {h:02d}:00 — {_format_temp(temp)}, {_describe(code)}, осадки {rain}%")
 
-        if temps:
-            lines.append("")
-            lines.append(_clothes_advice(min(temps), max(temps), max(rains) if rains else None, max(winds) if winds else None))
+            lines.append(f"• {h:02d}:00 ➔ {_format_temp(temp)} {emoji}")
+
+        lines.append("")
+        min_t = min(temps) if temps else None
+        max_t = max(temps) if temps else None
+        max_wind = max(winds) if winds else None
+        lines.append(f"👕 Что надеть: {_clothes_advice(min_t, max_t, max_wind)}")
+
+        max_rain = max(rains) if rains else 0
+        if max_rain > 20:
+            lines.append(f"☂️ Зонт: лучше взять с собой (вероятность осадков {max_rain}%).")
 
         return "\n".join(lines)
 
