@@ -18,6 +18,7 @@ def _env_int(name: str, default: int) -> int:
 FAMILY_CHAT_ID = _env_int("FAMILY_CHAT_ID", -5349521972)
 CREDENTIALS_FILE = "credentials.json"
 CHAT_HISTORY_FILE = os.getenv("CHAT_HISTORY_FILE", "chat_history.json")
+STATE_DIR = os.getenv("STATE_DIR", "states")
 
 # Приватный семейный бот: в таблицу должны попадать нормальные семейные имена,
 # а не короткие Telegram first_name вроде "D".
@@ -44,6 +45,7 @@ class Settings:
     FAMILY_CHAT_ID = FAMILY_CHAT_ID
     CREDENTIALS_FILE = CREDENTIALS_FILE
     CHAT_HISTORY_FILE = CHAT_HISTORY_FILE
+    STATE_DIR = STATE_DIR
 
     telegram_bot_token = TELEGRAM_BOT_TOKEN
     openai_api_key = OPENAI_API_KEY
@@ -54,6 +56,7 @@ class Settings:
     family_chat_id = FAMILY_CHAT_ID
     credentials_file = CREDENTIALS_FILE
     chat_history_file = CHAT_HISTORY_FILE
+    state_dir = STATE_DIR
 
 
 def get_settings():
