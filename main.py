@@ -2,6 +2,7 @@
 
 import asyncio
 import datetime
+import os
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
@@ -17,7 +18,7 @@ from handlers.text_handler import (
 )
 from handlers.media_handler import handle_media
 from services.sheets import (
-    get_pending_reminders, mark_reminder_done, append_transaction,
+    append_transaction,
     ensure_power_bi_dimension_table, process_due_subscriptions,
     normalize_existing_family_table_values, get_subscription_warnings,
     mark_subscription_warning_sent, get_transactions_for_period,
@@ -34,6 +35,8 @@ from services.reports import generate_pdf_report, generate_excel_export
 from services.analytics import analyze_budget_leaks
 from services.limits_ai import generate_limits_from_history
 from services.timezone import now_astana
+from services.reminders import deliver_due
+from services import preflight, state
 
 if DefaultBotProperties:
     bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
@@ -43,17 +46,30 @@ dp = Dispatcher()
 
 
 class FamilyPrivacyMiddleware(BaseMiddleware):
-    """Пускает к боту только семейный чат или разрешённые Telegram ID."""
+    """Пускает к боту только Влада и Диану — по Telegram ID, и только в
+    семейном групповом чате или в личной переписке с ботом.
+
+    Раньше был баг «ИЛИ»: сообщение пропускалось, если чат совпадал с
+    FAMILY_CHAT_ID — то есть ЛЮБОЙ человек, оказавшийся в семейной группе
+    (добавили по ошибке, бывший арендатор остался в чате и т.п.), мог
+    писать боту, и его сообщения обрабатывались бы наравне с семьёй.
+    Также ловилась обратная дыра: настоящий Влад/Диана из СОВСЕМ ДРУГОГО
+    чата (например, бот случайно добавлен в другую группу) тоже прошли бы.
+    Теперь нужны оба условия: и ID отправителя, и разрешённый чат
+    (семейная группа или личка с ботом).
+    """
 
     async def __call__(self, handler, event, data):
-        chat = getattr(event, "chat", None) or getattr(getattr(event, "message", None), "chat", None)
         user = getattr(event, "from_user", None)
+        chat = getattr(event, "chat", None) or getattr(getattr(event, "message", None), "chat", None)
 
-        allowed_chat = bool(chat and int(chat.id) == int(FAMILY_CHAT_ID))
         allowed_users = {str(x) for x in (VLAD_TELEGRAM_ID, DIANA_TELEGRAM_ID) if x}
         allowed_user = bool(user and str(user.id) in allowed_users)
+        allowed_chat = bool(chat and (
+            int(chat.id) == int(FAMILY_CHAT_ID) or getattr(chat, "type", "") == "private"
+        ))
 
-        if allowed_chat or allowed_user:
+        if allowed_user and allowed_chat:
             return await handler(event, data)
 
         if hasattr(event, "answer") and chat:
@@ -219,29 +235,16 @@ async def handle_all_messages(message: types.Message):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 async def check_reminders():
+    """Доставка просроченных напоминаний в семейный чат.
+
+    Логика теперь в services/reminders.py (deliver_due): именное упоминание
+    Влада/Дианы через tg://user, HTML-форматирование, и главное — корректный
+    row_idx при продлении daily/weekly/monthly (раньше при повторных
+    напоминаниях правился жёстко заданный номер строки в этом же файле).
+    """
     while True:
         try:
-            now = datetime.datetime.now(ASTANA_TZ)
-            reminders = await asyncio.to_thread(get_pending_reminders)
-            for rem in reminders:
-                try:
-                    rem_time = parse_flexible_datetime(rem.get("remind_at"))
-                    if rem_time and now >= rem_time:
-                        target_user = str(rem.get("target_user", "")) or "Семья"
-                        text = str(rem.get("text", ""))
-                        recurrence = str(rem.get("recurrence", "once"))
-                        remind_at = str(rem.get("remind_at", ""))
-                        row_idx = rem.get("row_idx", 0)
-                        try:
-                            await safe_send_message(
-                                bot, chat_id=FAMILY_CHAT_ID,
-                                text=f"⏰ Напоминание для {target_user}: {text}"
-                            )
-                        except Exception as send_err:
-                            print(f"[Напоминания] Не удалось отправить: {send_err}")
-                        await asyncio.to_thread(mark_reminder_done, row_idx, recurrence, remind_at)
-                except Exception as e:
-                    print(f"[Напоминания] Ошибка обработки: {e}")
+            await deliver_due(bot)
         except Exception as e:
             print(f"[Напоминания] Ошибка цикла: {e}")
         await asyncio.sleep(60)
@@ -251,7 +254,15 @@ async def check_subscriptions():
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
-            if now.minute == 5:
+            # Раньше проверялось только "now.minute == 5" — если процесс не
+            # работал ровно в эту минуту (перезапуск, деплой), проверка
+            # подписок в этот час пропускалась совсем. Идемпотентность и
+            # так обеспечена внутри process_due_subscriptions/get_subscription_warnings
+            # (по last_paid/дате предупреждения), так что здесь достаточно
+            # widen-окна — двойной записи не будет.
+            if now.minute >= 5:
+                hour_key = f"subscriptions:{now.strftime('%Y-%m-%dT%H')}"
+                state.put("scheduler", hour_key, {"checked_at": now.isoformat()})
                 warnings = await asyncio.to_thread(get_subscription_warnings, now, 2)
                 for item in warnings:
                     await safe_send_message(
@@ -272,9 +283,10 @@ async def check_subscriptions():
 
 
 async def weather_scheduler():
-    sent_morning_today = None
-    sent_evening_today = None
-
+    """Раньше "отправлено сегодня" хранилось в локальных переменных внутри
+    функции — при перезапуске процесса (например, деплой на Railway прямо
+    в 8:30 утра) счётчик обнулялся, и прогноз мог уйти в чат повторно.
+    Теперь маркер "уже отправлено" переживает перезапуск (state.py)."""
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
@@ -282,19 +294,21 @@ async def weather_scheduler():
 
             # 08:30 — утренний прогноз
             if (now.hour == 8 and now.minute >= 30) or (now.hour == 9 and now.minute == 0):
-                if sent_morning_today != today_str:
+                marker_key = f"weather_morning:{today_str}"
+                if not state.get("scheduler", marker_key):
                     forecast = await get_weather_forecast(target="today")
                     if forecast:
                         await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
-                        sent_morning_today = today_str
+                        state.put("scheduler", marker_key, {"sent_at": now.isoformat()})
 
             # 22:30 — вечерний прогноз на завтра
             if (now.hour == 22 and now.minute >= 30) or (now.hour == 23 and now.minute == 0):
-                if sent_evening_today != today_str:
+                marker_key = f"weather_evening:{today_str}"
+                if not state.get("scheduler", marker_key):
                     forecast = await get_tomorrow_forecast()
                     if forecast:
                         await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
-                        sent_evening_today = today_str
+                        state.put("scheduler", marker_key, {"sent_at": now.isoformat()})
 
         except Exception as e:
             print(f"[Погода-Шедулер] Ошибка: {e}")
@@ -306,7 +320,8 @@ async def sweep_pending_receipts():
     while True:
         try:
             expired = sweep_expired()
-            for chat_id, transactions, user_name in expired:
+            for key, transactions, user_name in expired:
+                chat_id = int(str(key).split(":", 1)[0])
                 for tx in transactions:
                     tx["user"] = user_name
                     tx["user_comment"] = tx.get("user_comment", "") or "(без комментария — авто-сохранение)"
@@ -327,7 +342,8 @@ async def sweep_clarifications():
     while True:
         try:
             expired = sweep_expired_clarifications()
-            for chat_id, tx in expired:
+            for key, tx in expired:
+                chat_id = int(str(key).split(":", 1)[0])
                 if not tx.get("category"):
                     tx["category"] = FALLBACK_EXPENSE_CATEGORY
                 comm = tx.get("user_comment", "")
@@ -393,7 +409,7 @@ async def finance_report_scheduler():
             # Еженедельный дайджест — по понедельникам в 09:10 за последние 7 дней.
             if now.weekday() == 0 and now.hour == 9 and now.minute >= 10 and sent_weekly != today:
                 start_dt = (now.date() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-                end_dt = (now.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+                end_dt = now.date().strftime("%Y-%m-%d")
                 text = await asyncio.to_thread(_period_summary_text, "Еженедельный финансовый дайджест", start_dt, end_dt)
                 await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
                 sent_weekly = today
@@ -416,20 +432,25 @@ async def finance_report_scheduler():
 
 
 async def monthly_limits_scheduler():
-    """Автоподтверждение/перегенерация лимитов 1-го числа."""
-    sent_for = None
+    """Автоподтверждение/перегенерация лимитов 1-го числа.
+
+    Маркер "уже сделано в этом месяце" — в state.py (переживает
+    перезапуск), как и для остальных шедулеров выше.
+    """
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             month_key = now.strftime("%Y-%m")
-            if now.day == 1 and now.hour == 9 and now.minute >= 20 and sent_for != month_key:
+            marker_key = f"limits:{month_key}"
+            auto_enabled = os.environ.get("AUTO_GENERATE_LIMITS", "").strip().lower() in {"1", "true", "yes"}
+            if now.day == 1 and now.hour == 9 and now.minute >= 20 and auto_enabled and not state.get("scheduler", marker_key):
                 new_limits = await generate_limits_from_history()
                 if new_limits:
                     await safe_send_message(
                         bot, chat_id=FAMILY_CHAT_ID,
                         text=f"✅ Лимиты на {month_key} автоматически обновлены и подтверждены."
                     )
-                sent_for = month_key
+                state.put("scheduler", marker_key, {"generated_at": now.isoformat()})
         except Exception as e:
             print(f"[Автолимиты] Ошибка: {e}")
         await asyncio.sleep(60)
@@ -438,6 +459,12 @@ async def monthly_limits_scheduler():
 async def main():
     await asyncio.to_thread(ensure_power_bi_dimension_table)
     await asyncio.to_thread(normalize_existing_family_table_values)
+    try:
+        # Создаёт недостающие листы (в т.ч. Debts) с нужными заголовками.
+        # Ничего не удаляет и не трогает уже существующие данные.
+        await asyncio.to_thread(preflight.initialize_optional)
+    except Exception as e:
+        print(f"[Preflight] Не удалось проверить/создать листы: {e}")
 
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())

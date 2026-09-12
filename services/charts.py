@@ -10,6 +10,7 @@ import matplotlib.pyplot as plt
 
 from services.sheets import get_transactions_for_period, get_category_limits
 from services.categories import TYPE_EXPENSE, TYPE_INCOME
+from services.plot_lock import serialized_plot
 
 
 def _parse_date(date_str: str) -> datetime:
@@ -102,6 +103,7 @@ def _get_month_range(year: int, month: int) -> tuple[str, str]:
     return start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")
 
 
+@serialized_plot
 def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
     now = datetime.now()
     year = year or now.year
@@ -142,7 +144,7 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
 
     fig = plt.figure(figsize=(16, 12), facecolor=COLORS['bg'])
     fig.suptitle(
-        f'📊 Семейный бюджет — {datetime(year, month, 1).strftime("%B %Y").capitalize()}',
+        f'Семейный бюджет — {datetime(year, month, 1).strftime("%B %Y").capitalize()}',
         fontsize=18, fontweight='bold', color=COLORS['text'], y=0.98
     )
 
@@ -304,6 +306,7 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
     return buf.getvalue()
 
 
+@serialized_plot
 def generate_trend_chart(months_back: int = 3) -> bytes | None:
     now = datetime.now()
     monthly_data = defaultdict(float)

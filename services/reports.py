@@ -1,6 +1,8 @@
 """Генерация PDF-отчётов и выгрузки Excel (.xlsx) прямо в Telegram."""
 
 import io
+import re
+import textwrap
 import datetime
 from collections import defaultdict
 import matplotlib
@@ -16,6 +18,36 @@ from services.categories import TYPE_EXPENSE, TYPE_INCOME
 from services.timezone import now_astana
 from services.money import parse_amount
 from services.analytics import analyze_budget_leaks
+from services.plot_lock import serialized_plot
+
+
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F300-\U0001FAFF"
+    "\U00002600-\U000027BF"
+    "\U0001F1E6-\U0001F1FF"
+    "\U00002190-\U000021FF"
+    "]+",
+    flags=re.UNICODE,
+)
+
+
+def _wrap_pdf(text: str, width: int = 80) -> str:
+    """Готовит текст для вставки в PDF через matplotlib: убирает эмодзи
+    (у стандартного DejaVu Sans нет этих глифов — вместо них печатаются
+    пустые квадраты, и matplotlib на каждый такой символ шлёт warning) и
+    переносит длинные строки настоящими переводами строки, а не тем, что
+    легко случайно оставить как литеральный текст "\\n" внутри f-строки."""
+    clean = _EMOJI_RE.sub("", str(text or ""))
+    clean = re.sub(r"[ \t]+", " ", clean)
+    out_lines = []
+    for line in clean.split("\n"):
+        line = line.strip()
+        if not line:
+            out_lines.append("")
+            continue
+        out_lines.extend(textwrap.wrap(line, width=width) or [""])
+    return "\n".join(out_lines)
 
 
 def _format_currency(value):
@@ -25,6 +57,7 @@ def _format_currency(value):
         return str(value)
 
 
+@serialized_plot
 def generate_pdf_report(year: int = None, month: int = None) -> bytes:
     """Генерирует двухстраничный финансовый PDF-буклет семьи."""
     now = now_astana()
@@ -58,11 +91,11 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         ax_cards = fig1.add_subplot(3, 1, 1)
         ax_cards.set_facecolor("#1a1a2e")
         ax_cards.axis("off")
-        card_text = (
-            f"💰 Общий доход:  {_format_currency(total_inc)} KZT\n"
-            f"💸 Общий расход: {_format_currency(total_exp)} KZT\n"
-            f"📈 Чистый баланс: {_format_currency(balance)} KZT\n"
-            f"📊 Всего операций: {len(transactions)} (Расходов: {len(expenses)}, Доходов: {len(incomes)})"
+        card_text = _wrap_pdf(
+            f"Общий доход:  {_format_currency(total_inc)} KZT\n"
+            f"Общий расход: {_format_currency(total_exp)} KZT\n"
+            f"Чистый баланс: {_format_currency(balance)} KZT\n"
+            f"Всего операций: {len(transactions)} (Расходов: {len(expenses)}, Доходов: {len(incomes)})"
         )
         ax_cards.text(0.1, 0.4, card_text, fontsize=12, color="#ecf0f1", linespacing=1.6,
                       bbox=dict(boxstyle="round,pad=1", facecolor="#27293d", edgecolor="#4ECDC4", linewidth=1.5))
@@ -116,7 +149,7 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         ax_leaks.set_facecolor("#1a1a2e")
         ax_leaks.axis("off")
         leak_data = analyze_budget_leaks(y, m)
-        ax_leaks.text(0.05, 0.2, leak_data["text"].replace("**", "").replace("_", ""),
+        ax_leaks.text(0.05, 0.2, _wrap_pdf(leak_data["text"].replace("**", "").replace("_", ""), 90),
                       fontsize=10, color="#ecf0f1", linespacing=1.5,
                       bbox=dict(boxstyle="round,pad=1", facecolor="#27293d", edgecolor="#E74C3C", linewidth=1.5))
 
@@ -125,7 +158,7 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         ax_top.set_facecolor("#1a1a2e")
         ax_top.axis("off")
         top_txs = sorted(expenses, key=lambda x: -parse_amount(x.get("amt", 0)))[:7]
-        top_lines = ["🏆 Топ-7 крупнейших трат месяца:\n"]
+        top_lines = ["Топ-7 крупнейших трат месяца:\n"]
         for idx, t in enumerate(top_txs, 1):
             top_lines.append(f"{idx}. {_format_currency(t.get('amt'))} KZT — {t.get('cat')} ({t.get('comm')}) | {t.get('user')}")
 
@@ -176,6 +209,8 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
     for t in transactions:
+        merchant_val = str(t.get("merchant", ""))
+        row_idx = ws1.max_row + 1
         ws1.append([
             str(t.get("transaction_id", "")),
             str(t.get("date", "")),
@@ -185,21 +220,62 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
             str(t.get("curr", "KZT")),
             str(t.get("bank", "")),
             str(t.get("source", "")),
-            "Собственные",
-            "Карта",
+            str(t.get("funds_type", "Собственные")),
+            str(t.get("resource", "Карта")),
             str(t.get("cat", "")),
             str(t.get("subcat", "")),
-            "",
+            merchant_val,
             str(t.get("nec", "")),
             str(t.get("comm", "")),
-            ""
+            str(t.get("ai_comm", "")),
         ])
+        if merchant_val.startswith("="):
+            # Название продавца — это ДАННЫЕ, а не формула, даже если
+            # начинается с "=" (например, кто-то назвал товар с таким
+            # символом). Без этого Excel попытается это вычислить.
+            # ВАЖНО: сначала meняем data_type, потом НЕ трогаем .value —
+            # повторное присвоение .value заново запускает автоопределение
+            # типа и откатывает обратно на "формулу".
+            cell = ws1.cell(row=row_idx, column=13)
+            cell.data_type = "s"
 
     # Автоподбор ширины столбцов
     for col in ws1.columns:
         max_len = max(len(str(cell.value or "")) for cell in col)
         col_letter = get_column_letter(col[0].column)
         ws1.column_dimensions[col_letter].width = min(max(max_len + 3, 11), 40)
+
+    # Лист 2: Журнал долгов (сырая лента событий — открытие/погашение)
+    try:
+        from services import debts as debts_svc
+        debt_events = debts_svc.events()
+    except Exception:
+        debt_events = []
+    ws2 = wb.create_sheet("Журнал долгов")
+    ws2.append(["Дата", "Кому/от кого", "Направление", "Тип", "Сумма", "Срок", "Заметка"])
+    for e in debt_events:
+        ws2.append([
+            str(e.get("date", "")), str(e.get("counterparty", "")),
+            "Дал в долг" if e.get("direction") == "lent" else "Взял в долг",
+            "Открытие" if e.get("event_type") == "open" else "Погашение",
+            parse_amount(e.get("amount", 0)), str(e.get("due_date", "")), str(e.get("note", "")),
+        ])
+
+    # Лист 3: Остатки долгов (текущий баланс по каждому)
+    try:
+        debt_balances = debts_svc.balances(debt_events)
+    except Exception:
+        debt_balances = []
+    ws3 = wb.create_sheet("Остатки долгов")
+    ws3.append(["Кому/от кого", "Направление", "Остаток", "Срок"])
+    for b in debt_balances:
+        if b.get("balance", 0) <= 0:
+            continue
+        ws3.append([
+            str(b.get("counterparty", "")),
+            "Нам должны" if b.get("direction") == "lent" else "Мы должны",
+            b.get("balance", 0), str(b.get("due_date", "")),
+        ])
 
     buf = io.BytesIO()
     wb.save(buf)

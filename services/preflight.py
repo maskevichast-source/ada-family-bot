@@ -12,6 +12,8 @@ EXPECTED = {
     "Trips": ["trip_id", "destination", "dates", "budget"],
     "Installments": ["id", "date", "user", "bank", "kind", "description", "total_amount",
                      "monthly_payment", "payments_count", "next_payment", "status"],
+    "Debts": ["event_id", "debt_id", "date", "owner", "counterparty", "direction",
+              "event_type", "amount", "currency", "due_date", "note"],
 }
 def check_schema():
     import gspread

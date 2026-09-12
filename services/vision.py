@@ -124,6 +124,35 @@ def _render_pdf(pdf_path: Path, output_path: Path) -> Path:
     raise RuntimeError("PDF не содержит доступной страницы")
 
 
+MAX_PDF_PAGES = 12
+
+
+def _render_pdf_pages(pdf_path: Path, output_dir: Path, max_pages: int = MAX_PDF_PAGES) -> list[Path]:
+    """Рендерит ВСЕ страницы PDF в PNG (а не только первую, как _render_pdf) —
+    для длинных чеков/выписок из нескольких страниц. Отказывается работать
+    с чем-то похожим на целую книгу — большой PDF съест уйму токенов на
+    Vision-запрос и с большой вероятностью означает, что это не чек."""
+    import fitz  # PyMuPDF
+    doc = fitz.open(str(pdf_path))
+    try:
+        page_count = doc.page_count
+        if page_count > max_pages:
+            raise ValueError(
+                f"В PDF {page_count} страниц — это больше {max_pages}, похоже, это не чек. "
+                f"Пришли, пожалуйста, отдельные страницы или сфотографируй чек."
+            )
+        images = []
+        for i in range(page_count):
+            page = doc.load_page(i)
+            pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+            out_path = Path(output_dir) / f"{pdf_path.stem}_p{i + 1}.png"
+            pix.save(str(out_path))
+            images.append(out_path)
+        return images
+    finally:
+        doc.close()
+
+
 async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                         user_name: str = "Пользователь") -> dict:
     if not file_bytes:
@@ -147,41 +176,59 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
 
             encoded_image = base64.b64encode(image_path.read_bytes()).decode("ascii")
             client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=2)
+            try:
+                from services.timezone import now_astana
+                now = now_astana()
+                time_hint = get_time_context_hint(now.hour, now.weekday())
 
-            from services.timezone import now_astana
-            now = now_astana()
-            time_hint = get_time_context_hint(now.hour, now.weekday())
+                prompt = (
+                    f"Файл от {user_name}. Подпись: {caption or 'нет'}.\n"
+                    f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
+                    f"Контекст: {time_hint}.\n"
+                    "Распознай чек/скриншот перевода и верни JSON."
+                )
+                response = await client.chat.completions.create(
+                    model="gpt-4o",
+                    messages=[
+                        {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": prompt},
+                            {"type": "image_url", "image_url": {
+                                "url": f"data:{mime_type};base64,{encoded_image}"}},
+                        ]},
+                    ],
+                    response_format={"type": "json_object"},
+                    max_tokens=900,
+                )
 
-            prompt = (
-                f"Файл от {user_name}. Подпись: {caption or 'нет'}.\n"
-                f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
-                f"Контекст: {time_hint}.\n"
-                "Распознай чек/скриншот перевода и верни JSON."
-            )
-            response = await client.chat.completions.create(
-                model="gpt-4o",
-                messages=[
-                    {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                    {"role": "user", "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {
-                            "url": f"data:{mime_type};base64,{encoded_image}"}},
-                    ]},
-                ],
-                response_format={"type": "json_object"},
-                max_tokens=900,
-            )
-            result = _parse_json(response.choices[0].message.content)
+                choice = response.choices[0]
+                if getattr(choice, "finish_reason", None) == "length":
+                    # Ответ обрезан лимитом токенов — это значит, что модель
+                    # НЕ договорила JSON. Молча принять его — значит рискнуть
+                    # либо потерять часть покупок из длинного чека, либо
+                    # словить невалидный JSON. Явно просим прислать по частям.
+                    print("[Распознавание] Ответ Vision обрезан по finish_reason=length")
+                    return {
+                        "transactions": [],
+                        "reply": "Чек слишком длинный, ответ модели обрезался. Пришли, пожалуйста, частями (например, по фото на каждые несколько позиций).",
+                    }
 
-            transactions = result.get("transactions", [])
-            for tx in transactions:
-                user_comment = str(tx.get("user_comment", "") or caption)
-                is_ambig, alternatives = is_ambiguous_item(user_comment)
-                if is_ambig and tx.get("confidence", 1.0) >= 0.9:
-                    tx["confidence"] = 0.6
-                    tx["alternatives"] = alternatives
+                result = _parse_json(choice.message.content)
 
-            return result
+                transactions = result.get("transactions", [])
+                for tx in transactions:
+                    user_comment = str(tx.get("user_comment", "") or caption)
+                    is_ambig, alternatives = is_ambiguous_item(user_comment)
+                    if is_ambig and tx.get("confidence", 1.0) >= 0.9:
+                        tx["confidence"] = 0.6
+                        tx["alternatives"] = alternatives
+
+                return result
+            finally:
+                # Раньше клиент никогда явно не закрывался — при большом
+                # количестве чеков в день это медленно копит открытые
+                # HTTP-сессии/соединения.
+                await client.close()
     except asyncio.TimeoutError:
         print("[Распознавание] OpenAI не ответил вовремя")
     except Exception as error:

@@ -39,6 +39,13 @@ async def handle_confirmation(message, text):
             result=await asyncio.to_thread(sheets.delete_record_by_keyword,op["worksheet"],op["id"])
         else:
             result=await asyncio.to_thread(sheets.find_and_update_record,op["worksheet"],op["id"],op["field"],op["value"])
+            if result and op["worksheet"]=="Transactions" and op["field"]=="bank":
+                # Банк и источник финансирования должны совпадать — иначе
+                # "было с BCC" поменяет банк, а источник останется от
+                # старого (например "Kaspi Gold" для транзакции с BCC).
+                from services.banks import normalize_bank_source
+                new_source = normalize_bank_source(op["value"], None)
+                await asyncio.to_thread(sheets.find_and_update_record,op["worksheet"],op["id"],"source",new_source)
         if not result:
             await safe_answer(message,"Подтверждённая запись уже изменилась или удалена. Проверь таблицу, затем повтори запрос.")
             state.delete("edit_plan",key)

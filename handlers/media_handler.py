@@ -6,7 +6,8 @@ from aiogram.types import Message
 from services.vision import parse_receipt
 from services.sheets import append_transaction, normalize_necessity
 from services.telegram_safe import safe_answer
-from services.pending_receipts import set_pending
+from services.pending_receipts import set_pending, ack_pending
+from services.state import dialogue_key
 from config import get_authorized_user_name
 from services.categories import (
     TYPE_EXPENSE, TYPE_INCOME, is_income_type,
@@ -44,6 +45,7 @@ def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> st
 async def handle_media(message: Message):
     user_name = get_authorized_user_name(message.from_user.id, message.from_user.first_name) or message.from_user.first_name or "Пользователь"
     chat_id = message.chat.id
+    pending_key = dialogue_key(chat_id, message.from_user.id)
     caption = message.caption or ""
 
     if message.photo:
@@ -109,13 +111,34 @@ async def handle_media(message: Message):
 
         validated_transactions.append(tx)
 
+    # Стабильный ID на основе сообщения — чтобы повторный вызов handle_media
+    # для ТОГО ЖЕ сообщения (retry после сетевой ошибки) не записывал уже
+    # успешно сохранённые позиции чека ещё раз (append_transaction сам
+    # пропускает дубли по transaction_id).
+    for idx, tx in enumerate(validated_transactions):
+        if not tx.get("transaction_id"):
+            tx["transaction_id"] = f"MEDIA_{chat_id}_{message.message_id}_{idx}"
+
     # Доходы записываем сразу и гарантированно в Google Sheets
     if has_income or caption:
-        for tx in validated_transactions:
-            if caption:
-                tx["user_comment"] = caption
-            tx["user"] = user_name
-            await asyncio.to_thread(append_transaction, tx)
+        try:
+            for tx in validated_transactions:
+                if caption:
+                    tx["user_comment"] = caption
+                tx["user"] = user_name
+                await asyncio.to_thread(append_transaction, tx)
+        except Exception:
+            # Часть позиций могла уже успешно записаться — не теряем то,
+            # что ещё не сохранилось: кладём в очередь для ретрая (сам
+            # append_transaction идемпотентен по transaction_id, так что
+            # повторный вызов handle_media с тем же сообщением дозапишет
+            # только недостающее, а не задублирует уже сохранённое).
+            set_pending(pending_key, validated_transactions, user_name)
+            raise
+        # Успешно сохранили — если до этого здесь лежал "хвост" от
+        # предыдущей неудачной попытки по этому же чату/пользователю,
+        # он больше не актуален.
+        ack_pending(pending_key)
         report = _format_receipt_report(validated_transactions, reply)
         await safe_answer(message, report)
         return
@@ -127,7 +150,7 @@ async def handle_media(message: Message):
     ]
 
     if low_confidence_txs:
-        set_pending(chat_id, validated_transactions, user_name)
+        set_pending(pending_key, validated_transactions, user_name)
         await safe_answer(
             message,
             (
@@ -137,7 +160,7 @@ async def handle_media(message: Message):
         )
         return
 
-    set_pending(chat_id, validated_transactions, user_name)
+    set_pending(pending_key, validated_transactions, user_name)
     await safe_answer(
         message,
         reply or f"Распознала {len(validated_transactions)} покупок. Напиши комментарий к чеку, и я запишу."

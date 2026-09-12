@@ -34,6 +34,27 @@ KNOWN_SOURCES_BY_BANK = {
 VALID_SOURCES_LOWER = {"bcc pay", "kaspi gold", "kaspi red", "forte card", "halyk card", "freedom card", "основная карта"}
 
 
+BANK_NAME_ALIASES = {
+    "bcc": "BCC", "бцк": "BCC", "центркредit": "BCC", "центркредит": "BCC",
+    "kaspi": "Kaspi", "каспи": "Kaspi", "kaspi gold": "Kaspi", "каспи голд": "Kaspi",
+    "kaspi red": "Kaspi", "каспи ред": "Kaspi",
+    "forte": "Forte", "форте": "Forte",
+    "halyk": "Halyk", "халык": "Halyk", "народный": "Halyk", "халик": "Halyk",
+    "freedom": "Freedom", "фридом": "Freedom", "ffin": "Freedom",
+    "нал": "Наличные", "наличные": "Наличные", "cash": "Наличные",
+}
+
+
+def canonical_bank_name(raw: str | None) -> str | None:
+    """Свободный ввод банка ("халык", "каспи голд", "BCC") -> каноничное имя.
+
+    None, если не распознали — вызывающий код тогда не должен молча
+    игнорировать команду, а должен переспросить.
+    """
+    key = str(raw or "").strip().lower().replace("ё", "е")
+    return BANK_NAME_ALIASES.get(key)
+
+
 def normalize_bank_source(bank: str | None, source: str | None) -> str:
     """Привести "source" к одному из известных значений, если оно похоже на
     что-то другое (например, домен/название магазина) — не трогая уже

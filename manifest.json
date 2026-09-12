@@ -1,4 +1,5 @@
 {
+  "_status": "SUPERSEDED — этот патч НИКОГДА не был подключён к боту (input_hotfix.install() нигде не вызывался). Подробности и актуальное состояние — в SESSION_REPORT_2026-09-11_RU.md. Оставлено для истории.",
   "patch": "ada-input-and-reminder-hotfix",
   "target": "previous ada_railway_group_release.zip; not the original main ZIP",
   "replace": [

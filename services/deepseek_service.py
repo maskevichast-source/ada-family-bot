@@ -26,7 +26,8 @@ _SUBCATEGORIES_PROMPT = "\n".join(
 SYSTEM_PROMPT_TEMPLATE = f"""
 Ты — Ада, приватная семейная помощница Влада и Дианы.
 Ты не публичный бот, а домашний комментатор, финансовый аналитик и аккуратная помощница семьи.
-Текущий год: 2026. Часовой пояс: Астана (UTC+5).
+Часовой пояс: Астана (UTC+5). Точные текущие дата/время — в блоке "ТЕКУЩЕЕ ВРЕМЯ В АСТАНЕ" ниже;
+не полагайся на год из своих тренировочных данных, он может быть устаревшим.
 
 ПРИВАТНОСТЬ:
 - Бот полностью семейный и приватный.
@@ -72,7 +73,7 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 Отвечай ТОЛЬКО валидным JSON-объектом.
 
 Обязательные поля:
-- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "chat"
+- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "chat"
 - "reply": "короткий живой ответ на русском"
 
 Для transaction:
@@ -99,10 +100,29 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 - "reminder_target": "Влад" | "Диана" | "Семья"
 - "reminder_times": ["YYYY-MM-DD HH:MM:SS"]
 - "reminder_text": "текст напоминания"
-- "recurrence": "once" | "daily" | "monthly"
+- "recurrence": "once" | "daily" | "weekly" | "monthly"
+
+Для update_reminder (перенос/правка УЖЕ существующего напоминания, не создание нового):
+- "reminder_ids": ["REM_..."] если пользователь назвал ID, иначе не указывай
 
 Для get_weather:
 - "weather_target": "today" | "tomorrow" | "after_tomorrow" | "week"
+- Используй этот интент для ЛЮБОГО вопроса про погоду, температуру, осадки, ветер,
+  что надеть/взять зонт — даже если слово «погода» не прозвучало явно
+  (например: «холодно сегодня?», «дождь будет?», «куртку брать?», «жарко ли на улице?»).
+
+Для debt (долги — НЕ доходы и НЕ расходы, отдельный учёт «кто кому должен»):
+- "debt": {{
+  "event_type": "open" | "repay",
+  "direction": "lent" | "borrowed",
+  "counterparty": "имя человека",
+  "amount": число,
+  "currency": "KZT",
+  "debt_id": "DEBT_..." (только для event_type=repay, если известен),
+  "due_date": "YYYY-MM-DD" или пусто
+  }}
+- intent "debt" используется, когда кто-то дал/занял в долг или вернул долг (не обычная покупка/доход).
+- intent "get_debts" — когда спрашивают «кто кому должен», «покажи долги», «сколько мы должны».
 
 Для need_clarification:
 - "transaction": объект транзакции
@@ -152,7 +172,8 @@ def _format_history_compact(history: list, limit: int = 200) -> str:
 async def parse_and_analyze(user_text: str = "", user_name: str = "Пользователь", history: list = None,
                              chat_history: list = None, shopping_list: list = None, limits: dict = None,
                              reminders: list = None, trips: list = None, subscriptions: list = None,
-                             installments: list = None, **kwargs) -> dict:
+                             installments: list = None, debts: list = None, dialogue_state: dict = None,
+                             context_errors: list = None, **kwargs) -> dict:
     text_to_parse = user_text or kwargs.get("user_comment") or kwargs.get("text") or ""
     now = now_astana()
     today_prefix = now.strftime("%Y-%m-%d")
@@ -188,6 +209,20 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
         system_sections.append(f"[ПОДПИСКИ]:\n{json.dumps(subscriptions, ensure_ascii=False)}")
     if installments:
         system_sections.append(f"[РАССРОЧКИ]:\n{json.dumps(installments, ensure_ascii=False)}")
+    # ДОЛГИ показываем всегда (даже пустыми) — иначе модель может решить,
+    # что раздел долгов вообще не существует, и не распознает intent "debt".
+    system_sections.append(f"[ДОЛГИ]:\n{json.dumps(debts or [], ensure_ascii=False)}")
+    if dialogue_state:
+        system_sections.append(
+            f"[СОСТОЯНИЕ ДИАЛОГА]:\nНезавершённый локальный черновик, учти его при ответе "
+            f"(например, если это продолжение — не начинай заново):\n{json.dumps(dialogue_state, ensure_ascii=False)}"
+        )
+    if context_errors:
+        broken = ", ".join(str(x) for x in context_errors)
+        system_sections.append(
+            f"[ВНИМАНИЕ]: Источник недоступен для: {broken}. "
+            f"Не считай эти данные пустыми/нулевыми — они просто не загрузились сейчас."
+        )
     if chat_history:
         chat_lines = [f"{m['sender']}: {m['text']}" for m in chat_history[-50:]]
         system_sections.append(f"[ИСТОРИЯ ЧАТА]:\n" + "\n".join(chat_lines))

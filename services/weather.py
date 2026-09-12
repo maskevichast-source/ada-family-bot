@@ -158,92 +158,121 @@ def _day_title(dt: datetime.date, today: datetime.date) -> str:
     return f"{WEEKDAYS_RU[dt.weekday()].capitalize()}, {dt.strftime('%d.%m')}"
 
 
+def _arr(container: dict, key: str, length: int) -> list:
+    """Достаёт список по ключу; если ключ целиком отсутствует в ответе API —
+    отдаёт список из None нужной длины вместо IndexError на второй день."""
+    value = container.get(key)
+    if not isinstance(value, list):
+        return [None] * length
+    if len(value) < length:
+        value = value + [None] * (length - len(value))
+    return value
+
+
+def format_forecast(data: dict, target: str = "today", now: datetime.datetime | None = None, days: int = 1) -> str:
+    """Чистое форматирование ответа Open-Meteo в текст — без сетевых вызовов.
+
+    Вынесено отдельно от get_weather_forecast(), чтобы формат можно было
+    тестировать напрямую и чтобы легче было чинить конкретные тексты, не
+    трогая логику похода в сеть.
+    """
+    now = now or datetime.datetime.now(ASTANA_TZ)
+    today_date = now.date()
+
+    if target == "week" or days >= 4:
+        daily = data.get("daily", {})
+        times = daily.get("time", [])
+        n = len(times)
+        t_mins = _arr(daily, "temperature_2m_min", n)
+        t_maxs = _arr(daily, "temperature_2m_max", n)
+        codes = _arr(daily, "weather_code", n)
+        rains = _arr(daily, "precipitation_probability_max", n)
+        lines = ["📅 **Погода в Астане на неделю:**\n"]
+        for i, d_str in enumerate(times[:7]):
+            day_dt = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
+            t_min = _num(t_mins[i])
+            t_max = _num(t_maxs[i])
+            code = codes[i]
+            desc = _describe(code)
+            emoji = _code_to_emoji(code, 12)
+            rain = rains[i]
+            rain_info = f", осадки {rain}%" if rain is not None and rain > 20 else ""
+            lines.append(f"• {_day_title(day_dt, today_date)}: {_format_temp(t_min)}…{_format_temp(t_max)} {emoji} ({desc}{rain_info})")
+        lines.append("\nЕсли планируете поездку — скажи куда и когда, я сверю прогноз под даты.")
+        return "\n".join(lines)
+
+    offset = 0
+    if target == "tomorrow":
+        offset = 1
+    elif target == "after_tomorrow":
+        offset = 2
+
+    target_date = today_date + datetime.timedelta(days=offset)
+    date_str = target_date.strftime("%Y-%m-%d")
+    title = "сегодня" if offset == 0 else ("завтра" if offset == 1 else "послезавтра")
+
+    hourly = data.get("hourly", {})
+    hourly_map = {str(t): i for i, t in enumerate(hourly.get("time", []))}
+
+    temps, rains, winds = [], [], []
+    hours = [9, 12, 15, 18, 21]
+    # На "сегодня" не показываем уже прошедшие часы — иначе в 22:00 прогноз
+    # на 09:00 выглядит так, будто он ещё впереди.
+    if offset == 0:
+        hours = [h for h in hours if h > now.hour]
+
+    cur = data.get("current", {})
+    lines = [f"🌤 Погода в Астане на {title}:"]
+
+    if offset == 0:
+        cur_temp = _format_temp(cur.get("temperature_2m"))
+        cur_app = _format_temp(cur.get("apparent_temperature"))
+        cur_desc = _describe(cur.get("weather_code"))
+        lines.append(f"Сейчас: {cur_temp}, {cur_desc} (ощущается как {cur_app}).\n")
+    else:
+        lines.append("")
+
+    lines.append("Динамика дня:")
+    for h in hours:
+        key = f"{date_str}T{h:02d}:00"
+        idx = hourly_map.get(key)
+        if idx is None:
+            continue
+        temp = _num(hourly["temperature_2m"][idx])
+        rain = hourly["precipitation_probability"][idx]
+        wind = _num(hourly["wind_speed_10m"][idx])
+        code = hourly["weather_code"][idx]
+        emoji = _code_to_emoji(code, h)
+
+        if temp is not None:
+            temps.append(temp)
+        if rain is not None:
+            rains.append(rain)
+        if wind is not None:
+            winds.append(wind)
+
+        lines.append(f"• {h:02d}:00 ➔ {_format_temp(temp)} {emoji}")
+
+    lines.append("")
+    min_t = min(temps) if temps else None
+    max_t = max(temps) if temps else None
+    max_wind = max(winds) if winds else None
+    lines.append(f"👕 Что надеть: {_clothes_advice(min_t, max_t, max_wind)}")
+
+    max_rain = max(rains) if rains else 0
+    if max_rain > 20:
+        lines.append(f"☂️ Зонт: лучше взять с собой (вероятность осадков {max_rain}%).")
+
+    return "\n".join(lines)
+
+
 async def get_weather_forecast(target: str = "today", days: int = 1) -> str | None:
     """Вернуть короткий и структурированный прогноз."""
     try:
         req_days = 7 if target in {"week", "after_tomorrow"} or days >= 4 else (2 if target == "tomorrow" else 1)
         data = await asyncio.to_thread(_request_open_meteo, req_days)
-
         now = datetime.datetime.now(ASTANA_TZ)
-        today_date = now.date()
-
-        if target == "week" or days >= 4:
-            daily = data.get("daily", {})
-            times = daily.get("time", [])
-            lines = ["📅 **Погода в Астане на неделю:**\n"]
-            for i, d_str in enumerate(times[:7]):
-                dt = datetime.datetime.strptime(d_str, "%Y-%m-%d").date()
-                t_min = _num(daily.get("temperature_2m_min", [None])[i])
-                t_max = _num(daily.get("temperature_2m_max", [None])[i])
-                code = daily.get("weather_code", [None])[i]
-                desc = _describe(code)
-                emoji = _code_to_emoji(code, 12)
-                rain = daily.get("precipitation_probability_max", [None])[i]
-                rain_info = f", осадки {rain}%" if rain is not None and rain > 20 else ""
-                lines.append(f"• {_day_title(dt, today_date)}: {_format_temp(t_min)}…{_format_temp(t_max)} {emoji} ({desc}{rain_info})")
-            lines.append("\nЕсли планируете поездку — скажи куда и когда, я сверю прогноз под даты.")
-            return "\n".join(lines)
-
-        offset = 0
-        if target == "tomorrow":
-            offset = 1
-        elif target == "after_tomorrow":
-            offset = 2
-
-        target_date = today_date + datetime.timedelta(days=offset)
-        date_str = target_date.strftime("%Y-%m-%d")
-        title = "сегодня" if offset == 0 else ("завтра" if offset == 1 else "послезавтра")
-
-        hourly = data.get("hourly", {})
-        hourly_map = {str(t): i for i, t in enumerate(hourly.get("time", []))}
-
-        temps, rains, winds = [], [], []
-        hours = [9, 12, 15, 18, 21]
-
-        cur = data.get("current", {})
-        lines = [f"🌤 Погода в Астане на {title}:"]
-
-        if offset == 0:
-            cur_temp = _format_temp(cur.get("temperature_2m"))
-            cur_app = _format_temp(cur.get("apparent_temperature"))
-            cur_desc = _describe(cur.get("weather_code"))
-            lines.append(f"Сейчас: {cur_temp}, {cur_desc} (ощущается как {cur_app}).\n")
-        else:
-            lines.append("")
-
-        lines.append("Динамика дня:")
-        for h in hours:
-            key = f"{date_str}T{h:02d}:00"
-            idx = hourly_map.get(key)
-            if idx is None:
-                continue
-            temp = _num(hourly["temperature_2m"][idx])
-            rain = hourly["precipitation_probability"][idx]
-            wind = _num(hourly["wind_speed_10m"][idx])
-            code = hourly["weather_code"][idx]
-            emoji = _code_to_emoji(code, h)
-
-            if temp is not None:
-                temps.append(temp)
-            if rain is not None:
-                rains.append(rain)
-            if wind is not None:
-                winds.append(wind)
-
-            lines.append(f"• {h:02d}:00 ➔ {_format_temp(temp)} {emoji}")
-
-        lines.append("")
-        min_t = min(temps) if temps else None
-        max_t = max(temps) if temps else None
-        max_wind = max(winds) if winds else None
-        lines.append(f"👕 Что надеть: {_clothes_advice(min_t, max_t, max_wind)}")
-
-        max_rain = max(rains) if rains else 0
-        if max_rain > 20:
-            lines.append(f"☂️ Зонт: лучше взять с собой (вероятность осадков {max_rain}%).")
-
-        return "\n".join(lines)
-
+        return format_forecast(data, target=target, now=now, days=days)
     except Exception as error:
         print(f"[Погода] Ошибка Open-Meteo: {error}")
         return None

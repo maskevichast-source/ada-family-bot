@@ -60,6 +60,25 @@ def get_settings():
     return Settings()
 
 
+def validate_settings() -> None:
+    """Проверка обязательных переменных окружения перед стартом/деплоем.
+
+    Раньше бот просто падал где-то в середине работы с непонятной ошибкой,
+    если забыли задать токен или ключ Google Sheets. Используется в
+    `python -m services.preflight` при деплое — не входит в горячий путь
+    обработки сообщений.
+    """
+    required = {
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "GOOGLE_SHEETS_KEY": GOOGLE_SHEETS_KEY,
+    }
+    if not DEEPSEEK_API_KEY and not OPENAI_API_KEY:
+        required["DEEPSEEK_API_KEY или OPENAI_API_KEY"] = None
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(f"Не заданы переменные окружения: {', '.join(missing)}")
+
+
 def normalize_family_user_name(raw_name: str | None) -> str | None:
     """Приводит Telegram first_name/алиас к семейному имени для таблиц."""
     if not raw_name:
@@ -72,10 +91,17 @@ def normalize_family_user_name(raw_name: str | None) -> str | None:
 
 
 def get_authorized_user_name(user_id, fallback_name: str | None = None):
-    """Возвращает имя члена семьи по Telegram ID или по безопасному алиасу.
+    """Возвращает имя члена семьи СТРОГО по Telegram ID.
 
-    Старый интерфейс get_authorized_user_name(user_id) сохранён: второй аргумент
-    необязательный, поэтому существующие вызовы не ломаются.
+    Раньше при незнакомом ID функция дополнительно пыталась угадать по
+    fallback_name (Telegram first_name) через normalize_family_user_name —
+    а Telegram first_name может выставить себе кто угодно. Из-за этого
+    любой человек в группе, назвавшийся «Влад», «Диана» или даже просто
+    «D»/«Ди», авторизовался бы как настоящий член семьи и его траты/чеки
+    попадали бы в таблицу под чужим именем. Теперь имя определяется только
+    по VLAD_TELEGRAM_ID/DIANA_TELEGRAM_ID; fallback_name используется
+    только вызывающим кодом для отображения ("Пользователь" по умолчанию),
+    не для авторизации.
     """
     uid = str(user_id)
 
@@ -83,9 +109,5 @@ def get_authorized_user_name(user_id, fallback_name: str | None = None):
         return "Влад"
     if DIANA_TELEGRAM_ID and uid == str(DIANA_TELEGRAM_ID):
         return "Диана"
-
-    by_fallback = normalize_family_user_name(fallback_name)
-    if by_fallback:
-        return by_fallback
 
     return None
