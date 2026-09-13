@@ -4,13 +4,15 @@ import traceback
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY
 from services.timezone import now_astana
-from services.ai_config import DEEPSEEK_MODEL
+from services.ai_config import DEEPSEEK_MODEL, DEEPSEEK_THINKING_EFFORT
 from services.categories import (
     EXPENSE_CATEGORIES, INCOME_CATEGORIES, TYPE_EXPENSE, TYPE_INCOME,
     format_category_list, SUBCATEGORIES_MAP, get_time_context_hint,
     get_ambiguous_options,
 )
 from services.banks import BANK_ALIASES_PROMPT
+
+_RU_WEEKDAY_NAMES = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
 client = AsyncOpenAI(
     api_key=DEEPSEEK_API_KEY,
@@ -52,6 +54,10 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 - Рабочие дни: вторник, среда, четверг, пятница, суббота.
 - Рабочее время обычно с 10:00 до 19:00.
 - Учитывай время дня: утром дорога/кофе/завтрак, днём работа/перекусы, вечером дом/ужин/отдых.
+- ВАЖНО: этот список — общая справка про график семьи, а не то, какой
+  сегодня день. Какой сегодня день — строго по блоку "ТЕКУЩЕЕ ВРЕМЯ В
+  АСТАНЕ" ниже; если упоминаешь день недели в комментарии, называй
+  именно его, а не наугад выбранный день из этого списка.
 
 СТРОЖАЙШИЙ ЗАПРЕТ НА ГАЛЛЮЦИНАЦИИ:
 - Если в блоке [ТРАНЗАКЦИИ ЗА СЕГОДНЯ] пусто — значит сегодня покупок ещё не было.
@@ -98,9 +104,16 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 
 Для add_reminder:
 - "reminder_target": "Влад" | "Диана" | "Семья"
-- "reminder_times": ["YYYY-MM-DD HH:MM:SS"]
+- "reminder_times": ["YYYY-MM-DD HH:MM:SS"] — если несколько раз в день (например "утром и вечером"), перечисли каждое время отдельным элементом списка.
 - "reminder_text": "текст напоминания"
 - "recurrence": "once" | "daily" | "weekly" | "monthly"
+- "recurrence_until": "YYYY-MM-DD" — ОБЯЗАТЕЛЬНО указывай, если пользователь назвал срок/длительность
+  ("в течение двух недель", "на месяц", "до 1 октября", "неделю") — посчитай итоговую дату от текущей.
+  Если recurrence="once" или срок не назван — не указывай это поле вовсе.
+
+Для add_reminder: "напоминай дважды в день (утром и вечером) две недели" — это НЕ два разных
+разовых напоминания, а recurrence="daily" с двумя временами в reminder_times и
+recurrence_until через 14 дней от сегодня.
 
 Для update_reminder (перенос/правка УЖЕ существующего напоминания, не создание нового):
 - "reminder_ids": ["REM_..."] если пользователь назвал ID, иначе не указывай
@@ -140,6 +153,38 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 Для delete_transaction:
 - "search_query": "что удалить"
 """
+
+
+async def classify_items(items: list[str]) -> list[dict]:
+    """Быстрая классификация коротких описаний товаров по категориям —
+    используется, когда комментарий к чеку неявно просит разбить одну
+    сумму на несколько позиций ("Стики 1210, остальное молоко") и категорию
+    для каждой части нужно определить отдельно, а не гадать по ключевым
+    словам вручную."""
+    prompt = (
+        "Определи категорию и подкатегорию для каждого товара. Категории:\n"
+        + format_category_list(EXPENSE_CATEGORIES)
+        + "\n\nПодкатегории:\n"
+        + "\n".join(f"- {cat}: {', '.join(subs)}" for cat, subs in SUBCATEGORIES_MAP.items())
+        + "\n\nВерни JSON: {\"items\": [{\"category\": \"...\", \"subcategory\": \"...\"}, ...]} "
+        "в ТОМ ЖЕ порядке, что и товары ниже, без пояснений."
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=DEEPSEEK_MODEL,
+            messages=[
+                {"role": "system", "content": prompt},
+                {"role": "user", "content": json.dumps(items, ensure_ascii=False)},
+            ],
+            response_format={"type": "json_object"},
+        )
+        result = _clean_json_content(response.choices[0].message.content)
+        parsed_items = result.get("items", [])
+        if len(parsed_items) == len(items):
+            return parsed_items
+    except Exception as e:
+        print(f"[Классификация товаров] Ошибка: {e}")
+    return [{"category": "", "subcategory": ""} for _ in items]
 
 
 def _clean_json_content(content: str) -> dict:
@@ -191,7 +236,9 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
 
     system_sections = [
         SYSTEM_PROMPT_TEMPLATE,
-        f"ТЕКУЩЕЕ ВРЕМЯ В АСТАНЕ: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}",
+        f"ТЕКУЩЕЕ ВРЕМЯ В АСТАНЕ: {now.strftime('%Y-%m-%d %H:%M:%S')}, "
+        f"{_RU_WEEKDAY_NAMES[now.weekday()]} "
+        f"(не путай с английским названием дня — ориентируйся только на это).",
         f"КОНТЕКСТ ДНЯ: {time_hint}",
         f"[ТРАНЗАКЦИИ ЗА СЕГОДНЯ ({today_prefix})]:\n{_format_history_compact(today_txs) if today_txs else 'Сегодня покупок ещё НЕ БЫЛО.'}",
         f"[АРХИВ ПРЕДЫДУЩИХ ОПЕРАЦИЙ ДО 200 ЗАПИСЕЙ]:\n{_format_history_compact(past_txs, limit=200)}",
@@ -235,11 +282,20 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
     ]
 
     try:
-        response = await client.chat.completions.create(
+        create_kwargs = dict(
             model=DEEPSEEK_MODEL,
             messages=messages,
-            response_format={"type": "json_object"}
+            response_format={"type": "json_object"},
         )
+        if DEEPSEEK_THINKING_EFFORT != "disabled":
+            # "Режим размышления" DeepSeek — включается параметром thinking,
+            # не отдельной моделью, поэтому не меняет цену/скорость обычных
+            # быстрых ответов, если effort="low" (по умолчанию).
+            create_kwargs["extra_body"] = {
+                "thinking": {"type": "enabled"},
+                "reasoning_effort": DEEPSEEK_THINKING_EFFORT,
+            }
+        response = await client.chat.completions.create(**create_kwargs)
         result = _clean_json_content(response.choices[0].message.content)
 
         ambig_options = get_ambiguous_options(text_to_parse)
