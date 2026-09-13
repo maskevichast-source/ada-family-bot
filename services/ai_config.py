@@ -31,6 +31,6 @@ DEEPSEEK_MODEL = os.environ.get("DEEPSEEK_MODEL", "deepseek-flash")
 # и медленнее для обычных "записала покупку". low/high/max — по
 # документации DeepSeek: low для простых задач, high для ежедневных
 # агентных сценариев, max для сложных. "disabled" — выключить совсем.
-DEEPSEEK_THINKING_EFFORT = os.environ.get("DEEPSEEK_THINKING_EFFORT", "low").strip().lower()
+DEEPSEEK_THINKING_EFFORT = os.environ.get("DEEPSEEK_THINKING_EFFORT", "high").strip().lower()
 
 
