@@ -45,7 +45,7 @@ from services.timezone import now_astana, parse_ru_relative_datetime
 from services.analytics import analyze_budget_leaks
 from services.reports import generate_pdf_report, generate_excel_export
 from services.price_tracker import fetch_product_info, detect_marketplace
-from services import reminders, reminder_edit, debts, edits
+from services import reminders, reminder_edit, debts, edits, goals, fx
 from services.state import dialogue_key
 
 
@@ -336,6 +336,8 @@ async def _process_text_message(message: Message, text: str):
         return
     if await debts.handle(message, text, user_name):
         return
+    if await goals.handle(message, text, user_name):
+        return
     if await _try_handle_reminder_directly(message, text, user_name, chat_id):
         return
 
@@ -604,6 +606,7 @@ async def _process_text_message(message: Message, text: str):
         "add_subscription", "cancel_subscription", "get_subscriptions",
         "add_reminder", "delete_reminder", "get_reminders", "update_reminder",
         "debt", "get_debts",
+        "add_goal", "deposit_goal", "get_goals",
         "add_shopping", "clear_shopping", "get_shopping",
         "add_trip", "get_trips",
         "get_limits", "generate_limits", "get_income", "get_weather",
@@ -664,6 +667,8 @@ async def _process_text_message(message: Message, text: str):
     # Долги через ИИ (если локальный разбор в debts.handle() не справился —
     # например, из-за местоимений вроде "он мне вернул").
     if await debts.handle_model(message, parsed, user_name):
+        return
+    if await goals.handle_model(message, parsed, user_name):
         return
 
     # ── УДАЛЕНИЕ И ПРАВКА ЗАПИСЕЙ ──
@@ -743,6 +748,20 @@ async def _process_text_message(message: Message, text: str):
 
         if not tx.get("bank"): tx["bank"] = "Не указан"
         if not tx.get("currency"): tx["currency"] = "KZT"
+        cur = str(tx.get("currency") or "KZT").strip().upper()
+        if cur and cur != "KZT":
+            converted = await fx.convert_to_kzt(tx.get("amount", 0), cur)
+            if converted:
+                kzt_amount, rate = converted
+                tx["ai_comment"] = f"{tx.get('ai_comment', '')} ({tx.get('amount')} {cur} по курсу {rate:.2f})".strip()
+                tx["amount"] = kzt_amount
+                tx["amount_kzt"] = kzt_amount
+                tx["currency"] = "KZT"
+            else:
+                res = f"Это в {cur}, а курс сейчас узнать не удалось — назови сумму в тенге."
+                add_chat_message(chat_id, "Ада", res)
+                await safe_answer(message, res)
+                return
         if not tx.get("funds_type"): tx["funds_type"] = "Собственные"
         if not tx.get("resource"): tx["resource"] = "Карта"
         tx["user"] = user_name
