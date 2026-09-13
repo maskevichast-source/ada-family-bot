@@ -4,10 +4,12 @@ import asyncio
 
 from aiogram.types import Message
 from services.vision import parse_receipt
-from services.sheets import append_transaction, normalize_necessity
+from services.sheets import append_transaction, normalize_necessity, get_last_200_transactions
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending, ack_pending
 from services.state import dialogue_key
+from services.memory import get_chat_history, add_chat_message
+from services import fx, goals
 from config import get_authorized_user_name
 from services.categories import (
     TYPE_EXPENSE, TYPE_INCOME, is_income_type,
@@ -17,6 +19,7 @@ from services.categories import (
     validate_transaction_category_subcategory,
 )
 from services.banks import normalize_bank_source
+import re
 
 
 def _format_currency(value):
@@ -24,6 +27,38 @@ def _format_currency(value):
         return f"{float(value):,.0f}".replace(",", " ")
     except (ValueError, TypeError):
         return str(value)
+
+
+_GOAL_DEPOSIT_CAPTION_RE = re.compile(
+    r"(?:в|на)\s+копилк[уи]\s*(.+)?|(?:на\s+цель)\s+(.+)?|копилк[ауи]\s+(.+)?",
+    re.IGNORECASE,
+)
+
+
+def _build_recent_context(chat_id: int) -> str:
+    """Несколько последних трат и сообщений чата — чтобы комментарий к
+    новому чеку мог естественно связать его с тем, что уже происходит
+    (например, переезд, начатый вчера/сегодня), а не был "слепым" к
+    остальной семейной жизни. Специально не тащим много — иначе комментарий
+    начнёт КАЖДЫЙ раз пытаться привязаться к прошлому, что уже перебор."""
+    lines = []
+    try:
+        recent_tx = get_last_200_transactions()[-6:]
+        for t in recent_tx:
+            comm = str(t.get("user_comment") or "").strip()
+            if comm:
+                lines.append(f"- трата: {t.get('category', '')} — {comm}")
+    except Exception:
+        pass
+    try:
+        recent_chat = get_chat_history(chat_id)[-6:]
+        for m in recent_chat:
+            txt = str(m.get("text") or "").strip()
+            if txt and len(txt) < 200:
+                lines.append(f"- сообщение ({m.get('sender', '')}): {txt}")
+    except Exception:
+        pass
+    return "\n".join(lines[-10:])
 
 
 def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> str:
@@ -64,13 +99,59 @@ async def handle_media(message: Message):
         await safe_answer(message, "Не распознала формат файла. Пришли фото или PDF.")
         return
 
-    result = await parse_receipt(file_bytes, filename, caption, user_name)
+    result = await parse_receipt(file_bytes, filename, caption, user_name, _build_recent_context(chat_id))
     transactions = result.get("transactions", [])
     reply = result.get("reply", "")
 
     if not transactions:
         await safe_answer(message, reply or "Не удалось распознать чек.")
         return
+
+    # Пополнение копилки скриншотом/PDF перевода, а не обычная трата —
+    # "закинул в копилку на отпуск" + прикреплённый чек банка.
+    goal_match = _GOAL_DEPOSIT_CAPTION_RE.search(caption) if caption else None
+    if goal_match and transactions:
+        goal_name = next((g for g in goal_match.groups() if g), "").strip(" .,")
+        amount = transactions[0].get("amount")
+        if goal_name and amount:
+            try:
+                goal = await asyncio.to_thread(goals.deposit_to_goal, goal_name, amount)
+            except ValueError as e:
+                await safe_answer(message, str(e))
+                return
+            if goal:
+                target = float(goal.get("target_amount", 0) or 0)
+                curr = float(goal.get("current_amount", 0) or 0)
+                pct = int((curr / target) * 100) if target > 0 else 0
+                done = " 🎉 Цель достигнута!" if curr >= target > 0 else ""
+                await safe_answer(
+                    message,
+                    f"✅ Пополнила «{goal['name']}»: {_format_currency(curr)} из {_format_currency(target)} KZT ({pct}%).{done}",
+                )
+                return
+            await safe_answer(message, f"Не нашла активную цель «{goal_name}». Покажи цели, чтобы свериться с названием.")
+            return
+
+    # Валюта отличная от KZT — конвертируем по официальному курсу автоматически,
+    # а не просим сначала сконвертировать вручную (это и есть тот самый
+    # "не понимает другую валюту", который просили починить).
+    for tx in transactions:
+        cur = str(tx.get("currency") or "KZT").strip().upper()
+        if cur and cur != "KZT":
+            converted = await fx.convert_to_kzt(tx.get("amount", 0), cur)
+            if converted:
+                kzt_amount, rate = converted
+                original_amount = tx.get("amount")
+                tx["amount"] = kzt_amount
+                tx["amount_kzt"] = kzt_amount
+                tx["currency"] = "KZT"
+                tx["_fx_note"] = f"{original_amount} {cur} по курсу {rate:.2f}"
+            else:
+                await safe_answer(
+                    message,
+                    f"Чек в {cur}, а курс сейчас не удалось узнать — пришли, пожалуйста, сумму в тенге вручную.",
+                )
+                return
 
     validated_transactions = []
     has_income = False
@@ -107,6 +188,8 @@ async def handle_media(message: Message):
         tx["user"] = user_name
         if not tx.get("merchant"): tx["merchant"] = ""
         if not tx.get("user_comment"): tx["user_comment"] = caption or ("Пополнение/доход" if is_income else "")
+        if tx.get("_fx_note"):
+            tx["user_comment"] = f"{tx['user_comment']} ({tx['_fx_note']})".strip(" ()")
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
 
         validated_transactions.append(tx)
@@ -124,7 +207,7 @@ async def handle_media(message: Message):
         try:
             for tx in validated_transactions:
                 if caption:
-                    tx["user_comment"] = caption
+                    tx["user_comment"] = f"{caption} ({tx['_fx_note']})" if tx.get("_fx_note") else caption
                 tx["user"] = user_name
                 await asyncio.to_thread(append_transaction, tx)
         except Exception:
