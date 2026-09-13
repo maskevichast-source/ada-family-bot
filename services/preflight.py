@@ -14,6 +14,7 @@ EXPECTED = {
                      "monthly_payment", "payments_count", "next_payment", "status"],
     "Debts": ["event_id", "debt_id", "date", "owner", "counterparty", "direction",
               "event_type", "amount", "currency", "due_date", "note"],
+    "Goals": ["goal_id", "date_created", "name", "target_amount", "current_amount", "deadline", "status"],
 }
 def check_schema():
     import gspread
