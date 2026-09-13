@@ -180,10 +180,12 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                 from services.timezone import now_astana
                 now = now_astana()
                 time_hint = get_time_context_hint(now.hour, now.weekday())
+                weekday_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
 
                 prompt = (
                     f"Файл от {user_name}. Подпись: {caption or 'нет'}.\n"
-                    f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S (%A)')}.\n"
+                    f"Текущее время: {now.strftime('%Y-%m-%d %H:%M:%S')}, {weekday_ru} "
+                    f"(ориентируйся только на это название дня, не угадывай).\n"
                     f"Контекст: {time_hint}.\n"
                     "Распознай чек/скриншот перевода и верни JSON."
                 )
