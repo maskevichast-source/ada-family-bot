@@ -79,14 +79,14 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 Отвечай ТОЛЬКО валидным JSON-объектом.
 
 Обязательные поля:
-- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "chat"
+- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "add_goal" | "deposit_goal" | "get_goals" | "chat"
 - "reply": "короткий живой ответ на русском"
 
 Для transaction:
 - "transaction": {{
   "type": "РАСХОД" или "ДОХОД",
-  "amount": число,
-  "currency": "KZT",
+  "amount": число (в валюте "currency" КАК ЕСТЬ, не пересчитывай сама в тенге),
+  "currency": "KZT" или другая, если пользователь явно назвал другую валюту (USD/RUB/EUR/...) — код сконвертирует по официальному курсу сам,
   "bank": "BCC" | "Kaspi" | "Forte" | "Halyk" | "Freedom" | "Не указан",
   "source": строка,
   "funds_type": "Собственные" | "Рассрочка" | "Кредитные",
@@ -136,6 +136,18 @@ recurrence_until через 14 дней от сегодня.
   }}
 - intent "debt" используется, когда кто-то дал/занял в долг или вернул долг (не обычная покупка/доход).
 - intent "get_debts" — когда спрашивают «кто кому должен», «покажи долги», «сколько мы должны».
+
+Для add_goal/deposit_goal (финансовые цели/копилки — НЕ доходы и НЕ расходы, отдельный учёт "откладываем на что-то"):
+- "goal": {{
+  "action": "create" | "deposit",
+  "name": "название цели, например Отпуск",
+  "target_amount": число (только для action=create),
+  "deadline": "YYYY-MM-DD" или пусто (только для action=create),
+  "amount": число (только для action=deposit — сколько закинули в копилку)
+  }}
+- intent "add_goal" (action=create) — когда просят завести цель/копилку ("создай цель на отпуск 500000").
+- intent "deposit_goal" (action=deposit) — когда просят пополнить/закинуть в уже существующую копилку.
+- intent "get_goals" — когда спрашивают «покажи цели», «сколько накопили», «покажи копилки».
 
 Для need_clarification:
 - "transaction": объект транзакции
