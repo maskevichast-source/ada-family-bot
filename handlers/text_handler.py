@@ -18,7 +18,7 @@ from services.categories import (
 )
 from services.money import parse_amount
 from services.banks import normalize_bank_source
-from services.deepseek_service import parse_and_analyze
+from services.deepseek_service import parse_and_analyze, classify_items
 from services.sheets import (
     append_transaction, get_last_200_transactions, get_category_limits,
     add_shopping_items, get_shopping_items, mark_shopping_items_done,
@@ -104,13 +104,64 @@ _NOT_A_RECEIPT_COMMENT_RE = re.compile(
 )
 
 
+_SPLIT_COMMENT_RE = re.compile(
+    r"^(.*?)\s+(\d[\d\s]*)\s*(?:тенге|тг|kzt)?\s*[,.]?\s*(?:а\s+)?остальн(?:ое|ые)\s+(?:это\s+)?(.+)$",
+    re.IGNORECASE,
+)
+
+
+async def _maybe_split_pending_comment(text: str, transactions: list[dict]) -> list[dict]:
+    """"Стики 1210 тенге, остальное молоко" на чек с ОДНОЙ позицией на 2330 —
+    раньше просто вешало весь текст комментарием на одну запись одной
+    категорией. Теперь, если в комментарии явно назван первый товар с
+    суммой и "остальное" — второй, режем на два товара с отдельными
+    категориями (категории уточняет модель, не угадываем по словам)."""
+    if len(transactions) != 1:
+        return transactions
+    m = _SPLIT_COMMENT_RE.match(text.strip())
+    if not m:
+        return transactions
+    item1_name = m.group(1).strip(" ,.")
+    amount1 = parse_amount(m.group(2))
+    item2_name = m.group(3).strip(" ,.")
+    total = parse_amount(transactions[0].get("amount", 0))
+    amount2 = round(total - amount1, 2)
+    if not item1_name or not item2_name or not (0 < amount1 < total):
+        return transactions
+
+    try:
+        cats = await classify_items([item1_name, item2_name])
+    except Exception as e:
+        print(f"[Разбор чека] Не удалось классифицировать позиции: {e}")
+        return transactions
+
+    base = transactions[0]
+    parts = []
+    for name, amt, cat in ((item1_name, amount1, cats[0]), (item2_name, amount2, cats[1])):
+        tx = dict(base)
+        tx["amount"] = amt
+        tx["user_comment"] = name
+        if cat.get("category"):
+            tx["category"] = cat["category"]
+            tx["subcategory"] = cat.get("subcategory", "")
+        parts.append(tx)
+    return parts
+
+
 def _looks_like_receipt_comment(text: str) -> bool:
     """Отличает подпись к чеку ("обед", "продукты") от случайного вопроса,
     болтовни ("Как дела?") или НОВОЙ покупки ("Такси 1000") — комментарий к
-    чеку обычно короткое название без сумм, суммы сообщает сам чек."""
+    чеку обычно короткое название без сумм, суммы сообщает сам чек.
+
+    Исключение — явная просьба разбить сумму чека на две позиции
+    ("Стики 1210, остальное молоко"): там сумма нужна и это не новая
+    покупка, а инструкция к уже висящему чеку.
+    """
     t = text.strip()
     if not t:
         return False
+    if _SPLIT_COMMENT_RE.match(t):
+        return True
     if re.search(r"\d", t):
         return False
     return not _NOT_A_RECEIPT_COMMENT_RE.search(t.lower())
@@ -294,14 +345,23 @@ async def _process_text_message(message: Message, text: str):
         pending = pop_pending(pending_key)
         if pending:
             transactions, receipt_user = pending
+            original_count = len(transactions)
+            transactions = await _maybe_split_pending_comment(text, transactions)
+            was_split = len(transactions) != original_count
             lines = ["📸 **Записано по чеку:**"]
             try:
                 for tx in transactions:
-                    original_item = str(tx.get("user_comment", "") or "").strip()
-                    if original_item and original_item != text:
-                        tx["user_comment"] = f"{original_item} ({text})"
+                    if was_split:
+                        # _maybe_split_pending_comment уже поставил свой,
+                        # предметный комментарий на каждую часть — не
+                        # затираем и не дублируем его исходным текстом целиком.
+                        pass
                     else:
-                        tx["user_comment"] = text
+                        original_item = str(tx.get("user_comment", "") or "").strip()
+                        if original_item and original_item != text:
+                            tx["user_comment"] = f"{original_item} ({text})"
+                        else:
+                            tx["user_comment"] = text
                     tx["user"] = receipt_user
                     await asyncio.to_thread(append_transaction, tx)
                     lines.append(
@@ -555,6 +615,7 @@ async def _process_text_message(message: Message, text: str):
     ambig_options = parsed.get("clarification_options") or get_ambiguous_options(text)
     if (
         not is_delete_or_edit_command
+        and intent not in _INTENTS_WITH_OWN_HANDLER
         and (intent in {"need_clarification", "transaction"} or parse_amount(text) > 0)
         and _should_ask_clarification(text, parsed, ambig_options)
     ):
