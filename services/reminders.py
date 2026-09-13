@@ -15,7 +15,8 @@ import config
 
 HEADERS = [
     "reminder_id", "created_at", "target_user", "remind_at",
-    "text", "status", "recurrence", "created_by", "anchor_day", "deliveries"
+    "text", "status", "recurrence", "created_by", "anchor_day", "deliveries",
+    "until",
 ]
 
 dispatch_lock = asyncio.Lock()
@@ -149,19 +150,21 @@ def next_occurrence(prev_dt, recurrence, now=None, anchor_day=None):
 
 
 def worksheet():
-    from services.sheets import _get_or_create_worksheet
+    from services.sheets import _get_or_create_worksheet, _table_range
     ws = _get_or_create_worksheet("Reminders", HEADERS, rows=100, cols=len(HEADERS))
     existing = ws.row_values(1)
     if existing[:7] != HEADERS[:7]:
         raise RuntimeError("Лист Reminders: первые 7 колонок не совпадают с ожидаемой схемой.")
-    # Если в H:J уже что-то есть и это НЕ наши created_by/anchor_day/deliveries —
+    # Если в хвосте (H и дальше) уже что-то есть и это НЕ наши поля —
     # значит колонки заняты чужими данными, дописывать поверх них опасно.
     if len(existing) > 7 and existing[7:] != HEADERS[7:len(existing)]:
-        raise RuntimeError("Лист Reminders: в колонках H:J посторонние данные, миграция остановлена.")
+        raise RuntimeError("Лист Reminders: в дополнительных колонках посторонние данные, миграция остановлена.")
     if len(existing) < len(HEADERS):
         if ws.col_count < len(HEADERS):
             ws.resize(cols=len(HEADERS))
-        ws.update(range_name="H1:J1", values=[HEADERS[7:]])
+        # H1 — первая из "хвостовых" колонок (после первых 7 базовых).
+        tail_range = f"H1:{_table_range(len(HEADERS))[3:]}"
+        ws.update(range_name=tail_range, values=[HEADERS[7:]])
     return ws
 
 
@@ -218,23 +221,41 @@ def _soft_delete_by_id(reminder_id: str) -> dict | None:
     return None
 
 
-def _soft_delete_by_keyword(query: str) -> dict | None:
-    """Помечает напоминание как 'cancelled', не удаляя строку — чтобы
-    история осталась в таблице (в отличие от ws.delete_rows на транзакциях,
-    напоминания дешевле держать все, чем терять ID при сдвиге строк)."""
-    stop = {"удали", "удалить", "напоминание", "напоминания", "сними", "отмени", "про", "об", "о"}
-    keywords = [w for w in re.findall(r"\w+", normalize_text(query)) if w not in stop]
+def _soft_delete_by_keyword(query: str) -> list[dict]:
+    """Помечает подходящие напоминания как 'cancelled', не удаляя строки —
+    чтобы история осталась в таблице. Если в запросе есть "все"/"всё" —
+    отменяет ВСЕ совпадения, а не только первое найденное (раньше "про
+    персен удали все напоминания" отменяло по одному за раз, и приходилось
+    повторять команду N раз для N совпадений)."""
+    stop = {
+        "удали", "удалить", "напоминание", "напоминания", "сними", "отмени",
+        "про", "об", "о", "все", "всё", "их", "эти",
+    }
+    normalized = normalize_text(query)
+    bulk = bool(re.search(r"\bвс[еёя]\b", normalized))
+    keywords = [w for w in re.findall(r"\w+", normalized) if w not in stop]
+    if not keywords:
+        return []
+
     ws = worksheet()
+    matched = []
     for r in reversed(pending()):
         row_str = " ".join(str(v) for v in r.values()).lower()
-        if keywords and all(k in row_str for k in keywords):
+        if all(k in row_str for k in keywords):
             ws.update_cell(r["row_idx"], 6, "cancelled")
-            return r
-    return None
+            matched.append(r)
+            if not bulk:
+                break
+    return matched
 
 
-def add(target, when, text, recurrence="once", author="Влад", reminder_id=None):
-    """Прямое сохранение в лист Reminders без промежуточных черновиков."""
+def add(target, when, text, recurrence="once", author="Влад", reminder_id=None, until=None):
+    """Прямое сохранение в лист Reminders без промежуточных черновиков.
+
+    until — дата, после которой повторяющееся напоминание перестаёт
+    приходить (например "напоминай две недели"). Для разового
+    напоминания (recurrence="once") не используется.
+    """
     parsed = parse_flexible_datetime(when)
     if not parsed:
         raise ValueError("Не удалось распознать время напоминания.")
@@ -244,6 +265,11 @@ def add(target, when, text, recurrence="once", author="Влад", reminder_id=No
         raise ValueError("Текст напоминания не может быть пустым.")
 
     target_user = normalize_target(target, author)
+
+    until_str = ""
+    if until:
+        until_dt = parse_flexible_datetime(until)
+        until_str = until_dt.strftime("%Y-%m-%d") if until_dt else str(until)[:10]
 
     if reminder_id:
         # Идемпотентность: повторный вызов с тем же reminder_id (например,
@@ -258,21 +284,23 @@ def add(target, when, text, recurrence="once", author="Влад", reminder_id=No
 
     row = [
         rid, now_str, target_user, time_str, clean_text,
-        "pending", recurrence, author, parsed.day, "{}"
+        "pending", recurrence, author, parsed.day, "{}", until_str,
     ]
 
     ws = worksheet()
-    ws.append_row(row, table_range="A1:J1", value_input_option="RAW")
+    from services.sheets import _table_range
+    ws.append_row(row, table_range=_table_range(len(HEADERS)), value_input_option="RAW")
     return dict(zip(HEADERS, row))
 
 
 def update_by_id(reminder_id, changes):
     ws = worksheet()
-    from services.sheets import _get_all_records_safe
+    from services.sheets import _get_all_records_safe, _table_range
     for idx, r in enumerate(_get_all_records_safe(ws), 2):
         if r.get("reminder_id") == reminder_id:
             values = [changes.get(h, r.get(h, "")) for h in HEADERS]
-            ws.update(range_name=f"A{idx}:J{idx}", values=[values], value_input_option="RAW")
+            col_letter = _table_range(len(HEADERS))[3:]
+            ws.update(range_name=f"A{idx}:{col_letter}{idx}", values=[values], value_input_option="RAW")
             return True
     return False
 
@@ -286,8 +314,11 @@ def format_list(items):
         time_val = str(r.get("remind_at", ""))
         text = str(r.get("text", ""))
         rec = str(r.get("recurrence", "once"))
-        rec_str = " (ежедневно)" if rec == "daily" else (" (ежемесячно)" if rec == "monthly" else "")
-        lines.append(f"{idx}. **{target}**: {text}\n   ⏰ {time_val}{rec_str} | ID: `{r.get('reminder_id')}`")
+        rec_names = {"daily": "ежедневно", "weekly": "еженедельно", "monthly": "ежемесячно"}
+        rec_str = f" ({rec_names[rec]})" if rec in rec_names else ""
+        until = str(r.get("until") or "").strip()
+        until_str = f" до {until}" if until and rec in rec_names else ""
+        lines.append(f"{idx}. **{target}**: {text}\n   ⏰ {time_val}{rec_str}{until_str} | ID: `{r.get('reminder_id')}`")
     return "\n\n".join(lines)
 
 
@@ -302,15 +333,22 @@ async def handle(message, text, author):
     if draft:
         if t_clean in {"да", "подтверждаю", "удали", "удалить"}:
             if draft.get("ids"):
-                deleted = None
+                deleted_list = []
                 for rid in draft["ids"]:
                     d = await asyncio.to_thread(_soft_delete_by_id, rid)
-                    deleted = deleted or d
+                    if d:
+                        deleted_list.append(d)
             else:
-                deleted = await asyncio.to_thread(_soft_delete_by_keyword, draft.get("query", ""))
+                deleted_list = await asyncio.to_thread(_soft_delete_by_keyword, draft.get("query", ""))
             state.delete("reminder_delete", key)
-            if deleted:
-                await safe_answer(message, f"✅ Отменила напоминание: {deleted.get('text')} ({deleted.get('remind_at')})")
+            if deleted_list:
+                if len(deleted_list) == 1:
+                    d = deleted_list[0]
+                    await safe_answer(message, f"✅ Отменила напоминание: {d.get('text')} ({d.get('remind_at')})")
+                else:
+                    lines = [f"✅ Отменила {len(deleted_list)} напоминани(й):"]
+                    lines += [f"• {d.get('text')} ({d.get('remind_at')})" for d in deleted_list]
+                    await safe_answer(message, "\n".join(lines), parse_mode=None)
             else:
                 await safe_answer(message, "Не нашла такое напоминание в таблице.")
             return True
@@ -328,7 +366,10 @@ async def handle(message, text, author):
             saved = []
             for t_str in plan["times"]:
                 try:
-                    saved.append(await asyncio.to_thread(add, plan["target"], t_str, plan["text"], plan.get("recurrence", "once"), author))
+                    saved.append(await asyncio.to_thread(
+                        add, plan["target"], t_str, plan["text"], plan.get("recurrence", "once"), author,
+                        None, plan.get("until"),
+                    ))
                 except Exception as e:
                     logging.exception(f"[Reminder Plan Error]: {e}")
             state.delete("reminder_plan", key)
@@ -350,6 +391,7 @@ async def handle(message, text, author):
                 saved = await asyncio.to_thread(
                     add, time_draft["target"], when_dt.strftime("%Y-%m-%d %H:%M:%S"),
                     time_draft["text"], time_draft.get("recurrence", "once"), author,
+                    None, time_draft.get("until"),
                 )
                 state.delete("reminder_draft", key)
                 await safe_answer(
@@ -445,6 +487,7 @@ async def handle_model(message, parsed, author):
     times = parsed.get("reminder_times") or []
     target_raw = parsed.get("reminder_target") or author
     rec = str(parsed.get("recurrence") or "once").lower()
+    until = parsed.get("recurrence_until") or None
     clarification_q = parsed.get("clarification_question")
 
     if isinstance(times, str):
@@ -458,17 +501,18 @@ async def handle_model(message, parsed, author):
         # вместо того чтобы потерять контекст к следующему сообщению.
         if not clarification_q:
             return False
-        state.put("reminder_draft", key, {"target": target_raw, "text": text, "recurrence": rec})
+        state.put("reminder_draft", key, {"target": target_raw, "text": text, "recurrence": rec, "until": until})
         await safe_answer(message, clarification_q)
         return True
 
     if len(times) > 1:
         # Несколько времён сразу — подтверждаем, прежде чем плодить записи.
-        state.put("reminder_plan", key, {"target": target_raw, "text": text, "times": times, "recurrence": rec})
+        state.put("reminder_plan", key, {"target": target_raw, "text": text, "times": times, "recurrence": rec, "until": until})
         summary = "\n".join(f"• {t_str}" for t_str in times)
+        until_line = f"\nПовтор: {rec}, до {until}." if until and rec != "once" else (f"\nПовтор: {rec}." if rec != "once" else "")
         await safe_answer(
             message,
-            f"Поставить {len(times)} напоминания для {target_raw} «{text}»?\n{summary}\nПодтверди: да/нет.",
+            f"Поставить {len(times)} напоминания для {target_raw} «{text}»?\n{summary}{until_line}\nПодтверди: да/нет.",
             parse_mode=None,
         )
         return True
@@ -534,10 +578,12 @@ async def deliver_due(bot, now=None):
 
                 rec = str(r.get("recurrence", "once")).lower()
                 ws = worksheet()
-                if rec in {"daily", "weekly", "monthly"}:
+                until_str = str(r.get("until") or "").strip()
+                until_dt = parse_flexible_datetime(until_str) if until_str else None
+                if rec in {"daily", "weekly", "monthly"} and not (until_dt and now.date() >= until_dt.date()):
                     anchor = r.get("anchor_day")
                     next_dt = next_occurrence(when, rec, now, anchor_day=int(anchor) if anchor else None)
-                    if next_dt:
+                    if next_dt and not (until_dt and next_dt.date() > until_dt.date()):
                         ws.update_cell(r["row_idx"], 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
                     else:
                         ws.update_cell(r["row_idx"], 6, "sent")
