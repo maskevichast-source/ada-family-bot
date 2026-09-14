@@ -4,6 +4,7 @@ import json
 import os
 import re
 import threading
+import time
 from functools import wraps
 from typing import Optional
 import gspread
@@ -11,7 +12,7 @@ from gspread import utils as gspread_utils
 from oauth2client.service_account import ServiceAccountCredentials
 from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE, normalize_family_user_name
 from services.categories import TYPE_EXPENSE, TYPE_INCOME, is_income_type, SUBCATEGORIES_MAP, DEFAULT_EXPENSE_LIMITS
-from services.money import parse_amount, to_clean_number
+from services.money import parse_amount, to_clean_number, normalize_currency_code
 from services.banks import normalize_bank_source
 from services.timezone import parse_flexible_datetime, ASTANA_TZ
 
@@ -30,6 +31,28 @@ def _table_range(num_columns: int) -> str:
 
 
 _serialize_lock = threading.RLock()
+
+
+def _retry_write(fn, *args, retries: int = 3, base_delay: float = 0.6, **kwargs):
+    """Повторяет запись при ВРЕМЕННОМ сбое Google Sheets API (лимит запросов,
+    сеть моргнула) вместо того, чтобы сразу сдаться и заставить человека
+    присылать чек ещё раз. На постоянные ошибки (неверные данные и т.п.)
+    не влияет — они не gspread.exceptions.APIError с кодом 429/5xx."""
+    last_error = None
+    for attempt in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except gspread.exceptions.APIError as e:
+            last_error = e
+            status = getattr(getattr(e, "response", None), "status_code", None)
+            if status not in (429, 500, 502, 503, 504) or attempt == retries - 1:
+                raise
+        except Exception as e:
+            last_error = e
+            if attempt == retries - 1:
+                raise
+        time.sleep(base_delay * (2 ** attempt))
+    raise last_error
 
 
 def _serialized(fn):
@@ -146,8 +169,8 @@ def append_transaction(data: dict):
     if not data.get("currency"):
         data["currency"] = "KZT"
     else:
-        cur = str(data["currency"]).strip().upper()
-        if cur in {"KZT", "TENGE", "TG", "₸"}:
+        cur = normalize_currency_code(data["currency"])
+        if cur == "KZT":
             data["currency"] = "KZT"
         elif not (data.get("amount_kzt") or data.get("converted")):
             # Нельзя молча писать сумму в иностранной валюте в колонку,
@@ -191,7 +214,7 @@ def append_transaction(data: dict):
             existing = _get_all_records_safe(ws)
             if any(str(r.get("transaction_id")) == str(data["transaction_id"]) for r in existing):
                 return
-        ws.append_row(row, table_range=_table_range(len(columns)))
+        _retry_write(ws.append_row, row, table_range=_table_range(len(columns)))
     except Exception as e:
         print(f"[Транзакции] Не удалось добавить запись: {e}")
         raise
