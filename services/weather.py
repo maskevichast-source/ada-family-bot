@@ -124,30 +124,48 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _clothes_advice(temp_min: float | None, temp_max: float | None, wind: float | None) -> str:
+def _clothes_advice(temp_min: float | None, temp_max: float | None, wind: float | None, rain: float | None = None) -> str:
     if temp_max is None:
         return "Ориентируйтесь по фактической температуре за окном."
 
     parts = []
     if temp_max <= -15:
-        parts.append("Очень тёплая зимняя куртка, шапка, шарф и тёплые перчатки")
+        parts.append("очень тёплая зимняя куртка, шапка, шарф и тёплые перчатки — открытые участки кожи на таком морозе мёрзнут за минуты")
     elif temp_max <= -5:
-        parts.append("Зимняя тёплая куртка, шапка и перчатки")
+        parts.append("зимняя тёплая куртка, шапка и перчатки")
     elif temp_max <= 5:
-        parts.append("Тёплая демисезонная куртка, шапка")
+        parts.append("тёплая демисезонная куртка и шапка")
     elif temp_max <= 12:
-        parts.append("Куртка или плотная ветровка")
+        parts.append("куртка или плотная ветровка")
     elif temp_max <= 18:
-        parts.append("Худи, свитшот или лёгкая куртка")
+        parts.append("худи, свитшот или лёгкая куртка")
     elif temp_max <= 23:
-        parts.append("Лёгкая одежда (футболка/рубашка), вечером накиньте кофту")
+        parts.append("лёгкая одежда (футболка/рубашка)")
     else:
-        parts.append("Лёгкая одежда (футболка/шорты)")
+        parts.append("лёгкая одежда (футболка/шорты), в жару не забывайте воду")
 
-    if wind is not None and wind >= 30:
-        parts.append("на улице ветрено — капюшон пригодится")
+    # Разница между утренней/дневной и вечерней температурой — если она
+    # заметная, одного слоя на весь день не хватит.
+    if temp_min is not None:
+        swing = temp_max - temp_min
+        if swing >= 10:
+            parts.append("днём и вечером температура заметно разная — возьмите с собой лёгкую кофту или толстовку про запас")
 
-    return ", ".join(parts) + "."
+    if wind is not None:
+        if wind >= 50:
+            parts.append("сильный, почти штормовой ветер — капюшон и что-то прилегающее, не парусящее")
+        elif wind >= 30:
+            parts.append("ветрено — пригодится капюшон или шапка, чтобы не сдувало")
+        elif wind >= 20:
+            parts.append("лёгкий ветер — не помешает что-то, прикрывающее шею")
+
+    if rain is not None and rain >= 60:
+        parts.append("осадки почти наверняка — непромокаемая куртка или дождевик будут не лишними, зонта может не хватить при таком ветре")
+    elif rain is not None and rain >= 20:
+        parts.append("вероятны осадки — возьмите что-то непромокаемое сверху")
+
+    result = ", ".join(parts) + "."
+    return result[0].upper() + result[1:] if result else result
 
 
 def _day_title(dt: datetime.date, today: datetime.date) -> str:
@@ -257,9 +275,9 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
     min_t = min(temps) if temps else None
     max_t = max(temps) if temps else None
     max_wind = max(winds) if winds else None
-    lines.append(f"👕 Что надеть: {_clothes_advice(min_t, max_t, max_wind)}")
-
     max_rain = max(rains) if rains else 0
+    lines.append(f"👕 Что надеть: {_clothes_advice(min_t, max_t, max_wind, max_rain)}")
+
     if max_rain > 20:
         lines.append(f"☂️ Зонт: лучше взять с собой (вероятность осадков {max_rain}%).")
 
