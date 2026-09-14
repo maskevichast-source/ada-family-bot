@@ -16,7 +16,35 @@ HELP = (
     "Сумма — в KZT."
 )
 
-HEADERS = ["goal_id", "date_created", "name", "target_amount", "current_amount", "deadline", "status"]
+_MONTHS_RU = {
+    "января": 1, "февраля": 2, "марта": 3, "апреля": 4, "мая": 5, "июня": 6,
+    "июля": 7, "августа": 8, "сентября": 9, "октября": 10, "ноября": 11, "декабря": 12,
+}
+
+
+def parse_ru_deadline(text: str, base_now=None) -> str:
+    """"1 июля" / "до 1 июля" / "1 июля 2027" -> "YYYY-MM-DD". Если год не
+    назвали — берём текущий, а если такая дата в этом году уже прошла —
+    следующий (иначе "накопи к 1 июля" в декабре означало бы дедлайн
+    полгода назад)."""
+    t = str(text or "").strip().lower().replace("ё", "е")
+    m = re.search(r"\b(\d{1,2})\s+([а-я]+)(?:\s+(\d{4}))?\b", t)
+    if not m:
+        return ""
+    day = int(m.group(1))
+    month = _MONTHS_RU.get(m.group(2))
+    if not month:
+        return ""
+    now = base_now or now_astana()
+    year = int(m.group(3)) if m.group(3) else now.year
+    try:
+        import datetime as _dt
+        dt = _dt.date(year, month, day)
+    except ValueError:
+        return ""
+    if not m.group(3) and dt < now.date():
+        dt = dt.replace(year=year + 1)
+    return dt.strftime("%Y-%m-%d")
 
 
 def _format_currency(value):
@@ -48,7 +76,10 @@ def add_goal(name: str, target_amount: float, deadline: str = ""):
     deadline_str = ""
     if deadline:
         deadline_dt = parse_flexible_datetime(deadline)
-        deadline_str = deadline_dt.strftime("%Y-%m-%d") if deadline_dt else str(deadline).strip()[:10]
+        if deadline_dt:
+            deadline_str = deadline_dt.strftime("%Y-%m-%d")
+        else:
+            deadline_str = parse_ru_deadline(deadline) or str(deadline).strip()[:10]
 
     ws = _worksheet()
     now = now_astana()
