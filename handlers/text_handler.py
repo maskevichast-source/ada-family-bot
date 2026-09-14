@@ -16,7 +16,7 @@ from services.categories import (
     validate_transaction_category_subcategory,
     get_ambiguous_options,
 )
-from services.money import parse_amount
+from services.money import parse_amount, normalize_currency_code
 from services.banks import normalize_bank_source
 from services.deepseek_service import parse_and_analyze, classify_items
 from services.sheets import (
@@ -748,7 +748,7 @@ async def _process_text_message(message: Message, text: str):
 
         if not tx.get("bank"): tx["bank"] = "Не указан"
         if not tx.get("currency"): tx["currency"] = "KZT"
-        cur = str(tx.get("currency") or "KZT").strip().upper()
+        cur = normalize_currency_code(tx.get("currency"))
         if cur and cur != "KZT":
             converted = await fx.convert_to_kzt(tx.get("amount", 0), cur)
             if converted:
