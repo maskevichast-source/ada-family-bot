@@ -10,6 +10,7 @@ from services.pending_receipts import set_pending, ack_pending
 from services.state import dialogue_key
 from services.memory import get_chat_history, add_chat_message
 from services import fx, goals
+from services.money import normalize_currency_code
 from config import get_authorized_user_name
 from services.categories import (
     TYPE_EXPENSE, TYPE_INCOME, is_income_type,
@@ -136,7 +137,7 @@ async def handle_media(message: Message):
     # а не просим сначала сконвертировать вручную (это и есть тот самый
     # "не понимает другую валюту", который просили починить).
     for tx in transactions:
-        cur = str(tx.get("currency") or "KZT").strip().upper()
+        cur = normalize_currency_code(tx.get("currency"))
         if cur and cur != "KZT":
             converted = await fx.convert_to_kzt(tx.get("amount", 0), cur)
             if converted:
