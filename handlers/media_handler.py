@@ -4,7 +4,10 @@ import asyncio
 
 from aiogram.types import Message
 from services.vision import parse_receipt
-from services.sheets import append_transaction, normalize_necessity, get_last_200_transactions
+from services.sheets import (
+    append_transaction, normalize_necessity, get_last_200_transactions,
+    add_trip_plan, get_planned_trips, add_or_update_subscription,
+)
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending, ack_pending
 from services.state import dialogue_key
@@ -60,6 +63,53 @@ def _build_recent_context(chat_id: int) -> str:
     except Exception:
         pass
     return "\n".join(lines[-10:])
+
+
+async def _apply_hints(result: dict, transactions: list[dict]) -> str:
+    """Если распознавание чека увидело явный признак билета на поездку между
+    городами или регулярной подписки — заводит/дополняет Trips/Subscriptions
+    сам, без отдельной команды. Возвращает строку-приписку к ответу (или "")."""
+    notes = []
+
+    trip_hint = result.get("trip_hint")
+    if trip_hint and trip_hint.get("destination"):
+        dest = str(trip_hint["destination"]).strip()
+        try:
+            existing = await asyncio.to_thread(get_planned_trips)
+        except Exception:
+            existing = []
+        match = next((t for t in existing if dest.lower() in str(t.get("destination", "")).lower()), None)
+        if match:
+            notes.append(f"🧳 Похоже, это по поездке в {match.get('destination')} — уже есть в «Поездках».")
+        else:
+            try:
+                amount = transactions[0].get("amount", 0) if transactions else 0
+                await asyncio.to_thread(
+                    add_trip_plan, dest, trip_hint.get("dates", ""), 0,
+                    f"Заведено автоматически по билету ({trip_hint.get('note', '')})",
+                )
+                notes.append(
+                    f"🧳 Похоже на поездку в {dest} — завела черновик в «Поездках» "
+                    f"(бюджет не указан, поправь командой при необходимости)."
+                )
+            except Exception as e:
+                print(f"[Билет->Поездка] Не удалось завести поездку: {e}")
+
+    sub_hint = result.get("subscription_hint")
+    if sub_hint and sub_hint.get("name") and transactions:
+        try:
+            day = int(sub_hint.get("day_of_month") or 1)
+            amount = transactions[0].get("amount", 0)
+            bank = transactions[0].get("bank", "Не указан")
+            await asyncio.to_thread(add_or_update_subscription, sub_hint["name"], amount, bank, day)
+            notes.append(
+                f"🔁 Похоже на регулярную подписку «{sub_hint['name']}» — добавила в «Подписки», "
+                f"буду напоминать о списании и предупреждать заранее."
+            )
+        except Exception as e:
+            print(f"[Чек->Подписка] Не удалось завести подписку: {e}")
+
+    return "\n".join(notes)
 
 
 def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> str:
@@ -224,6 +274,9 @@ async def handle_media(message: Message):
         # он больше не актуален.
         ack_pending(pending_key)
         report = _format_receipt_report(validated_transactions, reply)
+        extra_note = await _apply_hints(result, validated_transactions)
+        if extra_note:
+            report += f"\n\n{extra_note}"
         await safe_answer(message, report)
         return
 
