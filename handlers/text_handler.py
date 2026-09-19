@@ -594,6 +594,39 @@ async def _process_text_message(message: Message, text: str):
     intent = parsed.get("intent", "chat")
     reply = parsed.get("reply", "")
 
+    # Побочное, попутное намерение в том же сообщении ("купил хлеб за 500,
+    # напомни завтра купить молоко") — раньше терялось совсем, потому что
+    # обрабатывался только один intent на сообщение. Не подменяет основной
+    # разбор, просто дополнительно выполняет то, что явно попросили попутно.
+    sec_reminder = parsed.get("secondary_reminder")
+    if sec_reminder and sec_reminder.get("text"):
+        try:
+            sec_time = sec_reminder.get("time")
+            if sec_time:
+                saved = await asyncio.to_thread(
+                    reminders.add, sec_reminder.get("target", user_name), sec_time,
+                    sec_reminder["text"], sec_reminder.get("recurrence", "once"), user_name,
+                )
+                await safe_answer(message, f"⏰ Заодно поставила напоминание: {saved['text']} на {saved['remind_at']}.")
+            else:
+                key = dialogue_key(chat_id, message.from_user.id)
+                from services import state as _state
+                _state.put("reminder_draft", key, {
+                    "target": sec_reminder.get("target", user_name),
+                    "text": sec_reminder["text"], "recurrence": sec_reminder.get("recurrence", "once"),
+                })
+                await safe_answer(message, f"⏰ Заодно запомнила напоминание «{sec_reminder['text']}» — во сколько поставить?")
+        except Exception as e:
+            print(f"[Побочное напоминание] Ошибка: {e}")
+
+    sec_item = parsed.get("secondary_shopping_item")
+    if sec_item:
+        try:
+            await asyncio.to_thread(add_shopping_items, [str(sec_item)], user_name)
+            await safe_answer(message, f"🛒 Заодно добавила в список покупок: {sec_item}.")
+        except Exception as e:
+            print(f"[Побочный список покупок] Ошибка: {e}")
+
     # Блокировка кнопок при командах удаления
     is_delete_or_edit_command = any(k in t_clean for k in ["удали", "удалить", "поменяй", "измени", "исправь", "замени", "отмени"])
     # Намерения, для которых ниже есть свой собственный обработчик — слово
