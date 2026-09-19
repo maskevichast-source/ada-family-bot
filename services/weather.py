@@ -257,6 +257,7 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
         if idx is None:
             continue
         temp = _num(hourly["temperature_2m"][idx])
+        feels = _num(hourly["apparent_temperature"][idx])
         rain = hourly["precipitation_probability"][idx]
         wind = _num(hourly["wind_speed_10m"][idx])
         code = hourly["weather_code"][idx]
@@ -269,7 +270,19 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
         if wind is not None:
             winds.append(wind)
 
-        lines.append(f"• {h:02d}:00 ➔ {_format_temp(temp)} {emoji}")
+        line = f"• {h:02d}:00 ➔ {_format_temp(temp)} {emoji}"
+        # Разница между "будет" и "как ощущается" бывает существенной (ветер,
+        # влажность) — показываем прямо на строке часа, а не только для "сейчас".
+        if feels is not None and temp is not None and abs(feels - temp) >= 2:
+            line += f", ощущается как {_format_temp(feels)}"
+        extras = []
+        if wind is not None and wind >= 30:
+            extras.append(f"ветер {wind:.0f} км/ч")
+        if rain is not None and rain >= 40:
+            extras.append(f"осадки {rain}%")
+        if extras:
+            line += f" ({', '.join(extras)})"
+        lines.append(line)
 
     lines.append("")
     min_t = min(temps) if temps else None
