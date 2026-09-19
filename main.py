@@ -22,7 +22,7 @@ from services.sheets import (
     ensure_power_bi_dimension_table, process_due_subscriptions,
     normalize_existing_family_table_values, get_subscription_warnings,
     mark_subscription_warning_sent, get_transactions_for_period,
-    save_category_limits,
+    save_category_limits, get_category_limits,
 )
 from services.categories import FALLBACK_EXPENSE_CATEGORY, TYPE_INCOME, is_income_type
 from services.telegram_safe import safe_answer, safe_send_message
@@ -36,7 +36,7 @@ from services.analytics import analyze_budget_leaks
 from services.limits_ai import generate_limits_from_history
 from services.timezone import now_astana
 from services.reminders import deliver_due
-from services import preflight, state
+from services import preflight, state, debts
 
 if DefaultBotProperties:
     bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
@@ -250,6 +250,89 @@ async def check_reminders():
         await asyncio.sleep(60)
 
 
+async def check_debt_reminders():
+    """Предупреждение о приближающемся/просроченном сроке долга — по тому
+    же принципу, что и предупреждения о подписках выше, только раз в день
+    (у долга нет смысла проверять каждый час)."""
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            if now.hour == 10 and now.minute < 5:
+                today_str = now.strftime("%Y-%m-%d")
+                due_list = await asyncio.to_thread(debts.get_debts_due_soon, 3)
+                for d in due_list:
+                    debt_id = d.get("debt_id", "")
+                    marker_key = f"debt_due:{debt_id}:{today_str}"
+                    if state.get("scheduler", marker_key):
+                        continue
+                    state.put("scheduler", marker_key, {"warned_at": now.isoformat()})
+                    days_left = d.get("days_left", 0)
+                    direction = "нам должны" if d.get("direction") == "lent" else "мы должны"
+                    when_txt = "уже просрочен" if days_left < 0 else (
+                        "сегодня срок" if days_left == 0 else f"через {days_left} дн."
+                    )
+                    await safe_send_message(
+                        bot, chat_id=FAMILY_CHAT_ID,
+                        text=(
+                            f"⏳ Долг ({direction}, {d.get('counterparty')}): "
+                            f"{_format_currency(d.get('balance'))} тг — срок {when_txt} "
+                            f"({d.get('due_date')})."
+                        ),
+                    )
+        except Exception as e:
+            print(f"[Долги] Ошибка цикла напоминаний: {e}")
+        await asyncio.sleep(60)
+
+
+async def check_limit_warnings():
+    """Раз в день предупреждает, если по категории расходов почти выбран
+    месячный лимит — не только постфактум по факту превышения (это уже
+    видно в отчётах), а заранее, пока ещё можно притормозить."""
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            if now.hour == 19 and now.minute < 5:
+                month_key = now.strftime("%Y-%m")
+                limits = await asyncio.to_thread(get_category_limits)
+                if limits:
+                    start = now.replace(day=1).strftime("%Y-%m-%d")
+                    end = now.strftime("%Y-%m-%d")
+                    txs = await asyncio.to_thread(get_transactions_for_period, start, end)
+                    spent = {}
+                    for t in txs:
+                        if is_income_type(t.get("type")):
+                            continue
+                        cat = str(t.get("cat") or "")
+                        spent[cat] = spent.get(cat, 0.0) + float(t.get("amt") or 0)
+
+                    for cat, limit in limits.items():
+                        limit = float(limit or 0)
+                        if limit <= 0:
+                            continue
+                        amount_spent = spent.get(cat, 0.0)
+                        pct = amount_spent / limit
+                        if pct < 0.85:
+                            continue
+                        marker_key = f"limit_warning:{cat}:{month_key}"
+                        if state.get("scheduler", marker_key):
+                            continue
+                        state.put("scheduler", marker_key, {"warned_at": now.isoformat(), "pct": pct})
+                        if pct >= 1:
+                            status = f"лимит превышен на {_format_currency(amount_spent - limit)} тг"
+                        else:
+                            status = f"осталось {_format_currency(limit - amount_spent)} тг до конца месяца"
+                        await safe_send_message(
+                            bot, chat_id=FAMILY_CHAT_ID,
+                            text=(
+                                f"📊 Лимит по категории «{cat}»: потрачено {_format_currency(amount_spent)} "
+                                f"из {_format_currency(limit)} тг ({status})."
+                            ),
+                        )
+        except Exception as e:
+            print(f"[Лимиты] Ошибка цикла предупреждений: {e}")
+        await asyncio.sleep(60)
+
+
 async def check_subscriptions():
     while True:
         try:
@@ -371,7 +454,7 @@ def _month_range(year: int, month: int) -> tuple[str, str]:
     return start, end
 
 
-def _period_summary_text(title: str, start: str, end: str) -> str:
+def _period_summary_text(title: str, start: str, end: str, compare_start: str = None, compare_end: str = None) -> str:
     txs = get_transactions_for_period(start, end)
     income = 0.0
     expense = 0.0
@@ -389,6 +472,18 @@ def _period_summary_text(title: str, start: str, end: str) -> str:
     lines.append(f"💰 Доходы: {_format_currency(income)} тг")
     lines.append(f"💸 Расходы: {_format_currency(expense)} тг")
     lines.append(f"📈 Баланс: {_format_currency(income - expense)} тг")
+
+    if compare_start and compare_end:
+        prev_txs = get_transactions_for_period(compare_start, compare_end)
+        prev_expense = sum(float(t.get("amt") or 0) for t in prev_txs if not is_income_type(t.get("type")))
+        if prev_expense > 0:
+            diff_pct = (expense - prev_expense) / prev_expense * 100
+            if abs(diff_pct) >= 1:
+                word = "больше" if diff_pct > 0 else "меньше"
+                lines.append(f"📐 Расходы на {abs(diff_pct):.0f}% {word}, чем за предыдущий период ({_format_currency(prev_expense)} тг).")
+            else:
+                lines.append("📐 Расходы примерно на уровне предыдущего периода.")
+
     if by_cat:
         top = sorted(by_cat.items(), key=lambda x: -x[1])[:5]
         lines.append("\nТоп категорий:")
@@ -398,34 +493,48 @@ def _period_summary_text(title: str, start: str, end: str) -> str:
 
 
 async def finance_report_scheduler():
-    """Еженедельный и месячный автоотчёт в семейный чат."""
-    sent_weekly = None
-    sent_monthly = None
+    """Еженедельный и месячный автоотчёт в семейный чат.
+
+    Маркеры "уже отправлено" — в state.py (переживают перезапуск), как и у
+    остальных шедулеров; раньше здесь были локальные переменные, которые
+    обнулялись при каждом деплое и рисковали задвоить отчёт."""
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             today = now.date().isoformat()
 
-            # Еженедельный дайджест — по понедельникам в 09:10 за последние 7 дней.
-            if now.weekday() == 0 and now.hour == 9 and now.minute >= 10 and sent_weekly != today:
-                start_dt = (now.date() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
-                end_dt = now.date().strftime("%Y-%m-%d")
-                text = await asyncio.to_thread(_period_summary_text, "Еженедельный финансовый дайджест", start_dt, end_dt)
-                await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
-                sent_weekly = today
+            # Еженедельный дайджест — по понедельникам в 09:10 за последние 7 дней,
+            # со сравнением с предыдущей неделей.
+            if now.weekday() == 0 and now.hour == 9 and now.minute >= 10:
+                marker_key = f"weekly_report:{today}"
+                if not state.get("scheduler", marker_key):
+                    state.put("scheduler", marker_key, {"sent_at": now.isoformat()})
+                    start_dt = (now.date() - datetime.timedelta(days=7)).strftime("%Y-%m-%d")
+                    end_dt = now.date().strftime("%Y-%m-%d")
+                    cmp_start = (now.date() - datetime.timedelta(days=14)).strftime("%Y-%m-%d")
+                    cmp_end = start_dt
+                    text = await asyncio.to_thread(
+                        _period_summary_text, "Еженедельный финансовый дайджест",
+                        start_dt, end_dt, cmp_start, cmp_end,
+                    )
+                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
 
-            # Месячный дайджест — 1-го числа в 09:15 за прошлый месяц.
-            if now.day == 1 and now.hour == 9 and now.minute >= 15 and sent_monthly != today:
-                prev_month_last_day = now.date().replace(day=1) - datetime.timedelta(days=1)
-                start_dt, end_dt = _month_range(prev_month_last_day.year, prev_month_last_day.month)
-                text = await asyncio.to_thread(
-                    _period_summary_text,
-                    f"Месячный отчёт за {prev_month_last_day.strftime('%m.%Y')}",
-                    start_dt,
-                    end_dt,
-                )
-                await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
-                sent_monthly = today
+            # Месячный дайджест — 1-го числа в 09:15 за прошлый месяц, со
+            # сравнением с позапрошлым.
+            if now.day == 1 and now.hour == 9 and now.minute >= 15:
+                marker_key = f"monthly_report:{today}"
+                if not state.get("scheduler", marker_key):
+                    state.put("scheduler", marker_key, {"sent_at": now.isoformat()})
+                    prev_month_last_day = now.date().replace(day=1) - datetime.timedelta(days=1)
+                    start_dt, end_dt = _month_range(prev_month_last_day.year, prev_month_last_day.month)
+                    prev2 = prev_month_last_day.replace(day=1) - datetime.timedelta(days=1)
+                    cmp_start, cmp_end = _month_range(prev2.year, prev2.month)
+                    text = await asyncio.to_thread(
+                        _period_summary_text,
+                        f"Месячный отчёт за {prev_month_last_day.strftime('%m.%Y')}",
+                        start_dt, end_dt, cmp_start, cmp_end,
+                    )
+                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
         except Exception as e:
             print(f"[Автоотчёты] Ошибка: {e}")
         await asyncio.sleep(60)
@@ -468,6 +577,8 @@ async def main():
 
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
+    asyncio.create_task(check_debt_reminders())
+    asyncio.create_task(check_limit_warnings())
     asyncio.create_task(weather_scheduler())
     asyncio.create_task(finance_report_scheduler())
     asyncio.create_task(monthly_limits_scheduler())
