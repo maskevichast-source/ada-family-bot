@@ -75,6 +75,27 @@ def record(payload, event_id):
     worksheet().append_row([p.get(h, "") for h in HEADERS], table_range="A1:K1", value_input_option="RAW")
     return p
 
+def get_debts_due_soon(days_ahead: int = 3):
+    """Непогашенные долги, у которых срок наступает в течение `days_ahead`
+    дней (включая уже просроченные — days_left будет отрицательным)."""
+    from services.timezone import now_astana, parse_flexible_datetime
+    now = now_astana().date()
+    due = []
+    for b in balances():
+        if b.get("balance", 0) <= 0:
+            continue
+        due_date_str = str(b.get("due_date") or "").strip()
+        if not due_date_str:
+            continue
+        due_dt = parse_flexible_datetime(due_date_str)
+        if not due_dt:
+            continue
+        days_left = (due_dt.date() - now).days
+        if days_left <= days_ahead:
+            due.append({**b, "days_left": days_left})
+    return due
+
+
 def person_key(name):
     s = re.sub(r"[^а-яa-z]", "", name.lower().replace("ё", "е"))
     aliases = {"саше": "саша", "саши": "саша", "сашей": "саша",
