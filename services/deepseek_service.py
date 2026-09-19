@@ -82,6 +82,18 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 - "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "add_goal" | "deposit_goal" | "get_goals" | "chat"
 - "reply": "короткий живой ответ на русском"
 
+ВТОРОЕ, ПОПУТНОЕ НАМЕРЕНИЕ В ТОМ ЖЕ СООБЩЕНИИ (важно!):
+Если В ОДНОМ сообщении, кроме основного intent, ЕЩЁ отдельно и явно просят
+поставить напоминание или добавить товар в список покупок — например
+"Купил хлеб за 500, напомни завтра купить молоко" (основное — transaction,
+но есть ещё отдельная просьба про напоминание) — заполни ДОПОЛНИТЕЛЬНО:
+- "secondary_reminder": {{"target": "Влад"|"Диана"|"Семья", "text": "...",
+  "time": "YYYY-MM-DD HH:MM:SS" или null если время не назвали, "recurrence": "once"}}
+  или null, если такой отдельной просьбы нет.
+- "secondary_shopping_item": "название товара" или null, если такой просьбы нет.
+Не путай это с основным intent — используй, только когда в сообщении явно
+ДВЕ разные просьбы, а не одна.
+
 Для transaction:
 - "transaction": {{
   "type": "РАСХОД" или "ДОХОД",
