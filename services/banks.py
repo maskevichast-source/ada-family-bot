@@ -14,6 +14,8 @@ BANK_ALIASES_PROMPT = """СЛОВАРЬ БАНКОВ (Казахстан) — с
 - Forte → bank: "Forte", source: "Forte Card"
 - Halyk, Народный → bank: "Halyk", source: "Halyk Card"
 - Freedom, FFIN → bank: "Freedom", source: "Freedom Card"
+- Ozen, Özen, Home Credit, HCB, Хоум Кредит → bank: "Home Credit", source: "Ozen", funds_type: "Рассрочка"
+  (карта рассрочки Home Credit Bank — на чеке обычно видно "Home Credit OZEN" или просто "OZEN")
 - Если банк не указан или не распознан → bank: "Не указан", source: "Основная карта"
 - Если оплата наличными → resource: "Наличные", bank: "Не указан", source: "Основная карта"
   (НИКОГДА не пиши "Наличные" в поле bank — это resource, а не bank!)"""
@@ -28,10 +30,11 @@ KNOWN_SOURCES_BY_BANK = {
     "forte": "Forte Card",
     "halyk": "Halyk Card",
     "freedom": "Freedom Card",
+    "home credit": "Ozen",
 }
 # Отдельные источники, которые сами по себе валидны и НЕ должны заменяться
 # (например Kaspi Red — рассрочка, это не то же самое, что обычный Kaspi Gold).
-VALID_SOURCES_LOWER = {"bcc pay", "kaspi gold", "kaspi red", "forte card", "halyk card", "freedom card", "основная карта"}
+VALID_SOURCES_LOWER = {"bcc pay", "kaspi gold", "kaspi red", "forte card", "halyk card", "freedom card", "ozen", "основная карта"}
 
 
 BANK_NAME_ALIASES = {
@@ -41,6 +44,8 @@ BANK_NAME_ALIASES = {
     "forte": "Forte", "форте": "Forte",
     "halyk": "Halyk", "халык": "Halyk", "народный": "Halyk", "халик": "Halyk",
     "freedom": "Freedom", "фридом": "Freedom", "ffin": "Freedom",
+    "ozen": "Home Credit", "özen": "Home Credit", "озен": "Home Credit",
+    "home credit": "Home Credit", "хоум кредит": "Home Credit", "hcb": "Home Credit",
     "нал": "Наличные", "наличные": "Наличные", "cash": "Наличные",
 }
 
