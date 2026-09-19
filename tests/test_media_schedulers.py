@@ -151,10 +151,10 @@ def test_weekly_summary_and_monthly_limits(app,monkeypatch):
     calls=[]
     monkeypatch.setattr(app,"_period_summary_text",lambda *args: calls.append(args) or "Отчет")
     tick(app.finance_report_scheduler)
-    assert calls[0][1:] == ("2026-08-31","2026-09-07")
+    assert calls[0][1:] == ("2026-08-31","2026-09-07","2026-08-24","2026-08-31")
     frozen(monkeypatch,app,when.replace(day=1,minute=25))
     tick(app.finance_report_scheduler)
-    assert calls[-1][1:]==("2026-08-01","2026-09-01")
+    assert calls[-1][1:]==("2026-08-01","2026-09-01","2026-07-01","2026-08-01")
     gen=AsyncMock(return_value={"Транспорт":1000})
     monkeypatch.setattr(app,"generate_limits_from_history",gen)
     monkeypatch.setenv("AUTO_GENERATE_LIMITS","true")
