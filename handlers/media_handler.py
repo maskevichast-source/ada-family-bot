@@ -7,6 +7,7 @@ from services.vision import parse_receipt
 from services.sheets import (
     append_transaction, normalize_necessity, get_last_200_transactions,
     add_trip_plan, get_planned_trips, add_or_update_subscription,
+    count_recent_category_purchases,
 )
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending, ack_pending
@@ -21,6 +22,7 @@ from services.categories import (
     FALLBACK_EXPENSE_CATEGORY, FALLBACK_INCOME_CATEGORY,
     normalize_category, normalize_subcategory,
     validate_transaction_category_subcategory,
+    HARMFUL_CATEGORY,
 )
 from services.banks import normalize_bank_source
 import re
@@ -39,7 +41,7 @@ _GOAL_DEPOSIT_CAPTION_RE = re.compile(
 )
 
 
-def _build_recent_context(chat_id: int) -> str:
+def _build_recent_context(chat_id: int, user_name: str = "") -> str:
     """Несколько последних трат и сообщений чата — чтобы комментарий к
     новому чеку мог естественно связать его с тем, что уже происходит
     (например, переезд, начатый вчера/сегодня), а не был "слепым" к
@@ -49,9 +51,25 @@ def _build_recent_context(chat_id: int) -> str:
     try:
         recent_tx = get_last_200_transactions()[-6:]
         for t in recent_tx:
-            comm = str(t.get("user_comment") or "").strip()
-            if comm:
-                lines.append(f"- трата: {t.get('category', '')} — {comm}")
+            # Поля здесь "cat"/"comm" (см. get_last_200_transactions), а не
+            # "category"/"user_comment" — раньше тут было несовпадение имён
+            # и эта часть контекста фактически никогда не собиралась.
+            cat = str(t.get("cat") or "").strip()
+            comm = str(t.get("comm") or "").strip()
+            if cat or comm:
+                lines.append(f"- трата: {cat} — {comm}" if comm else f"- трата: {cat}")
+    except Exception:
+        pass
+    try:
+        harmful_count = count_recent_category_purchases(user_name, HARMFUL_CATEGORY, days=7)
+        if harmful_count >= 2:
+            lines.append(
+                f"- ФАКТ (посчитано кодом, не выдумано): за последние 7 дней у "
+                f"{user_name or 'этого человека'} уже было {harmful_count} покупок(и) "
+                f"из категории «{HARMFUL_CATEGORY}» (сигареты/энергетики/алкоголь), "
+                f"не считая сегодняшней, если она из этой же категории — учти это "
+                f"в комментарии по правилам из раздела КОММЕНТАРИИ ниже."
+            )
     except Exception:
         pass
     try:
@@ -150,7 +168,7 @@ async def handle_media(message: Message):
         await safe_answer(message, "Не распознала формат файла. Пришли фото или PDF.")
         return
 
-    result = await parse_receipt(file_bytes, filename, caption, user_name, _build_recent_context(chat_id))
+    result = await parse_receipt(file_bytes, filename, caption, user_name, _build_recent_context(chat_id, user_name))
     transactions = result.get("transactions", [])
     reply = result.get("reply", "")
 

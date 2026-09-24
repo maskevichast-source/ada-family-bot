@@ -305,6 +305,34 @@ def get_last_200_transactions():
         return []
 
 
+def count_recent_category_purchases(user_name: str, category: str, days: int = 7) -> int:
+    """Считает покупки в заданной категории у конкретного человека за
+    последние `days` дней — твёрдый факт для комментариев ИИ (посчитан
+    кодом, а не угадан моделью по обрывочному списку истории). Используется,
+    чтобы комментарий к повторным покупкам сигарет/энергетиков/алкоголя не
+    был слепым к тому, что это уже третий-четвёртый раз за неделю."""
+    if not user_name or not category:
+        return 0
+    count = 0
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+    try:
+        for t in get_last_200_transactions():
+            if t.get("cat") != category:
+                continue
+            if str(t.get("user") or "").strip() != user_name:
+                continue
+            date_str = str(t.get("date") or "")[:19]
+            try:
+                dt = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                continue
+            if dt >= cutoff:
+                count += 1
+    except Exception:
+        pass
+    return count
+
+
 def get_transactions_for_period(start_date: str, end_date: str) -> list[dict]:
     try:
         ws = get_db().worksheet("Transactions")

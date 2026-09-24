@@ -3,6 +3,11 @@
 TYPE_EXPENSE = "РАСХОД"
 TYPE_INCOME = "ДОХОД"
 
+# Категория, для которой комментарии Ады не должны быть автоматически
+# одобрительными (сигареты/энергетики/алкоголь) — см. count_recent_category_purchases
+# в services/sheets.py и КОММЕНТАРИИ в vision.py / deepseek_service.py.
+HARMFUL_CATEGORY = "Алкоголь, табак и энергетики"
+
 
 def is_income_type(raw_type: object) -> bool:
     """Универсальная проверка дохода вне зависимости от регистра и языка."""
