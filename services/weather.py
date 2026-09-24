@@ -2,12 +2,18 @@
 
 import asyncio
 import datetime
+import os
 import urllib.parse
 import urllib.request
 from services.timezone import ASTANA_TZ
 
 ASTANA_LATITUDE = 51.169392
 ASTANA_LONGITUDE = 71.449074
+
+# Резервный источник на случай, если Open-Meteo целиком недоступен (сеть,
+# авария, лимиты). Ключ живёт только в переменных окружения Railway —
+# никогда не хардкодить его в код и не коммитить в репозиторий.
+OPENWEATHERMAP_API_KEY = os.environ.get("OPENWEATHERMAP_API_KEY", "").strip()
 
 WEATHER_DESCRIPTIONS = {
     0: "ясно",
@@ -464,10 +470,226 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
     return "\n".join(lines)
 
 
+# --- Резервный источник: OpenWeatherMap -----------------------------------
+# Независимая от Open-Meteo инфраструктура — используется только если
+# Open-Meteo целиком недоступен. У OWM своя система кодов погоды (не WMO),
+# поэтому классификация ясно/дождь/снег переведена отдельно.
+
+def _owm_describe(owm_id: object) -> str:
+    c = _code_int(owm_id)
+    if c is None:
+        return "переменная облачность"
+    if 200 <= c < 300:
+        return "гроза"
+    if 300 <= c < 400:
+        return "морось"
+    if 500 <= c < 600:
+        return "дождь" if c < 520 else "ливень"
+    if 600 <= c < 700:
+        return "снег"
+    if 700 <= c < 800:
+        return "туман/дымка"
+    if c == 800:
+        return "ясно"
+    if 801 <= c <= 802:
+        return "облачно с прояснениями"
+    if c in (803, 804):
+        return "пасмурно"
+    return "переменная облачность"
+
+
+def _owm_emoji(owm_id: object) -> str:
+    c = _code_int(owm_id)
+    if c is None:
+        return "⛅"
+    if 200 <= c < 300:
+        return "⛈"
+    if 300 <= c < 400:
+        return "🌦"
+    if 500 <= c < 600:
+        return "🌧"
+    if 600 <= c < 700:
+        return "🌨"
+    if 700 <= c < 800:
+        return "🌫"
+    if c == 800:
+        return "☀️"
+    if 801 <= c <= 802:
+        return "⛅"
+    return "☁️"
+
+
+def _owm_is_snow(owm_id: object) -> bool:
+    c = _code_int(owm_id)
+    return c is not None and 600 <= c < 700
+
+
+def _owm_is_rain(owm_id: object) -> bool:
+    c = _code_int(owm_id)
+    return c is not None and (200 <= c < 600)
+
+
+def _request_openweathermap_current(lat: float, lon: float, api_key: str) -> dict:
+    params = urllib.parse.urlencode({"lat": lat, "lon": lon, "appid": api_key, "units": "metric", "lang": "ru"})
+    url = f"https://api.openweathermap.org/data/2.5/weather?{params}"
+    with urllib.request.urlopen(url, timeout=12) as response:
+        import json
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _request_openweathermap_forecast(lat: float, lon: float, api_key: str) -> dict:
+    """3-часовые блоки на 5 дней вперёд — бесплатный тариф OWM."""
+    params = urllib.parse.urlencode({"lat": lat, "lon": lon, "appid": api_key, "units": "metric", "lang": "ru"})
+    url = f"https://api.openweathermap.org/data/2.5/forecast?{params}"
+    with urllib.request.urlopen(url, timeout=12) as response:
+        import json
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _nearest_owm_block(blocks: list, target_dt: datetime.datetime) -> dict | None:
+    best = None
+    best_diff = None
+    for block in blocks:
+        dt_txt = block.get("dt_txt")
+        try:
+            block_dt = datetime.datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S")
+        except (TypeError, ValueError):
+            continue
+        diff = abs((block_dt - target_dt).total_seconds())
+        if best_diff is None or diff < best_diff:
+            best, best_diff = block, diff
+    return best
+
+
+def format_owm_forecast(
+    current: dict,
+    forecast: dict,
+    target: str = "today",
+    now: datetime.datetime | None = None,
+    days: int = 1,
+) -> str:
+    """Форматирование ответа OpenWeatherMap — только когда Open-Meteo
+    недоступен целиком. Своя, более простая версия format_forecast: у OWM
+    нет мульти-модельного консенсуса и только 3-часовая детализация, зато
+    это полностью независимая инфраструктура на случай сбоя основной."""
+    now = now or datetime.datetime.now(ASTANA_TZ)
+    today_date = now.date()
+
+    if target == "week" or days >= 4:
+        blocks = forecast.get("list", []) if isinstance(forecast, dict) else []
+        by_day: dict[datetime.date, list] = {}
+        for block in blocks:
+            dt_txt = block.get("dt_txt")
+            try:
+                block_dt = datetime.datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S")
+            except (TypeError, ValueError):
+                continue
+            by_day.setdefault(block_dt.date(), []).append(block)
+
+        lines = ["📅 Погода в Астане на неделю (резервный источник):\n"]
+        for day in sorted(by_day)[:7]:
+            day_blocks = by_day[day]
+            temps = [_num(b.get("main", {}).get("temp")) for b in day_blocks]
+            temps = [t for t in temps if t is not None]
+            t_min = min(temps) if temps else None
+            t_max = max(temps) if temps else None
+            ids = [(b.get("weather") or [{}])[0].get("id") for b in day_blocks]
+            ids = [_code_int(i) for i in ids if i is not None]
+            code = max(set(ids), key=ids.count) if ids else None
+            emoji = _owm_emoji(code)
+            desc = _owm_describe(code)
+            lines.append(f"• {_day_title(day, today_date)}: {_format_temp(t_min)}…{_format_temp(t_max)} {emoji} ({desc})")
+        return "\n".join(lines)
+
+    offset = 0
+    if target == "tomorrow":
+        offset = 1
+    elif target == "after_tomorrow":
+        offset = 2
+    target_date = today_date + datetime.timedelta(days=offset)
+    title = "сегодня" if offset == 0 else ("завтра" if offset == 1 else "послезавтра")
+
+    if offset == 0 and isinstance(current, dict):
+        cur_main = current.get("main", {})
+        cur_weather = (current.get("weather") or [{}])[0]
+        cur_temp = _format_temp(cur_main.get("temp"))
+        cur_app = _format_temp(cur_main.get("feels_like"))
+        cur_desc = _owm_describe(cur_weather.get("id"))
+        lines = [f"🌤 Астана сейчас: {cur_temp}, {cur_desc} (ощущ. {cur_app}) — резервный источник", ""]
+    else:
+        lines = [f"🌤 Астана, {title} (резервный источник):", ""]
+
+    hours = [9, 12, 15, 18, 21]
+    if offset == 0:
+        hours = [h for h in hours if h > now.hour]
+
+    blocks = forecast.get("list", []) if isinstance(forecast, dict) else []
+    temps, rains, winds = [], [], []
+    has_rain = False
+    has_snow = False
+    for h in hours:
+        target_dt = datetime.datetime.combine(target_date, datetime.time(h, 0))
+        block = _nearest_owm_block(blocks, target_dt)
+        if not block:
+            continue
+        main = block.get("main", {})
+        weather0 = (block.get("weather") or [{}])[0]
+        temp = _num(main.get("temp"))
+        feels = _num(main.get("feels_like"))
+        pop = block.get("pop")
+        rain = round(pop * 100) if isinstance(pop, (int, float)) else None
+        wind = _num((block.get("wind") or {}).get("speed"))
+        if wind is not None:
+            wind *= 3.6  # м/с -> км/ч, для единообразия с основным прогнозом
+        code = weather0.get("id")
+        emoji = _owm_emoji(code)
+
+        if temp is not None:
+            temps.append(temp)
+        if rain is not None:
+            rains.append(rain)
+        if wind is not None:
+            winds.append(wind)
+        if rain is not None and rain >= 20:
+            if _owm_is_snow(code):
+                has_snow = True
+            elif _owm_is_rain(code):
+                has_rain = True
+
+        line = f"{h:02d}:00  {_format_temp(temp)} {emoji}"
+        if feels is not None and temp is not None and abs(feels - temp) >= 2:
+            line += f" (ощущ. {_format_temp(feels)})"
+        lines.append(line)
+
+    lines.append("")
+    min_t = min(temps) if temps else None
+    max_t = max(temps) if temps else None
+    max_wind = max(winds) if winds else None
+    max_rain = max(rains) if rains else 0
+    lines.append(
+        f"👕 {_clothes_advice(min_t, max_t, max_wind, max_rain, has_rain=has_rain, has_snow=has_snow)}"
+    )
+    if max_rain > 20:
+        if has_snow and not has_rain:
+            lines.append(f"❄️ Ожидается снег (вероятность {max_rain}%) — зонт не нужен, важнее непромокаемая обувь.")
+        elif has_rain and has_snow:
+            lines.append(f"☂️❄️ Возможны и дождь, и снег (вероятность {max_rain}%) — зонт пригодится для дождя, для снега — обувь понадёжнее.")
+        elif has_rain:
+            lines.append(f"☂️ Зонт: лучше взять с собой (вероятность осадков {max_rain}%).")
+
+    return "\n".join(lines)
+
+
 async def get_weather_forecast(target: str = "today", days: int = 1) -> str | None:
-    """Вернуть короткий и структурированный прогноз."""
+    """Вернуть короткий и структурированный прогноз.
+
+    Основной путь — Open-Meteo (best_match + консенсус 3 моделей). Если он
+    целиком недоступен (сеть, авария, лимиты) — тихо переключаемся на
+    OpenWeatherMap как независимый резервный источник, если для него задан
+    ключ. Человеку в сообщении честно видно, что это резервный источник."""
+    now = datetime.datetime.now(ASTANA_TZ)
+    req_days = 7 if target in {"week", "after_tomorrow"} or days >= 4 else (2 if target == "tomorrow" else 1)
     try:
-        req_days = 7 if target in {"week", "after_tomorrow"} or days >= 4 else (2 if target == "tomorrow" else 1)
         data = await asyncio.to_thread(_request_open_meteo, req_days)
 
         # Консенсус 3 моделей нужен только для однодневного вида (today/
@@ -487,11 +709,23 @@ async def get_weather_forecast(target: str = "today", days: int = 1) -> str | No
                 # best_match hourly, если суффиксов по моделям не найдётся.
                 print(f"[Погода] Консенсус-запрос не удался, использую best_match: {consensus_error}")
 
-        now = datetime.datetime.now(ASTANA_TZ)
         return format_forecast(data, target=target, now=now, days=days)
     except Exception as error:
-        print(f"[Погода] Ошибка Open-Meteo: {error}")
-        return None
+        print(f"[Погода] Open-Meteo недоступен ({error}), пробую резервный источник")
+        if not OPENWEATHERMAP_API_KEY:
+            print("[Погода] OPENWEATHERMAP_API_KEY не задан — резервного источника нет")
+            return None
+        try:
+            current = await asyncio.to_thread(
+                _request_openweathermap_current, ASTANA_LATITUDE, ASTANA_LONGITUDE, OPENWEATHERMAP_API_KEY
+            )
+            forecast = await asyncio.to_thread(
+                _request_openweathermap_forecast, ASTANA_LATITUDE, ASTANA_LONGITUDE, OPENWEATHERMAP_API_KEY
+            )
+            return format_owm_forecast(current, forecast, target=target, now=now, days=days)
+        except Exception as owm_error:
+            print(f"[Погода] Резервный источник тоже недоступен: {owm_error}")
+            return None
 
 
 async def get_tomorrow_forecast() -> str | None:
