@@ -1,7 +1,7 @@
 import datetime
 
 from services.timezone import ASTANA_TZ
-from services.weather import format_forecast
+from services.weather import format_forecast, CONSENSUS_MODELS
 
 NOW = datetime.datetime(2026, 1, 5, 8, 0, tzinfo=ASTANA_TZ)
 DATE = "2026-01-05"
@@ -80,3 +80,78 @@ def test_compact_format_has_no_old_verbose_labels():
     assert "ощущается как" not in text  # заменено на компактное "ощущ."
     assert "Что надеть:" not in text
     assert "ощущ." in text
+
+
+# --- Консенсус 3 моделей (ECMWF/GFS/ICON) ---------------------------------
+
+
+def _multimodel_hourly(per_model_temps, rain=10, codes_per_model=None, wind=10):
+    """per_model_temps: список из 3 температур (по числу CONSENSUS_MODELS),
+    одинаковых на все HOURS. codes_per_model: аналогично, список из 3
+    WMO-кодов; если не задан — все модели говорят "ясно" (0)."""
+    assert len(per_model_temps) == len(CONSENSUS_MODELS)
+    codes_per_model = codes_per_model or [0] * len(CONSENSUS_MODELS)
+    times = [f"{DATE}T{h:02d}:00" for h in HOURS]
+    hourly = {"time": times}
+    for model, temp, code in zip(CONSENSUS_MODELS, per_model_temps, codes_per_model):
+        hourly[f"temperature_2m_{model}"] = [temp] * len(HOURS)
+        hourly[f"apparent_temperature_{model}"] = [temp] * len(HOURS)
+        hourly[f"precipitation_probability_{model}"] = [rain] * len(HOURS)
+        hourly[f"weather_code_{model}"] = [code] * len(HOURS)
+        hourly[f"wind_speed_10m_{model}"] = [wind] * len(HOURS)
+    return hourly
+
+
+def _multimodel_data(per_model_temps, rain=10, codes_per_model=None, current_temp=0.0):
+    return {
+        "current": {"temperature_2m": current_temp, "apparent_temperature": current_temp, "weather_code": 0},
+        "hourly": _multimodel_hourly(per_model_temps, rain=rain, codes_per_model=codes_per_model),
+    }
+
+
+def test_consensus_uses_median_of_three_models():
+    # ECMWF=10, GFS=12, ICON=20 -> медиана 12, а не среднее (14) и не крайние
+    data = _multimodel_data([10.0, 12.0, 20.0])
+    text = format_forecast(data, "today", NOW)
+    assert "12°C" in text
+    assert "20°C" not in text and "10°C" not in text and "14°C" not in text
+
+
+def test_large_model_disagreement_is_flagged():
+    # разброс температур 10° между моделями - явно стоит предупредить
+    data = _multimodel_data([5.0, 10.0, 15.0])
+    text = format_forecast(data, "today", NOW)
+    assert "🔀" in text and "расходятся" in text
+
+
+def test_small_model_disagreement_is_not_flagged():
+    # разброс всего 1° - несущественно, предупреждать не нужно
+    data = _multimodel_data([12.0, 12.5, 13.0])
+    text = format_forecast(data, "today", NOW)
+    assert "🔀" not in text
+
+
+def test_consensus_code_majority_vote_wins():
+    # 2 из 3 моделей видят дождь (63), 1 - ясно (0) -> побеждает дождь
+    data = _multimodel_data([12.0, 12.0, 12.0], rain=70, codes_per_model=[63, 63, 0])
+    text = format_forecast(data, "today", NOW)
+    assert "Зонт:" in text
+
+
+def test_backward_compatible_without_model_suffixes():
+    # Старый формат без суффиксов моделей (как раньше, best_match) должен
+    # продолжать работать как один "источник" - без сюрпризов и падений.
+    data = {
+        "current": {"temperature_2m": 12, "apparent_temperature": 9, "weather_code": 0},
+        "hourly": {
+            "time": [f"{DATE}T{h:02d}:00" for h in HOURS],
+            "temperature_2m": [13, 18, 19, 17, 15],
+            "apparent_temperature": [11, 16, 16, 15, 15],
+            "precipitation_probability": [10] * 5,
+            "weather_code": [0, 2, 3, 3, 3],
+            "wind_speed_10m": [10] * 5,
+        },
+    }
+    text = format_forecast(data, "today", NOW)
+    assert "13°C" in text
+    assert "🔀" not in text  # один источник -> расхождений быть не может

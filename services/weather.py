@@ -78,12 +78,101 @@ WEEKDAYS_RU = ["понедельник", "вторник", "среда", "чет
 SNOW_WMO_CODES = {71, 73, 75, 77, 85, 86}
 RAIN_WMO_CODES = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99}
 
+# Астана — резко континентальный климат, отдельные модели тут регулярно
+# расходятся заметнее, чем в Европе. Берём 3 независимые модели от разных
+# национальных метеослужб (не просто общий best_match) и сверяем их между
+# собой, примерно как это делает RAD Weather: там где модели соглашаются —
+# доверяем консенсусу, там где сильно расходятся — говорим об этом прямо,
+# а не выдаём один из вариантов за точный факт.
+CONSENSUS_MODELS = ["ecmwf_ifs025", "gfs_seamless", "icon_seamless"]
+CONSENSUS_HOURLY_VARS = "temperature_2m,apparent_temperature,precipitation_probability,weather_code,wind_speed_10m"
+# Пороги, начиная с которых расхождение моделей достаточно большое, чтобы
+# об этом стоило сказать прямым текстом, а не тихо усреднять.
+TEMP_DISAGREEMENT_C = 3.0
+RAIN_DISAGREEMENT_PP = 30
+
 
 def _code_int(code: object) -> int | None:
     try:
         return int(code)
     except (TypeError, ValueError):
         return None
+
+
+def _model_values_at(hourly: dict, var: str, idx: int) -> list[float]:
+    """Значения var на индексе idx по каждой из CONSENSUS_MODELS.
+
+    Open-Meteo при явном перечислении нескольких моделей (&models=a,b,c)
+    возвращает каждую переменную с суффиксом модели в имени ключа
+    (например temperature_2m_icon_seamless). Мы не завязываемся жёстко на
+    точный формат суффикса — ищем по вхождению названия модели в ключ,
+    так функция не ломается, если Open-Meteo слегка изменит написание.
+    Если суффиксов вообще нет (например в тестах или если модельный
+    запрос не выполнялся) — тихо откатываемся на обычный "bare"-ключ,
+    как было раньше с одной моделью best_match."""
+    values: list[float] = []
+    for model in CONSENSUS_MODELS:
+        for key, arr in hourly.items():
+            if key.startswith(var + "_") and model in key and isinstance(arr, list) and idx < len(arr):
+                v = _num(arr[idx])
+                if v is not None:
+                    values.append(v)
+                break
+    if values:
+        return values
+    arr = hourly.get(var)
+    if isinstance(arr, list) and idx < len(arr):
+        v = _num(arr[idx])
+        if v is not None:
+            return [v]
+    return []
+
+
+def _model_codes_at(hourly: dict, idx: int) -> list[int]:
+    codes: list[int] = []
+    for model in CONSENSUS_MODELS:
+        for key, arr in hourly.items():
+            if key.startswith("weather_code_") and model in key and isinstance(arr, list) and idx < len(arr):
+                c = _code_int(arr[idx])
+                if c is not None:
+                    codes.append(c)
+                break
+    if codes:
+        return codes
+    arr = hourly.get("weather_code")
+    if isinstance(arr, list) and idx < len(arr):
+        c = _code_int(arr[idx])
+        if c is not None:
+            return [c]
+    return []
+
+
+def _consensus(values: list[float]) -> float | None:
+    """Медиана по моделям — устойчивее к одной модели-выбросу, чем среднее."""
+    if not values:
+        return None
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
+def _consensus_code(codes: list[int]) -> int | None:
+    """При разногласии моделей по типу погоды берём наиболее часто
+    встречающийся код; при ничьей — более "серьёзный" (осадки/гроза
+    важнее показать, чем пропустить, если половина моделей их не видит)."""
+    if not codes:
+        return None
+    counts: dict[int, int] = {}
+    for c in codes:
+        counts[c] = counts.get(c, 0) + 1
+    return max(counts.items(), key=lambda kv: (kv[1], kv[0]))[0]
+
+
+def _spread(values: list[float]) -> float:
+    return (max(values) - min(values)) if values else 0.0
 
 
 def _describe(code: object) -> str:
@@ -127,6 +216,24 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
         "hourly": "temperature_2m,apparent_temperature,precipitation_probability,weather_code,wind_speed_10m",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max",
+        "timezone": "Asia/Almaty",
+        "forecast_days": max(1, min(int(forecast_days), 7)),
+    })
+    url = f"https://api.open-meteo.com/v1/forecast?{params}"
+    with urllib.request.urlopen(url, timeout=12) as response:
+        import json
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _request_open_meteo_consensus(forecast_days: int = 7) -> dict:
+    """Отдельный запрос за почасовыми данными сразу от 3 независимых
+    моделей (ECMWF/GFS/ICON) — для консенсуса на однодневный вид прогноза.
+    Возвращает hourly с суффиксами моделей в ключах."""
+    params = urllib.parse.urlencode({
+        "latitude": ASTANA_LATITUDE,
+        "longitude": ASTANA_LONGITUDE,
+        "hourly": CONSENSUS_HOURLY_VARS,
+        "models": ",".join(CONSENSUS_MODELS),
         "timezone": "Asia/Almaty",
         "forecast_days": max(1, min(int(forecast_days), 7)),
     })
@@ -281,32 +388,42 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
 
     has_rain = False
     has_snow = False
+    max_temp_spread = 0.0
+    max_rain_spread = 0.0
     for h in hours:
         key = f"{date_str}T{h:02d}:00"
         idx = hourly_map.get(key)
         if idx is None:
             continue
-        temp = _num(hourly["temperature_2m"][idx])
-        feels = _num(hourly["apparent_temperature"][idx])
-        rain = hourly["precipitation_probability"][idx]
-        wind = _num(hourly["wind_speed_10m"][idx])
-        code = hourly["weather_code"][idx]
-        emoji = _code_to_emoji(code, h)
+
+        temp_values = _model_values_at(hourly, "temperature_2m", idx)
+        feels_values = _model_values_at(hourly, "apparent_temperature", idx)
+        rain_values = _model_values_at(hourly, "precipitation_probability", idx)
+        wind_values = _model_values_at(hourly, "wind_speed_10m", idx)
+        codes = _model_codes_at(hourly, idx)
+
+        temp = _consensus(temp_values)
+        feels = _consensus(feels_values)
+        rain = _consensus(rain_values)
+        wind = _consensus(wind_values)
+        code = _consensus_code(codes)
+        emoji = _code_to_emoji(code, h) if code is not None else "⛅"
 
         if temp is not None:
             temps.append(temp)
+            max_temp_spread = max(max_temp_spread, _spread(temp_values))
         if rain is not None:
             rains.append(rain)
+            max_rain_spread = max(max_rain_spread, _spread(rain_values))
         if wind is not None:
             winds.append(wind)
 
         # Отдельно помечаем снег и дождь — от этого зависит совет про зонт
         # и про обувь ниже: советовать зонт от снега бессмысленно.
         if rain is not None and rain >= 20:
-            code_int = _code_int(code)
-            if code_int in SNOW_WMO_CODES:
+            if code in SNOW_WMO_CODES:
                 has_snow = True
-            elif code_int in RAIN_WMO_CODES:
+            elif code in RAIN_WMO_CODES:
                 has_rain = True
 
         line = f"{h:02d}:00  {_format_temp(temp)} {emoji}"
@@ -334,6 +451,16 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
         # rain/snow-кода (has_rain=has_snow=False) — не гадаем и молчим,
         # чем врать про зонт от осадков непонятного типа (туман/град).
 
+    # Модели заметно разошлись — честно предупреждаем, а не выдаём
+    # усреднённое число за точный факт (как расхождение показывает RAD Weather).
+    if max_temp_spread >= TEMP_DISAGREEMENT_C or max_rain_spread >= RAIN_DISAGREEMENT_PP:
+        bits = []
+        if max_temp_spread >= TEMP_DISAGREEMENT_C:
+            bits.append(f"по температуре до {max_temp_spread:.0f}°")
+        if max_rain_spread >= RAIN_DISAGREEMENT_PP:
+            bits.append(f"по осадкам до {max_rain_spread:.0f} п.п.")
+        lines.append(f"🔀 Модели расходятся ({', '.join(bits)}) — прогноз может измениться.")
+
     return "\n".join(lines)
 
 
@@ -342,6 +469,24 @@ async def get_weather_forecast(target: str = "today", days: int = 1) -> str | No
     try:
         req_days = 7 if target in {"week", "after_tomorrow"} or days >= 4 else (2 if target == "tomorrow" else 1)
         data = await asyncio.to_thread(_request_open_meteo, req_days)
+
+        # Консенсус 3 моделей нужен только для однодневного вида (today/
+        # tomorrow/after_tomorrow) — недельный прогноз строится из daily
+        # best_match и там детальный почасовой консенсус не используется.
+        if target != "week" and days < 4:
+            try:
+                consensus = await asyncio.to_thread(_request_open_meteo_consensus, req_days)
+                c_hourly = consensus.get("hourly")
+                if isinstance(c_hourly, dict):
+                    data.setdefault("hourly", {})
+                    for var_key, values in c_hourly.items():
+                        if var_key != "time":
+                            data["hourly"][var_key] = values
+            except Exception as consensus_error:
+                # Не страшно: format_forecast сам откатится на обычный
+                # best_match hourly, если суффиксов по моделям не найдётся.
+                print(f"[Погода] Консенсус-запрос не удался, использую best_match: {consensus_error}")
+
         now = datetime.datetime.now(ASTANA_TZ)
         return format_forecast(data, target=target, now=now, days=days)
     except Exception as error:
