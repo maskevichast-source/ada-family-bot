@@ -73,6 +73,18 @@ WEATHER_EMOJIS = {
 
 WEEKDAYS_RU = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
+# Коды WMO (Open-Meteo) по типу осадков — нужно, чтобы не советовать зонт
+# от снега и не советовать "непромокаемую обувь от дождя" при ясной погоде.
+SNOW_WMO_CODES = {71, 73, 75, 77, 85, 86}
+RAIN_WMO_CODES = {51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82, 95, 96, 99}
+
+
+def _code_int(code: object) -> int | None:
+    try:
+        return int(code)
+    except (TypeError, ValueError):
+        return None
+
 
 def _describe(code: object) -> str:
     try:
@@ -124,7 +136,14 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         return json.loads(response.read().decode("utf-8"))
 
 
-def _clothes_advice(temp_min: float | None, temp_max: float | None, wind: float | None, rain: float | None = None) -> str:
+def _clothes_advice(
+    temp_min: float | None,
+    temp_max: float | None,
+    wind: float | None,
+    rain: float | None = None,
+    has_rain: bool = False,
+    has_snow: bool = False,
+) -> str:
     if temp_max is None:
         return "Ориентируйтесь по фактической температуре за окном."
 
@@ -159,10 +178,22 @@ def _clothes_advice(temp_min: float | None, temp_max: float | None, wind: float 
         elif wind >= 20:
             parts.append("лёгкий ветер — не помешает что-то, прикрывающее шею")
 
-    if rain is not None and rain >= 60:
-        parts.append("осадки почти наверняка — непромокаемая куртка или дождевик будут не лишними, зонта может не хватить при таком ветре")
-    elif rain is not None and rain >= 20:
-        parts.append("вероятны осадки — возьмите что-то непромокаемое сверху")
+    if rain is not None and rain >= 20:
+        strong = rain >= 60
+        if has_snow and not has_rain:
+            # Снег — зонт тут ни при чём, важнее не скользить и не промочить ноги.
+            if strong:
+                parts.append("снег почти наверняка — непромокаемая нескользящая обувь и куртка с капюшоном, зонт от снега не спасёт")
+            else:
+                parts.append("возможен снег — выбирайте обувь понадёжнее, чтобы не скользить")
+        elif has_rain and has_snow:
+            # В течение дня возможна смена осадков — универсальный совет.
+            parts.append("возможны и дождь, и снег в течение дня — непромокаемая куртка и обувь с протектором выручат в обоих случаях")
+        else:
+            if strong:
+                parts.append("осадки почти наверняка — непромокаемая куртка или дождевик будут не лишними, зонта может не хватить при таком ветре")
+            else:
+                parts.append("вероятны осадки — возьмите что-то непромокаемое сверху")
 
     result = ", ".join(parts) + "."
     return result[0].upper() + result[1:] if result else result
@@ -240,17 +271,16 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
         hours = [h for h in hours if h > now.hour]
 
     cur = data.get("current", {})
-    lines = [f"🌤 Погода в Астане на {title}:"]
-
     if offset == 0:
         cur_temp = _format_temp(cur.get("temperature_2m"))
         cur_app = _format_temp(cur.get("apparent_temperature"))
         cur_desc = _describe(cur.get("weather_code"))
-        lines.append(f"Сейчас: {cur_temp}, {cur_desc} (ощущается как {cur_app}).\n")
+        lines = [f"🌤 Астана сейчас: {cur_temp}, {cur_desc} (ощущ. {cur_app})", ""]
     else:
-        lines.append("")
+        lines = [f"🌤 Астана, {title}:", ""]
 
-    lines.append("Динамика дня:")
+    has_rain = False
+    has_snow = False
     for h in hours:
         key = f"{date_str}T{h:02d}:00"
         idx = hourly_map.get(key)
@@ -270,18 +300,18 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
         if wind is not None:
             winds.append(wind)
 
-        line = f"• {h:02d}:00 ➔ {_format_temp(temp)} {emoji}"
-        # Разница между "будет" и "как ощущается" бывает существенной (ветер,
-        # влажность) — показываем прямо на строке часа, а не только для "сейчас".
+        # Отдельно помечаем снег и дождь — от этого зависит совет про зонт
+        # и про обувь ниже: советовать зонт от снега бессмысленно.
+        if rain is not None and rain >= 20:
+            code_int = _code_int(code)
+            if code_int in SNOW_WMO_CODES:
+                has_snow = True
+            elif code_int in RAIN_WMO_CODES:
+                has_rain = True
+
+        line = f"{h:02d}:00  {_format_temp(temp)} {emoji}"
         if feels is not None and temp is not None and abs(feels - temp) >= 2:
-            line += f", ощущается как {_format_temp(feels)}"
-        extras = []
-        if wind is not None and wind >= 30:
-            extras.append(f"ветер {wind:.0f} км/ч")
-        if rain is not None and rain >= 40:
-            extras.append(f"осадки {rain}%")
-        if extras:
-            line += f" ({', '.join(extras)})"
+            line += f" (ощущ. {_format_temp(feels)})"
         lines.append(line)
 
     lines.append("")
@@ -289,10 +319,20 @@ def format_forecast(data: dict, target: str = "today", now: datetime.datetime | 
     max_t = max(temps) if temps else None
     max_wind = max(winds) if winds else None
     max_rain = max(rains) if rains else 0
-    lines.append(f"👕 Что надеть: {_clothes_advice(min_t, max_t, max_wind, max_rain)}")
+    lines.append(
+        f"👕 {_clothes_advice(min_t, max_t, max_wind, max_rain, has_rain=has_rain, has_snow=has_snow)}"
+    )
 
     if max_rain > 20:
-        lines.append(f"☂️ Зонт: лучше взять с собой (вероятность осадков {max_rain}%).")
+        if has_snow and not has_rain:
+            lines.append(f"❄️ Ожидается снег (вероятность {max_rain}%) — зонт не нужен, важнее непромокаемая обувь.")
+        elif has_rain and has_snow:
+            lines.append(f"☂️❄️ Возможны и дождь, и снег (вероятность {max_rain}%) — зонт пригодится для дождя, для снега — обувь понадёжнее.")
+        elif has_rain:
+            lines.append(f"☂️ Зонт: лучше взять с собой (вероятность осадков {max_rain}%).")
+        # Если рядом с высоким max_rain нет ни одного распознанного
+        # rain/snow-кода (has_rain=has_snow=False) — не гадаем и молчим,
+        # чем врать про зонт от осадков непонятного типа (туман/град).
 
     return "\n".join(lines)
 
