@@ -18,7 +18,7 @@ from services.categories import (
 )
 from services.money import parse_amount, normalize_currency_code
 from services.banks import normalize_bank_source
-from services.deepseek_service import parse_and_analyze, classify_items
+from services.deepseek_service import parse_and_analyze, classify_items, generate_budget_reflection
 from services.sheets import (
     append_transaction, get_last_200_transactions, get_category_limits,
     add_shopping_items, get_shopping_items, mark_shopping_items_done,
@@ -42,7 +42,7 @@ from services.pending_clarifications import (
 from services.memory import get_chat_history, add_chat_message
 from services.voice import transcribe_voice
 from services.timezone import now_astana, parse_ru_relative_datetime
-from services.analytics import analyze_budget_leaks
+from services.analytics import analyze_budget_leaks, detect_amount_anomaly
 from services.reports import generate_pdf_report, generate_excel_export
 from services.price_tracker import fetch_product_info, detect_marketplace
 from services import reminders, reminder_edit, debts, edits, goals, fx
@@ -814,6 +814,19 @@ async def _process_text_message(message: Message, text: str):
             await safe_answer(message, "Не смогла записать трату в таблицу. Не буду делать вид, что записала — проверь Google Sheets.")
             return
         report = _format_confirmation_report(tx, reply)
+
+        # Та же опциональная живая реплика на аномально крупную покупку,
+        # что и на фото-пути в media_handler.py (см. detect_amount_anomaly).
+        if tx_type == TYPE_EXPENSE:
+            try:
+                fact = detect_amount_anomaly(tx.get("user"), tx.get("category"), amount)
+                if fact:
+                    reflection = await generate_budget_reflection("anomaly", fact)
+                    if reflection:
+                        report += f"\n\n{reflection}"
+            except Exception as anomaly_error:
+                print(f"[Аномалия суммы] Пропущено: {anomaly_error}")
+
         add_chat_message(chat_id, "Ада", report)
         await safe_answer(message, report)
         return

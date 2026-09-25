@@ -24,6 +24,8 @@ from services.categories import (
     validate_transaction_category_subcategory,
     HARMFUL_CATEGORY,
 )
+from services.analytics import detect_amount_anomaly
+from services.deepseek_service import generate_budget_reflection
 from services.banks import normalize_bank_source
 import re
 
@@ -295,6 +297,24 @@ async def handle_media(message: Message):
         extra_note = await _apply_hints(result, validated_transactions)
         if extra_note:
             report += f"\n\n{extra_note}"
+
+        # Опционально: если конкретная покупка заметно выбивается из
+        # обычного для этой категории у этого человека - короткая живая
+        # реплика сразу, а не только в еженедельном дайджесте. Не шумим
+        # на каждой крупной покупке - только когда реально есть с чем
+        # сравнить (см. min_history в detect_amount_anomaly) и разница
+        # заметная.
+        try:
+            for tx in validated_transactions:
+                fact = detect_amount_anomaly(tx.get("user") or user_name, tx.get("category"), tx.get("amount"))
+                if fact:
+                    reflection = await generate_budget_reflection("anomaly", fact)
+                    if reflection:
+                        report += f"\n\n{reflection}"
+                    break  # одной реплики на чек достаточно, даже если позиций несколько
+        except Exception as anomaly_error:
+            print(f"[Аномалия суммы] Пропущено: {anomaly_error}")
+
         await safe_answer(message, report)
         return
 

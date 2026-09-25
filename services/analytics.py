@@ -15,6 +15,51 @@ def _format_currency(value):
         return str(value)
 
 
+def detect_amount_anomaly(
+    user: str, category: str, amount: float,
+    lookback_days: int = 90, min_history: int = 3, threshold_ratio: float = 1.5,
+) -> str | None:
+    """Если новая трата заметно (в threshold_ratio раз) больше предыдущего
+    максимума в этой же категории у этого же человека за lookback_days дней —
+    возвращает короткое текстовое описание факта для generate_budget_reflection
+    (kind="anomaly"). Иначе None — молчим, не каждая крупная покупка обязана
+    получать отдельный комментарий.
+
+    min_history нужен, чтобы не поднимать шум на первой же покупке в новой
+    категории — сравнивать почти не с чем, значит и "аномалии" никакой нет."""
+    from services.sheets import get_last_200_transactions
+    if not user or not category or not amount or amount <= 0:
+        return None
+    cutoff = datetime.datetime.now() - datetime.timedelta(days=lookback_days)
+    amounts = []
+    for t in get_last_200_transactions():
+        if t.get("cat") != category or str(t.get("user") or "").strip() != user:
+            continue
+        if t.get("type") != TYPE_EXPENSE:
+            continue
+        date_str = str(t.get("date") or "")[:19]
+        try:
+            tx_dt = datetime.datetime.strptime(date_str, "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if tx_dt < cutoff:
+            continue
+        amt = t.get("amt")
+        if isinstance(amt, (int, float)) and amt > 0:
+            amounts.append(amt)
+    if len(amounts) < min_history:
+        return None
+    prev_max = max(amounts)
+    if amount <= prev_max * threshold_ratio:
+        return None
+    return (
+        f"Новая трата у {user} в категории «{category}»: {_format_currency(amount)} тг — "
+        f"заметно больше предыдущего максимума в этой категории за последние "
+        f"{lookback_days} дней ({_format_currency(prev_max)} тг, всего {len(amounts)} "
+        f"покупок в истории за этот период)."
+    )
+
+
 def analyze_budget_leaks(year: int = None, month: int = None) -> dict:
     """Анализирует скрытые утечки бюджета за указанный месяц."""
     now = now_astana()
