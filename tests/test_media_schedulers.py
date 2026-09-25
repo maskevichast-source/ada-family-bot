@@ -150,6 +150,7 @@ def test_weekly_summary_and_monthly_limits(app,monkeypatch):
     frozen(monkeypatch,app,when)
     calls=[]
     monkeypatch.setattr(app,"_period_summary_text",lambda *args: calls.append(args) or "Отчет")
+    monkeypatch.setattr(app,"generate_budget_reflection",AsyncMock(return_value=""))
     tick(app.finance_report_scheduler)
     assert calls[0][1:] == ("2026-08-31","2026-09-07","2026-08-24","2026-08-31")
     frozen(monkeypatch,app,when.replace(day=1,minute=25))
@@ -160,6 +161,54 @@ def test_weekly_summary_and_monthly_limits(app,monkeypatch):
     monkeypatch.setenv("AUTO_GENERATE_LIMITS","true")
     tick(app.monthly_limits_scheduler)
     assert gen.called and state.get("scheduler","limits:2026-09")
+
+def test_weekly_summary_prepends_live_reflection_when_present(app,monkeypatch):
+    when=dt.datetime(2026,9,7,9,15,tzinfo=ASTANA_TZ) # Monday
+    frozen(monkeypatch,app,when)
+    monkeypatch.setattr(app,"_period_summary_text",lambda *args: "Отчет с цифрами")
+    reflect=AsyncMock(return_value="Живая реплика от Ады")
+    monkeypatch.setattr(app,"generate_budget_reflection",reflect)
+    tick(app.finance_report_scheduler)
+    sent_text = app.bot.send_message.call_args.kwargs.get("text") or app.bot.send_message.call_args.args[-1]
+    assert "Живая реплика от Ады" in sent_text
+    assert "Отчет с цифрами" in sent_text
+    # реплика должна идти первой, цифры - следом
+    assert sent_text.index("Живая реплика от Ады") < sent_text.index("Отчет с цифрами")
+    assert reflect.call_args.args[0] == "weekly"
+
+def test_weekly_summary_falls_back_to_plain_template_when_reflection_fails(app,monkeypatch):
+    when=dt.datetime(2026,9,7,9,15,tzinfo=ASTANA_TZ) # Monday
+    frozen(monkeypatch,app,when)
+    monkeypatch.setattr(app,"_period_summary_text",lambda *args: "Отчет с цифрами")
+    monkeypatch.setattr(app,"generate_budget_reflection",AsyncMock(return_value=""))
+    tick(app.finance_report_scheduler)
+    sent_text = app.bot.send_message.call_args.kwargs.get("text") or app.bot.send_message.call_args.args[-1]
+    assert sent_text == "Отчет с цифрами"
+
+def test_limit_warning_includes_reflection_and_marks_state(app,monkeypatch,db):
+    from services.sheets import save_category_limits
+    when=dt.datetime(2026,9,15,19,2,tzinfo=ASTANA_TZ)
+    frozen(monkeypatch,app,when)
+    save_category_limits({"Еда и продукты": 1000})
+    # Пишем строку транзакции напрямую с явной датой внутри периода -
+    # append_transaction всегда проставляет реальное текущее время, а не
+    # замороженное через frozen(), это дало бы недетерминированный тест.
+    db.worksheet("Transactions").append_row([
+        "LIM1","2026-09-15 10:00:00","Влад","РАСХОД",950,"KZT",
+        "Kaspi","Kaspi Gold","Собственные","Карта","Еда и продукты",
+        "","","Need","",""
+    ])
+    reflect=AsyncMock(return_value="Тут явный перебор, будь внимательнее")
+    monkeypatch.setattr(app,"generate_budget_reflection",reflect)
+    tick(app.check_limit_warnings)
+    sent_text = app.bot.send_message.call_args.kwargs.get("text") or app.bot.send_message.call_args.args[-1]
+    assert "Тут явный перебор" in sent_text
+    assert "Еда и продукты" in sent_text
+    assert reflect.call_args.args[0] == "limit_warning"
+    assert state.get("scheduler","limit_warning:Еда и продукты:2026-09")
+    # повторный тик в тот же день не должен слать второй раз
+    tick(app.check_limit_warnings)
+    assert app.bot.send_message.call_count==1
 
 def test_pdf_text_no_emoji_and_real_newlines():
     from services.reports import _wrap_pdf

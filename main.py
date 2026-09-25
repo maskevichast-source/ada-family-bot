@@ -33,6 +33,7 @@ from services.weather import get_weather_forecast, get_tomorrow_forecast
 from services.charts import generate_expense_chart, generate_trend_chart
 from services.reports import generate_pdf_report, generate_excel_export
 from services.analytics import analyze_budget_leaks
+from services.deepseek_service import generate_budget_reflection
 from services.limits_ai import generate_limits_from_history
 from services.timezone import now_astana
 from services.reminders import deliver_due
@@ -178,8 +179,12 @@ async def cmd_trend(message: types.Message):
 
 @dp.message(Command("leaks"))
 async def cmd_leaks(message: types.Message):
-    leak_data = analyze_budget_leaks()
-    await safe_answer(message, leak_data["text"])
+    leak_data = await asyncio.to_thread(analyze_budget_leaks)
+    text = leak_data["text"]
+    reflection = await generate_budget_reflection("leaks", text)
+    if reflection:
+        text = f"{reflection}\n\n{text}"
+    await safe_answer(message, text)
 
 
 @dp.message(Command("report"))
@@ -296,7 +301,11 @@ async def check_limit_warnings():
                 limits = await asyncio.to_thread(get_category_limits)
                 if limits:
                     start = now.replace(day=1).strftime("%Y-%m-%d")
-                    end = now.strftime("%Y-%m-%d")
+                    # +1 день, т.к. get_transactions_for_period сравнивает как
+                    # [start, end) — без этого сегодняшние траты (тот же
+                    # календарный день, что и now) никогда бы не попадали
+                    # в подсчёт, хотя проверка идёт именно "на сегодня".
+                    end = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
                     txs = await asyncio.to_thread(get_transactions_for_period, start, end)
                     spent = {}
                     for t in txs:
@@ -321,13 +330,13 @@ async def check_limit_warnings():
                             status = f"лимит превышен на {_format_currency(amount_spent - limit)} тг"
                         else:
                             status = f"осталось {_format_currency(limit - amount_spent)} тг до конца месяца"
-                        await safe_send_message(
-                            bot, chat_id=FAMILY_CHAT_ID,
-                            text=(
-                                f"📊 Лимит по категории «{cat}»: потрачено {_format_currency(amount_spent)} "
-                                f"из {_format_currency(limit)} тг ({status})."
-                            ),
+                        fact_text = (
+                            f"Категория «{cat}»: потрачено {_format_currency(amount_spent)} из "
+                            f"{_format_currency(limit)} тг за месяц ({pct * 100:.0f}% лимита, {status})."
                         )
+                        reflection = await generate_budget_reflection("limit_warning", fact_text)
+                        text = f"{reflection}\n\n📊 {fact_text}" if reflection else f"📊 {fact_text}"
+                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
         except Exception as e:
             print(f"[Лимиты] Ошибка цикла предупреждений: {e}")
         await asyncio.sleep(60)
@@ -517,6 +526,9 @@ async def finance_report_scheduler():
                         _period_summary_text, "Еженедельный финансовый дайджест",
                         start_dt, end_dt, cmp_start, cmp_end,
                     )
+                    reflection = await generate_budget_reflection("weekly", text)
+                    if reflection:
+                        text = f"{reflection}\n\n{text}"
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
 
             # Месячный дайджест — 1-го числа в 09:15 за прошлый месяц, со
@@ -534,6 +546,9 @@ async def finance_report_scheduler():
                         f"Месячный отчёт за {prev_month_last_day.strftime('%m.%Y')}",
                         start_dt, end_dt, cmp_start, cmp_end,
                     )
+                    reflection = await generate_budget_reflection("monthly", text)
+                    if reflection:
+                        text = f"{reflection}\n\n{text}"
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
         except Exception as e:
             print(f"[Автоотчёты] Ошибка: {e}")
