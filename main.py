@@ -32,7 +32,7 @@ from services.timezone import ASTANA_TZ, parse_flexible_datetime
 from services.weather import get_weather_forecast, get_tomorrow_forecast
 from services.charts import generate_expense_chart, generate_trend_chart
 from services.reports import generate_pdf_report, generate_excel_export
-from services.analytics import analyze_budget_leaks
+from services.analytics import analyze_budget_leaks, detect_category_pace_anomalies
 from services.deepseek_service import generate_budget_reflection
 from services.limits_ai import generate_limits_from_history
 from services.timezone import now_astana
@@ -529,6 +529,21 @@ async def finance_report_scheduler():
                     reflection = await generate_budget_reflection("weekly", text)
                     if reflection:
                         text = f"{reflection}\n\n{text}"
+
+                    # Категории БЕЗ заданного лимита (их не видит
+                    # check_limit_warnings) — раз в неделю мягко сверяем
+                    # темп трат month-to-date с обычным для этой же
+                    # категории за прошлые месяцы. Молчит, если истории
+                    # мало или отклонение несущественное.
+                    try:
+                        pace_facts = await asyncio.to_thread(detect_category_pace_anomalies)
+                        if pace_facts:
+                            pace_reflection = await generate_budget_reflection("category_pace", pace_facts)
+                            if pace_reflection:
+                                text = f"{text}\n\n{pace_reflection}"
+                    except Exception as pace_error:
+                        print(f"[Темп категорий] Пропущено: {pace_error}")
+
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
 
             # Месячный дайджест — 1-го числа в 09:15 за прошлый месяц, со
