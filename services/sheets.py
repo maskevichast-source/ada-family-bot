@@ -1137,3 +1137,125 @@ def get_pending_reminders():
     except Exception as e:
         print(f"[Напоминания] Ошибка чтения: {e}")
         return []
+
+
+PRICE_TRACKING_HEADERS = ["id", "user", "url", "product_name", "image_url", "target_price",
+                          "first_price", "last_price", "last_checked_at", "fail_count",
+                          "status", "created_at"]
+
+
+def _get_or_create_price_tracking_sheet():
+    ws = _get_or_create_worksheet("PriceTracking", PRICE_TRACKING_HEADERS, rows=100, cols=len(PRICE_TRACKING_HEADERS))
+    headers = ws.row_values(1)
+    if len(headers) < len(PRICE_TRACKING_HEADERS):
+        for col_idx, header in enumerate(PRICE_TRACKING_HEADERS, start=1):
+            if col_idx > len(headers) or not headers[col_idx - 1]:
+                ws.update_cell(1, col_idx, header)
+    return ws
+
+
+def add_price_tracking(payload: dict) -> Optional[dict]:
+    """Заводит новую позицию отслеживания цены. Пока умеем только Kaspi —
+    вызывающий код (handlers/text_handler.py) сам решает, звать ли эту
+    функцию, в зависимости от того, что вернул detect_marketplace()."""
+    try:
+        now = datetime.datetime.now()
+        ws = _get_or_create_price_tracking_sheet()
+        price = parse_amount(payload.get("price", 0))
+        values = {
+            "id": payload.get("id") or f"PRICE_{now.strftime('%Y%m%d_%H%M%S')}",
+            "user": payload.get("user") or "Влад",
+            "url": payload.get("url") or "",
+            "product_name": payload.get("product_name") or "Товар",
+            "image_url": payload.get("image_url") or "",
+            "target_price": parse_amount(payload.get("target_price", 0)) if payload.get("target_price") else "",
+            "first_price": price,
+            "last_price": price,
+            "last_checked_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "fail_count": 0,
+            "status": "active",
+            "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        ws.append_row(
+            _typed_row(values, PRICE_TRACKING_HEADERS, numeric_cols={"target_price", "first_price", "last_price", "fail_count"}),
+            table_range=_table_range(len(PRICE_TRACKING_HEADERS)),
+        )
+        return values
+    except Exception as error:
+        print(f"[Отслеживание цен] Ошибка записи: {error}")
+        return None
+
+
+def get_active_price_trackings() -> list[dict]:
+    try:
+        ws = _get_or_create_price_tracking_sheet()
+        records = _get_all_records_safe(ws)
+        result = []
+        for idx, r in enumerate(records, start=2):
+            if str(r.get("status") or "").strip().lower() == "active" and str(r.get("id") or "").strip():
+                r["row_idx"] = idx
+                result.append(r)
+        return result
+    except Exception as e:
+        print(f"[Отслеживание цен] Ошибка чтения: {e}")
+        return []
+
+
+def get_user_price_trackings(user_name: str) -> list[dict]:
+    try:
+        ws = _get_or_create_price_tracking_sheet()
+        records = _get_all_records_safe(ws)
+        return [
+            r for r in records
+            if str(r.get("status") or "").strip().lower() == "active"
+            and str(r.get("user") or "").strip() == user_name
+        ]
+    except Exception as e:
+        print(f"[Отслеживание цен] Ошибка чтения: {e}")
+        return []
+
+
+def record_price_check_success(row_idx: int, price: float, image_url: str = "") -> None:
+    try:
+        ws = _get_or_create_price_tracking_sheet()
+        col = {name: i + 1 for i, name in enumerate(PRICE_TRACKING_HEADERS)}
+        ws.update_cell(row_idx, col["last_price"], price)
+        ws.update_cell(row_idx, col["last_checked_at"], datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        ws.update_cell(row_idx, col["fail_count"], 0)
+        if image_url:
+            ws.update_cell(row_idx, col["image_url"], image_url)
+    except Exception as error:
+        print(f"[Отслеживание цен] Ошибка записи успешной проверки {row_idx}: {error}")
+
+
+def record_price_check_failure(row_idx: int) -> int:
+    """Увеличивает fail_count и возвращает новое значение — НЕ трогает
+    last_price/last_checked_at, чтобы не терять последнюю реально известную
+    цену из-за временного сбоя сети/сайта."""
+    try:
+        ws = _get_or_create_price_tracking_sheet()
+        col = {name: i + 1 for i, name in enumerate(PRICE_TRACKING_HEADERS)}
+        all_values = ws.get_all_values()
+        current = all_values[row_idx - 1][col["fail_count"] - 1] if row_idx - 1 < len(all_values) else "0"
+        try:
+            new_count = int(current or 0) + 1
+        except ValueError:
+            new_count = 1
+        ws.update_cell(row_idx, col["fail_count"], new_count)
+        return new_count
+    except Exception as error:
+        print(f"[Отслеживание цен] Ошибка записи сбоя {row_idx}: {error}")
+        return 0
+
+
+def set_price_tracking_status(row_idx: int, status: str) -> None:
+    try:
+        ws = _get_or_create_price_tracking_sheet()
+        col = {name: i + 1 for i, name in enumerate(PRICE_TRACKING_HEADERS)}
+        ws.update_cell(row_idx, col["status"], status)
+    except Exception as error:
+        print(f"[Отслеживание цен] Ошибка смены статуса {row_idx}: {error}")
+
+
+def stop_price_tracking(search_query: str) -> bool:
+    return find_and_update_record("PriceTracking", search_query, "status", "stopped", search_from_recent=True)

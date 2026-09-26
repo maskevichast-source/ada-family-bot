@@ -23,7 +23,10 @@ from services.sheets import (
     normalize_existing_family_table_values, get_subscription_warnings,
     mark_subscription_warning_sent, get_transactions_for_period,
     save_category_limits, get_category_limits,
+    get_active_price_trackings, record_price_check_success,
+    record_price_check_failure, set_price_tracking_status,
 )
+from services.price_tracker import fetch_product_info
 from services.categories import FALLBACK_EXPENSE_CATEGORY, TYPE_INCOME, is_income_type
 from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
@@ -342,6 +345,76 @@ async def check_limit_warnings():
         await asyncio.sleep(60)
 
 
+async def check_price_tracking():
+    """Каждую активную позицию перепроверяем раз в ~3 часа (не глобально по
+    времени суток, а по last_checked_at конкретной строки — так после
+    перезапуска процесса ничего не "проспится" до следующего дня)."""
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            items = await asyncio.to_thread(get_active_price_trackings)
+            for item in items:
+                last_checked_str = str(item.get("last_checked_at") or "")
+                try:
+                    last_checked = datetime.datetime.strptime(last_checked_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=ASTANA_TZ)
+                except ValueError:
+                    last_checked = None
+                if last_checked and (now - last_checked) < datetime.timedelta(hours=3):
+                    continue
+
+                row_idx = item.get("row_idx")
+                info = await fetch_product_info(item.get("url"))
+                if not info or not info.get("price"):
+                    fail_count = await asyncio.to_thread(record_price_check_failure, row_idx)
+                    if fail_count >= 3:
+                        await asyncio.to_thread(set_price_tracking_status, row_idx, "broken")
+                        await safe_send_message(
+                            bot, chat_id=FAMILY_CHAT_ID,
+                            text=(
+                                f"⚠️ Не могу больше проверять цену на «{item.get('product_name')}» — "
+                                f"похоже, страница на Kaspi изменилась. Отслеживание остановлено, "
+                                f"пришли ссылку заново, если товар всё ещё актуален."
+                            ),
+                        )
+                    continue
+
+                new_price = info.get("price")
+                image_url = info.get("image_url") or item.get("image_url") or ""
+                first_price = float(item.get("first_price") or 0)
+                try:
+                    target_price = float(item.get("target_price")) if item.get("target_price") not in ("", None) else None
+                except (TypeError, ValueError):
+                    target_price = None
+
+                dropped = first_price > 0 and new_price < first_price
+                reached_target = target_price is not None and new_price <= target_price
+
+                if dropped or reached_target:
+                    caption = (
+                        f"📉 Цена упала: **{item.get('product_name')}**\n"
+                        f"Было: {_format_currency(first_price)} тг → Сейчас: {_format_currency(new_price)} тг\n"
+                        f"{info.get('url')}"
+                    )
+                    if reached_target:
+                        caption += f"\n\n🎯 Достигнута нужная цена ({_format_currency(target_price)} тг)!"
+                    try:
+                        if image_url:
+                            await bot.send_photo(chat_id=FAMILY_CHAT_ID, photo=image_url, caption=caption)
+                        else:
+                            await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=caption)
+                    except Exception as send_error:
+                        print(f"[Цены] Не удалось отправить фото, отправляю текстом: {send_error}")
+                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=caption)
+                    await asyncio.to_thread(record_price_check_success, row_idx, new_price, image_url)
+                    if reached_target:
+                        await asyncio.to_thread(set_price_tracking_status, row_idx, "reached")
+                else:
+                    await asyncio.to_thread(record_price_check_success, row_idx, new_price, image_url)
+        except Exception as e:
+            print(f"[Цены] Ошибка цикла отслеживания: {e}")
+        await asyncio.sleep(3600)
+
+
 async def check_subscriptions():
     while True:
         try:
@@ -607,6 +680,7 @@ async def main():
 
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
+    asyncio.create_task(check_price_tracking())
     asyncio.create_task(check_debt_reminders())
     asyncio.create_task(check_limit_warnings())
     asyncio.create_task(weather_scheduler())

@@ -15,6 +15,9 @@ EXPECTED = {
     "Debts": ["event_id", "debt_id", "date", "owner", "counterparty", "direction",
               "event_type", "amount", "currency", "due_date", "note"],
     "Goals": ["goal_id", "date_created", "name", "target_amount", "current_amount", "deadline", "status"],
+    "PriceTracking": ["id", "user", "url", "product_name", "image_url", "target_price",
+                      "first_price", "last_price", "last_checked_at", "fail_count",
+                      "status", "created_at"],
 }
 def check_schema():
     import gspread

@@ -81,6 +81,7 @@ async def parse_kaspi(url: str) -> Optional[dict]:
     product_id = None
     title = None
     price = 0.0
+    image_url = None
 
     async with AsyncSession(impersonate="chrome124") as session:
         if "l.kaspi.kz" in url.lower():
@@ -119,9 +120,24 @@ async def parse_kaspi(url: str) -> Optional[dict]:
                 if digits:
                     price = float(digits)
 
+            # Метатег product:price:amount отдаётся сервером статично (без JS)
+            # и надёжнее видимого текста на странице — пробуем в первую очередь,
+            # если экранная цена не нашлась (и как проверку, если нашлась).
+            if price == 0:
+                meta_price_m = re.search(r'<meta\s+property="product:price:amount"\s+content="([\d.]+)"', html_content)
+                if meta_price_m:
+                    try:
+                        price = float(meta_price_m.group(1))
+                    except ValueError:
+                        pass
+
             t_m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_content) or re.search(r'<title>([^<]+)</title>', html_content)
             if t_m:
                 title = clean_kaspi_title(t_m.group(1))
+
+            img_m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_content)
+            if img_m:
+                image_url = html.unescape(img_m.group(1))
 
         # 2. Если парсинг экрана не удался, запрашиваем API Астаны (город 710000000)
         if (price == 0 or not title) and product_id:
@@ -136,6 +152,14 @@ async def parse_kaspi(url: str) -> Optional[dict]:
                     api_data = api_resp.json()
                     if not title and api_data.get("title"):
                         title = clean_kaspi_title(api_data.get("title"))
+                    if not image_url:
+                        images = api_data.get("images") or []
+                        if images and isinstance(images, list):
+                            first_image = images[0]
+                            image_url = (
+                                first_image.get("medium") or first_image.get("large")
+                                or first_image.get("small") if isinstance(first_image, dict) else None
+                            )
 
                     # Берём реальную цену предложения (offers), а не общереспубликанский lowPrice
                     offers = api_data.get("offers", [])
@@ -154,6 +178,7 @@ async def parse_kaspi(url: str) -> Optional[dict]:
         "price": price,
         "in_stock": True,
         "url": f"https://kaspi.kz/shop/p/-{product_id}/" if product_id else final_url,
+        "image_url": image_url,
     }
 
 

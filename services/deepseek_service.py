@@ -92,7 +92,7 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 Отвечай ТОЛЬКО валидным JSON-объектом.
 
 Обязательные поля:
-- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "add_goal" | "deposit_goal" | "get_goals" | "chat"
+- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "add_goal" | "deposit_goal" | "get_goals" | "get_price_tracking" | "stop_price_tracking" | "chat"
 - "reply": "короткий живой ответ на русском"
 
 ВТОРОЕ, ПОПУТНОЕ НАМЕРЕНИЕ В ТОМ ЖЕ СООБЩЕНИИ (важно!):
@@ -169,6 +169,9 @@ recurrence_until через 14 дней от сегодня.
     Не путай это с обычным переводом человеку "за покупку" или "на подарок" — если явно сказано
     "занял"/"одолжил"/"в долг"/"взаймы", это debt, а не обычная трата, даже без слова "долг" в фразе.
 - intent "get_debts" — когда спрашивают «кто кому должен», «покажи долги», «сколько мы должны».
+- intent "get_price_tracking" — когда спрашивают «что я отслеживаю», «мои отслеживания цен», «список товаров, за которыми слежу».
+- intent "stop_price_tracking" — когда просят прекратить следить за ценой конкретного товара («хватит следить за холодильником», «убери из отслеживания микроволновку»).
+  "query": строка с ключевыми словами для поиска записи (например «холодильник»).
 
 Для add_goal/deposit_goal (финансовые цели/копилки — НЕ доходы и НЕ расходы, отдельный учёт "откладываем на что-то"):
 - "goal": {{

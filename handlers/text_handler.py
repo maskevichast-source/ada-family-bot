@@ -25,6 +25,7 @@ from services.sheets import (
     add_trip_plan, get_planned_trips,
     get_active_subscriptions, deactivate_subscription, add_or_update_subscription,
     add_installment, get_installments, close_installment,
+    add_price_tracking, get_user_price_trackings, stop_price_tracking,
     split_last_transaction_by_amount,
     get_transactions_for_period, find_recent_duplicate_transaction,
     debug_transactions_snapshot, normalize_necessity,
@@ -165,6 +166,10 @@ def _looks_like_receipt_comment(text: str) -> bool:
     if re.search(r"\d", t):
         return False
     return not _NOT_A_RECEIPT_COMMENT_RE.search(t.lower())
+
+
+_TRACK_PRICE_INTENT_RE = re.compile(r"(следи|отслежива|трекай|уведом\w*.{0,15}(подешев|упад|снизит))", re.IGNORECASE)
+_TARGET_PRICE_RE = re.compile(r"до\s+([\d\s]{3,})\s*(?:тг|тенге|₸)?", re.IGNORECASE)
 
 
 def _extract_marketplace_url(text: str) -> str | None:
@@ -538,13 +543,41 @@ async def _process_text_message(message: Message, text: str):
         if info:
             stock = "в наличии" if info.get("in_stock") else "нет в наличии"
             price = _format_currency(info.get("price", 0)) if info.get("price") else "цена не найдена"
-            res = (
-                f"🛒 **{info.get('marketplace')}**\n"
-                f"{info.get('title')}\n"
-                f"Цена: {price} тг\n"
-                f"Статус: {stock}\n"
-                f"{info.get('url')}"
-            )
+            marketplace = info.get("marketplace")
+            wants_tracking = bool(_TRACK_PRICE_INTENT_RE.search(text))
+
+            if wants_tracking and marketplace == "Kaspi" and info.get("price"):
+                target_m = _TARGET_PRICE_RE.search(text)
+                target_price = float("".join(c for c in target_m.group(1) if c.isdigit())) if target_m else None
+                saved = await asyncio.to_thread(add_price_tracking, {
+                    "user": user_name, "url": info.get("url"), "product_name": info.get("title"),
+                    "image_url": info.get("image_url") or "", "price": info.get("price"),
+                    "target_price": target_price,
+                })
+                if saved:
+                    res = (
+                        f"🛒 Буду следить за ценой:\n{info.get('title')}\nСейчас: {price} тг\n"
+                        + (f"Напишу, если упадёт до {_format_currency(target_price)} тг или ниже."
+                           if target_price else "Напишу, если цена упадёт.")
+                    )
+                else:
+                    res = "Не смогла сохранить отслеживание, попробуй ещё раз."
+            elif wants_tracking and marketplace != "Kaspi":
+                res = (
+                    f"🛒 **{marketplace}**\n{info.get('title')}\nЦена: {price} тг\nСтатус: {stock}\n\n"
+                    f"Отслеживание цены здесь, к сожалению, не работает — {marketplace} блокирует ботов, "
+                    f"такой возможности технически нет. Могу следить только за товарами с Kaspi."
+                )
+            else:
+                res = (
+                    f"🛒 **{marketplace}**\n"
+                    f"{info.get('title')}\n"
+                    f"Цена: {price} тг\n"
+                    f"Статус: {stock}\n"
+                    f"{info.get('url')}"
+                )
+                if marketplace == "Kaspi" and info.get("price"):
+                    res += "\n\nХочешь, буду следить за ценой — просто напиши «следи за ценой»."
         else:
             res = "Не смогла разобрать ссылку на товар."
         add_chat_message(chat_id, "Ада", res)
@@ -926,6 +959,32 @@ async def _process_text_message(message: Message, text: str):
             res = "\n".join(lines)
         else:
             res = "Нет активных подписок."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
+        return
+
+    if intent == "get_price_tracking":
+        items = await asyncio.to_thread(get_user_price_trackings, user_name)
+        if items:
+            lines = ["🛒 **Отслеживаю цены:**"]
+            for item in items:
+                target = item.get("target_price")
+                target_str = f", цель {_format_currency(target)} тг" if target else ""
+                lines.append(
+                    f"- {item.get('product_name')}: сейчас {_format_currency(item.get('last_price'))} тг"
+                    f" (было {_format_currency(item.get('first_price'))} тг{target_str})"
+                )
+            res = "\n".join(lines)
+        else:
+            res = "Пока ничего не отслеживаю. Кинь ссылку на товар с Kaspi и напиши «следи за ценой»."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
+        return
+
+    if intent == "stop_price_tracking":
+        query = (parsed.get("query") or text or "").strip()
+        stopped = await asyncio.to_thread(stop_price_tracking, query)
+        res = "Хорошо, перестала следить за этим товаром." if stopped else "Не нашла такую позицию в отслеживании."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
