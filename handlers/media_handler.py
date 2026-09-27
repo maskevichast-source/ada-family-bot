@@ -12,6 +12,7 @@ from services.sheets import (
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending, ack_pending
 from services.state import dialogue_key
+from services import state
 from services.memory import get_chat_history, add_chat_message
 from services import fx, goals
 from services.money import normalize_currency_code
@@ -171,6 +172,40 @@ async def handle_media(message: Message):
         return
 
     result = await parse_receipt(file_bytes, filename, caption, user_name, _build_recent_context(chat_id, user_name))
+
+    # Долг (занял/одолжил/вернул), а не обычная покупка — определяется по
+    # подписи к фото (например "занял Ануару, перевёл на халык"). Фото/чек
+    # никогда раньше не мог стать долгом (только текстовый ввод это умел) —
+    # переведённая сумма другу молча записывалась обычным расходом. Если
+    # ИИ уверенно распознал долг — ничего не пишем как трату, только черновик
+    # на подтверждение, через тот же механизм, что и текстовый ввод (Да/Нет).
+    debt_hint = result.get("debt_hint")
+    if debt_hint and debt_hint.get("direction") in {"lent", "borrowed"} and debt_hint.get("counterparty"):
+        try:
+            debt_amount = float(debt_hint.get("amount") or 0)
+        except (TypeError, ValueError):
+            debt_amount = 0
+        if debt_amount > 0:
+            payload = {
+                "owner": user_name, "event_type": "open",
+                "direction": debt_hint["direction"],
+                "counterparty": str(debt_hint["counterparty"]).strip(),
+                "amount": debt_amount, "currency": "KZT",
+            }
+            draft_key = dialogue_key(chat_id, message.from_user.id)
+            state.put("debt_draft", draft_key, {
+                "payload": payload, "event_id": f"DE_{chat_id}_{message.message_id}",
+            })
+            action = "Выдача в долг" if payload["direction"] == "lent" else "Получение в долг"
+            await safe_answer(
+                message,
+                f"💰 Похоже, это долг, а не обычная трата.\n\n{action}\n"
+                f"Участник семьи: {user_name}\nКонтрагент: {payload['counterparty']}\n"
+                f"Сумма: {_format_currency(debt_amount)}\n\n"
+                "Записать как долг (не как трату)? «Да» / «Нет».",
+            )
+            return
+
     transactions = result.get("transactions", [])
     reply = result.get("reply", "")
 
