@@ -118,6 +118,8 @@
   "tests/test_receipt_debt_hint.py::test_photo_debt_hint_creates_draft_not_transaction",
   "tests/test_receipt_debt_hint.py::test_photo_debt_hint_declined_via_text_net",
   "tests/test_receipt_debt_hint.py::test_photo_without_debt_hint_still_records_normal_transaction",
+  "tests/test_reflection_model.py::test_generate_budget_reflection_falls_back_to_empty_on_error",
+  "tests/test_reflection_model.py::test_generate_budget_reflection_uses_reasoning_model",
   "tests/test_release.py::test_ambiguous_loan_rejected",
   "tests/test_release.py::test_atomic_split_request",
   "tests/test_release.py::test_blank_rows_not_selected_as_last",

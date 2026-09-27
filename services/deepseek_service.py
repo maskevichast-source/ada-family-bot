@@ -4,7 +4,7 @@ import traceback
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY
 from services.timezone import now_astana
-from services.ai_config import DEEPSEEK_MODEL, DEEPSEEK_THINKING_EFFORT
+from services.ai_config import DEEPSEEK_MODEL, DEEPSEEK_THINKING_EFFORT, DEEPSEEK_REASONING_MODEL
 from services.categories import (
     EXPENSE_CATEGORIES, INCOME_CATEGORIES, TYPE_EXPENSE, TYPE_INCOME,
     format_category_list, SUBCATEGORIES_MAP, get_time_context_hint,
@@ -445,7 +445,7 @@ async def generate_budget_reflection(kind: str, facts: str) -> str:
     )
     try:
         response = await client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
+            model=DEEPSEEK_REASONING_MODEL,
             messages=[
                 {"role": "system", "content": prompt},
                 {"role": "user", "content": facts},
