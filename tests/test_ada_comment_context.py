@@ -53,25 +53,74 @@ def test_build_recent_context_transaction_history_bug_is_fixed(db, monkeypatch):
     assert "Еда и продукты" in context
 
 
-def test_build_recent_context_adds_harmful_fact_when_frequent(db, monkeypatch):
+def _seed_harmful(db, n, user="Влад"):
+    now = dt.datetime.now(ASTANA_TZ).replace(tzinfo=None)
+    for i in range(n):
+        _seed_row(db, f"H{i}", _fmt(now - dt.timedelta(hours=i + 1)), user, HARMFUL_CATEGORY, comm="сигареты")
+
+
+def test_habit_fact_added_when_frequent_and_text_matches(db, monkeypatch):
     from handlers import media_handler as mh
 
     monkeypatch.setattr(mh, "get_chat_history", lambda *a: [])
-    now = dt.datetime.now(ASTANA_TZ).replace(tzinfo=None)
-    _seed_row(db, "T1", _fmt(now - dt.timedelta(days=1)), "Влад", HARMFUL_CATEGORY, comm="сигареты")
-    _seed_row(db, "T2", _fmt(now - dt.timedelta(days=2)), "Влад", HARMFUL_CATEGORY, comm="энергетик")
+    _seed_harmful(db, 3)
 
-    context = mh._build_recent_context(chat_id=-100, user_name="Влад")
+    context = mh._build_recent_context(chat_id=-100, user_name="Влад", caption="Пачка сигарет")
     assert "ФАКТ" in context
-    assert "2 покупок" in context or "2 покупки" in context or "2 покупок(и)" in context
+    assert "3 таких покупок" in context
 
 
-def test_build_recent_context_no_harmful_fact_when_single_purchase(db, monkeypatch):
+def test_habit_fact_not_repeated_within_cooldown(db, monkeypatch):
+    """Ключевая защита от "заезженной пластинки": после замечания следующие
+    72 часа факт в промпт вообще не попадает, как бы часто человек ни покупал."""
     from handlers import media_handler as mh
 
     monkeypatch.setattr(mh, "get_chat_history", lambda *a: [])
-    now = dt.datetime.now(ASTANA_TZ).replace(tzinfo=None)
-    _seed_row(db, "T1", _fmt(now - dt.timedelta(days=1)), "Влад", HARMFUL_CATEGORY, comm="сигареты")
+    _seed_harmful(db, 4)
 
-    context = mh._build_recent_context(chat_id=-100, user_name="Влад")
+    first = mh._build_recent_context(chat_id=-100, user_name="Влад", caption="Банка энергетика")
+    second = mh._build_recent_context(chat_id=-100, user_name="Влад", caption="Пачка сигарет")
+    assert "ФАКТ" in first
+    assert "ФАКТ" not in second
+
+
+def test_habit_fact_returns_after_cooldown_expires(db, monkeypatch):
+    from services import state
+    from services.analytics import habit_remark_due
+
+    _seed_harmful(db, 3)
+    assert habit_remark_due("Влад", "пачка сигарет") == 3
+    assert habit_remark_due("Влад", "пачка сигарет") is None
+
+    old = (dt.datetime.now(ASTANA_TZ) - dt.timedelta(hours=73)).isoformat()
+    state.put("habit_remark", "Влад", {"at": old})
+    assert habit_remark_due("Влад", "пачка сигарет") == 3
+
+
+def test_unrelated_caption_does_not_burn_cooldown(db, monkeypatch):
+    """Чек на хлеб не должен тратить паузу — иначе замечание пропадёт там,
+    где оно действительно уместно (при следующей пачке сигарет)."""
+    from services.analytics import habit_remark_due
+
+    _seed_harmful(db, 3)
+    assert habit_remark_due("Влад", "Хлеб и молоко") is None
+    assert habit_remark_due("Влад", "") is None
+    assert habit_remark_due("Влад", "пачка сигарет") == 3
+
+
+def test_habit_fact_needs_three_prior_purchases(db, monkeypatch):
+    from handlers import media_handler as mh
+
+    monkeypatch.setattr(mh, "get_chat_history", lambda *a: [])
+    _seed_harmful(db, 2)
+
+    context = mh._build_recent_context(chat_id=-100, user_name="Влад", caption="Пачка сигарет")
     assert "ФАКТ" not in context
+
+
+def test_habit_fact_is_per_user(db, monkeypatch):
+    from services.analytics import habit_remark_due
+
+    _seed_harmful(db, 3, user="Влад")
+    assert habit_remark_due("Диана", "пачка сигарет") is None  # у Дианы нет истории
+    assert habit_remark_due("Влад", "пачка сигарет") == 3

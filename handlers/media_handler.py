@@ -7,7 +7,6 @@ from services.vision import parse_receipt
 from services.sheets import (
     append_transaction, normalize_necessity, get_last_200_transactions,
     add_trip_plan, get_planned_trips, add_or_update_subscription,
-    count_recent_category_purchases,
 )
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending, ack_pending
@@ -23,9 +22,8 @@ from services.categories import (
     FALLBACK_EXPENSE_CATEGORY, FALLBACK_INCOME_CATEGORY,
     normalize_category, normalize_subcategory,
     validate_transaction_category_subcategory,
-    HARMFUL_CATEGORY,
 )
-from services.analytics import detect_amount_anomaly
+from services.analytics import detect_amount_anomaly, habit_remark_due
 from services.deepseek_service import generate_budget_reflection
 from services.banks import normalize_bank_source
 import re
@@ -44,7 +42,7 @@ _GOAL_DEPOSIT_CAPTION_RE = re.compile(
 )
 
 
-def _build_recent_context(chat_id: int, user_name: str = "") -> str:
+def _build_recent_context(chat_id: int, user_name: str = "", caption: str = "") -> str:
     """Несколько последних трат и сообщений чата — чтобы комментарий к
     новому чеку мог естественно связать его с тем, что уже происходит
     (например, переезд, начатый вчера/сегодня), а не был "слепым" к
@@ -64,14 +62,16 @@ def _build_recent_context(chat_id: int, user_name: str = "") -> str:
     except Exception:
         pass
     try:
-        harmful_count = count_recent_category_purchases(user_name, HARMFUL_CATEGORY, days=7)
-        if harmful_count >= 2:
+        # Решает код (см. habit_remark_due): только если в подписи речь про
+        # такую покупку, повторов уже достаточно и прошлое замечание было давно.
+        harmful_count = habit_remark_due(user_name, caption)
+        if harmful_count:
             lines.append(
                 f"- ФАКТ (посчитано кодом, не выдумано): за последние 7 дней у "
-                f"{user_name or 'этого человека'} уже было {harmful_count} покупок(и) "
-                f"из категории «{HARMFUL_CATEGORY}» (сигареты/энергетики/алкоголь), "
-                f"не считая сегодняшней, если она из этой же категории — учти это "
-                f"в комментарии по правилам из раздела КОММЕНТАРИИ ниже."
+                f"{user_name} уже было {harmful_count} таких покупок (сигареты/"
+                f"энергетики/алкоголь), не считая сегодняшней. Можно отметить это "
+                f"ОДНОЙ короткой фразой своими словами (с конкретным числом, без "
+                f"советов и без слов «стоит»/«нужно») — правила в разделе КОММЕНТАРИИ."
             )
     except Exception:
         pass
@@ -171,7 +171,7 @@ async def handle_media(message: Message):
         await safe_answer(message, "Не распознала формат файла. Пришли фото или PDF.")
         return
 
-    result = await parse_receipt(file_bytes, filename, caption, user_name, _build_recent_context(chat_id, user_name))
+    result = await parse_receipt(file_bytes, filename, caption, user_name, _build_recent_context(chat_id, user_name, caption))
 
     # Долг (занял/одолжил/вернул), а не обычная покупка — определяется по
     # подписи к фото (например "занял Ануару, перевёл на халык"). Фото/чек

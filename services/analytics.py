@@ -2,11 +2,51 @@
 
 import calendar
 import datetime
+import re
 from collections import defaultdict
 from services.sheets import get_transactions_for_period
-from services.categories import TYPE_EXPENSE, TYPE_INCOME
+from services.categories import (
+    TYPE_EXPENSE, TYPE_INCOME, HARMFUL_CATEGORY, HARMFUL_TEXT_HINTS,
+    HABIT_REMARK_MIN_PRIOR, HABIT_REMARK_COOLDOWN_HOURS,
+)
 from services.timezone import now_astana
 from services.money import parse_amount
+
+_HARMFUL_TEXT_RE = re.compile(HARMFUL_TEXT_HINTS, re.IGNORECASE)
+
+
+def habit_remark_due(user_name: str, text: str, days: int = 7) -> int | None:
+    """Решает, стоит ли в ЭТОМ ответе дать ИИ факт о частоте покупок из
+    HARMFUL_CATEGORY (сигареты/энергетики/алкоголь). Возвращает количество
+    прошлых покупок за `days` дней или None.
+
+    Замечание даётся только если одновременно:
+      1) в самом тексте/подписи речь про такую покупку (иначе чек на хлеб
+         зря сожжёт паузу);
+      2) прошлых таких покупок не меньше HABIT_REMARK_MIN_PRIOR;
+      3) с прошлого замечания этому человеку прошло HABIT_REMARK_COOLDOWN_HOURS.
+    При успехе пауза сразу взводится. Решает код, а не модель — иначе, получив
+    факт в промпте, она озвучивает его в каждом сообщении подряд."""
+    from services.sheets import count_recent_category_purchases
+    from services import state
+
+    if not user_name or not text or not _HARMFUL_TEXT_RE.search(text.lower()):
+        return None
+    count = count_recent_category_purchases(user_name, HARMFUL_CATEGORY, days=days)
+    if count < HABIT_REMARK_MIN_PRIOR:
+        return None
+
+    now = now_astana()
+    last = state.get("habit_remark", user_name)
+    if last:
+        try:
+            last_at = datetime.datetime.fromisoformat(last["at"])
+            if now - last_at < datetime.timedelta(hours=HABIT_REMARK_COOLDOWN_HOURS):
+                return None
+        except (KeyError, TypeError, ValueError):
+            pass  # битая/несравнимая метка — считаем, что паузы нет
+    state.put("habit_remark", user_name, {"at": now.isoformat()})
+    return count
 
 
 def _format_currency(value):
