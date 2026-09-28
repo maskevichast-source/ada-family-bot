@@ -99,7 +99,8 @@ def get_debts_due_soon(days_ahead: int = 3):
 def person_key(name):
     s = re.sub(r"[^а-яa-z]", "", name.lower().replace("ё", "е"))
     aliases = {"саше": "саша", "саши": "саша", "сашей": "саша",
-               "диане": "диана", "дианы": "диана", "владу": "влад", "влада": "влад"}
+               "диане": "диана", "дианы": "диана", "владу": "влад", "влада": "влад",
+               "ануару": "ануар", "ануара": "ануар"}
     return aliases.get(s, s)
 
 def is_debt_request(text):
@@ -175,7 +176,7 @@ def parse_local(text, owner):
         if not parsed:
             raise ValueError("Некорректная дата возврата.")
         due = parsed.date().isoformat()
-    return {"owner": owner, "counterparty": name.capitalize(), "direction": direction,
+    return {"owner": owner, "counterparty": person_key(name).capitalize(), "direction": direction,
             "event_type": "open", "amount": amount, "currency": "KZT", "due_date": due, "note": text}
 
 def format_balances(items):
