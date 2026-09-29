@@ -81,12 +81,20 @@ def _user_of(t: dict) -> str:
     return normalize_family_user_name(raw) or raw
 
 
-def _short_text(t: dict) -> str:
-    for key in ("merchant", "comm", "subcat"):
-        value = str(t.get(key) or "").strip()
-        if value:
-            return value[:80]
-    return ""
+NOTE_MAX_CHARS = 160
+
+
+def _title_and_note(t: dict) -> tuple[str, str]:
+    """Заголовок строки траты (магазин или получатель, иначе подкатегория) и
+    заметка — комментарий, который семья написала к трате (он поясняет, что это было).
+    Комментарий ИИ не берём: он короткий, разговорный и ничего не поясняет."""
+    title = str(t.get("merchant") or "").strip() or str(t.get("subcat") or "").strip()
+    note = " ".join(str(t.get("comm") or "").split())
+    if note.lower() == title.lower():
+        note = ""
+    if len(note) > NOTE_MAX_CHARS:
+        note = note[: NOTE_MAX_CHARS - 1].rstrip() + "…"
+    return title[:80], note
 
 
 def _cumulative(by_day: dict[int, float], length: int) -> list[float]:
@@ -175,11 +183,14 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
                     day_cur[dt.day] = day_cur.get(dt.day, 0.0) + amount
                 cat = str(t.get("cat") or "").strip() or "Без категории"
                 by_cat[cat] = by_cat.get(cat, 0.0) + amount
+                title, note = _title_and_note(t)
                 expenses.append({
                     "date": dt.strftime("%d.%m.%Y"),
                     "amount": round(amount, 2),
                     "category": cat,
-                    "text": _short_text(t),
+                    "subcat": str(t.get("subcat") or "").strip(),
+                    "text": title,
+                    "note": note,
                     "user": _user_of(t),
                     "_ts": dt.timestamp(),
                 })

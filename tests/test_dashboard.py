@@ -207,8 +207,9 @@ def test_load_dashboard_end_to_end_on_fake_sheets(db):
     assert sum(t["amt"] for t in txs if t["type"] == "РАСХОД") == d["expense"]
 
 
-def txu(date, amt, user, cat="Еда и продукты", text="", typ="РАСХОД"):
-    return {"date": date, "amt": amt, "cat": cat, "type": typ, "user": user, "merchant": text}
+def txu(date, amt, user, cat="Еда и продукты", text="", typ="РАСХОД", comm="", subcat=""):
+    return {"date": date, "amt": amt, "cat": cat, "type": typ, "user": user, "merchant": text,
+            "comm": comm, "subcat": subcat}
 
 
 MULTI = [
@@ -262,7 +263,7 @@ def test_expenses_sorted_desc_with_details_and_cap():
     amounts = [e["amount"] for e in d["expenses"]]
     assert amounts == sorted(amounts, reverse=True) == [70000, 50000, 30000, 10000]
     assert d["expenses"][0] == {"date": "20.07.2026", "amount": 70000, "category": "Одежда и обувь",
-                                "text": "Zara", "user": "Диана"}
+                                "subcat": "", "text": "Zara", "note": "", "user": "Диана"}
     assert d["expenses_total"] == 4
     many = [txu("2026-09-02 10:00:00", i + 1, "Влад") for i in range(dashboard.MAX_EXPENSE_ROWS + 25)]
     capped = dashboard.compute_dashboard(many, {}, NOW)
@@ -338,3 +339,23 @@ def test_monthly_bars_for_longer_periods():
 def test_dynamics_empty_month():
     d = dashboard.compute_dashboard([], {}, NOW, months=1)["dynamics"]
     assert d["cur"] == [0.0] * 15 and d["bars"][0]["value"] == 0
+
+
+def test_expense_rows_carry_user_comment_as_note():
+    txs = [
+        txu("2026-09-07 10:00:00", 480000, "Влад", "Дом и быт", "Есимбек Е.",
+            comm="Оплата окончания ремонтных работ, оплата прорабу", subcat="Ремонт"),
+        txu("2026-09-08 10:00:00", 131347, "Влад", "Финансовые расходы и переводы", "По номеру телефона",
+            comm="Погашение кредитной задолженности по карте ozen"),
+        txu("2026-09-09 10:00:00", 5000, "Влад", "Дом и быт", "Temu", comm="  temu  "),          # дубль названия
+        txu("2026-09-10 10:00:00", 4000, "Влад", "Дом и быт", "", comm="Клининг", subcat="Уборка"),  # нет магазина
+        txu("2026-09-11 10:00:00", 3000, "Влад", "Дом и быт", "Ozon", comm="а" * 400),
+    ]
+    rows = dashboard.compute_dashboard(txs, {}, NOW, months=1)["expenses"]
+    by_amount = {r["amount"]: r for r in rows}
+    assert by_amount[480000]["note"].startswith("Оплата окончания ремонтных работ")
+    assert by_amount[480000]["subcat"] == "Ремонт" and by_amount[480000]["text"] == "Есимбек Е."
+    assert "ozen" in by_amount[131347]["note"]
+    assert by_amount[5000]["note"] == ""                       # комментарий = название, не дублируем
+    assert by_amount[4000]["text"] == "Уборка" and by_amount[4000]["note"] == "Клининг"
+    assert len(by_amount[3000]["note"]) == dashboard.NOTE_MAX_CHARS and by_amount[3000]["note"].endswith("…")
