@@ -742,20 +742,77 @@ def get_category_limits():
         return {}
 
 
-def save_category_limits(new_limits: dict):
+_PINNED_TRUE = {"да", "yes", "true", "1", "+", "y", "закреплён", "закреплен"}
+
+
+def get_pinned_categories() -> set:
+    """Категории, у которых в листе Limits в колонке pinned стоит «да».
+
+    Автопересчёт лимитов такие категории не трогает.
+    """
+    try:
+        ws = get_db().worksheet("Limits")
+        return {
+            str(r.get("category", "")).strip()
+            for r in _get_all_records_safe(ws)
+            if str(r.get("pinned", "")).strip().lower() in _PINNED_TRUE and str(r.get("category", "")).strip()
+        }
+    except Exception as e:
+        print(f"[Лимиты] Не удалось прочитать pinned: {e}")
+        return set()
+
+
+def save_category_limits(new_limits: dict, pinned=None):
+    """Записывает лимиты. Колонка pinned сохраняется: если pinned не передан,
+    берутся флаги, уже стоящие в таблице."""
     try:
         db = get_db()
         try:
             ws = db.worksheet("Limits")
         except Exception:
-            ws = db.add_worksheet(title="Limits", rows=20, cols=2)
-            ws.append_row(["category", "limit_amount"])
+            ws = db.add_worksheet(title="Limits", rows=20, cols=3)
+            ws.append_row(["category", "limit_amount", "pinned"])
+        keep = set(pinned) if pinned is not None else get_pinned_categories()
         ws.clear()
-        ws.append_row(["category", "limit_amount"])
+        ws.append_row(["category", "limit_amount", "pinned"])
         for cat, limit in new_limits.items():
-            ws.append_row([str(cat), parse_amount(limit)], table_range=_table_range(2))
+            ws.append_row(
+                [str(cat), parse_amount(limit), "да" if str(cat) in keep else ""],
+                table_range=_table_range(3),
+            )
     except Exception as e:
         print(f"[Лимиты] Ошибка сохранения: {e}")
+
+
+def find_foreign_currency_rows() -> list:
+    """Строки Transactions, где валюта не KZT (записаны до автоконвертации).
+
+    Возвращает [{"row", "amount", "currency", "comment"}, ...].
+    """
+    rows = []
+    try:
+        ws = get_db().worksheet("Transactions")
+        for idx, r in enumerate(_get_all_records_safe(ws), start=2):
+            cur = normalize_currency_code(r.get("currency"))
+            if cur and cur != "KZT":
+                amount = parse_amount(r.get("amount"))
+                if amount > 0:
+                    rows.append({"row": idx, "amount": amount, "currency": cur,
+                                 "comment": str(r.get("ai_comment") or "")})
+    except Exception as e:
+        print(f"[Валюта] Не удалось проверить таблицу: {e}")
+    return rows
+
+
+def apply_currency_fix(row: int, kzt_amount: float, original_amount: float, currency: str,
+                       rate: float, old_comment: str = "") -> None:
+    """Переписывает строку в тенге и оставляет след в ai_comment. Идемпотентно:
+    после исправления валюта становится KZT, и строка больше не попадает в выборку."""
+    ws = get_db().worksheet("Transactions")
+    note = f"(пересчитано автоматически: {original_amount:g} {currency} по курсу {rate:.2f})"
+    _retry_write(ws.update_cell, row, 5, kzt_amount)
+    _retry_write(ws.update_cell, row, 6, "KZT")
+    _retry_write(ws.update_cell, row, 16, f"{old_comment or ''} {note}".strip())
 
 
 def get_installments():

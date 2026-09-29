@@ -3,7 +3,7 @@ import datetime as dt
 import io
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, MagicMock
 import pytest
 from test_handlers import handler, message
 from services import sheets, state, reminders
@@ -156,11 +156,14 @@ def test_weekly_summary_and_monthly_limits(app,monkeypatch):
     frozen(monkeypatch,app,when.replace(day=1,minute=25))
     tick(app.finance_report_scheduler)
     assert calls[-1][1:]==("2026-08-01","2026-09-01","2026-07-01","2026-08-01")
-    gen=AsyncMock(return_value={"Транспорт":1000})
-    monkeypatch.setattr(app,"generate_limits_from_history",gen)
+    recalc=MagicMock(return_value=({"Транспорт":1000},"Сводка лимитов"))
+    monkeypatch.setattr(app,"recalc_and_apply",recalc)
     monkeypatch.setenv("AUTO_GENERATE_LIMITS","true")
+    app.bot.send_message.reset_mock()
     tick(app.monthly_limits_scheduler)
-    assert gen.called and state.get("scheduler","limits:2026-09")
+    assert recalc.called and state.get("scheduler","limits:2026-09")
+    sent=app.bot.send_message.call_args.kwargs.get("text") or app.bot.send_message.call_args.args[-1]
+    assert sent=="Сводка лимитов"
 
 def test_weekly_summary_prepends_live_reflection_when_present(app,monkeypatch):
     when=dt.datetime(2026,9,7,9,15,tzinfo=ASTANA_TZ) # Monday
@@ -214,3 +217,24 @@ def test_pdf_text_no_emoji_and_real_newlines():
     from services.reports import _wrap_pdf
     text=_wrap_pdf("🔎 Анализ бюджета\n💡 Совет",80)
     assert "🔎" not in text and "\n" in text and "\\n" not in text
+
+
+def test_monthly_limits_failure_keeps_marker_unset_and_reports_after_three_tries(app,monkeypatch):
+    when=dt.datetime(2026,10,1,9,25,tzinfo=ASTANA_TZ)
+    frozen(monkeypatch,app,when)
+    recalc=MagicMock(return_value=None)   # таблица не прочиталась
+    monkeypatch.setattr(app,"recalc_and_apply",recalc)
+    monkeypatch.setenv("AUTO_GENERATE_LIMITS","true")
+    app.bot.send_message.reset_mock()
+    tick(app.monthly_limits_scheduler)
+    assert recalc.call_count==1
+    assert not state.get("scheduler","limits:2026-10")      # маркер не ставим: повторим позже
+    assert app.bot.send_message.call_count==0                # сбой в чат не спамим
+
+def test_monthly_limits_disabled_without_env(app,monkeypatch):
+    frozen(monkeypatch,app,dt.datetime(2026,10,1,9,25,tzinfo=ASTANA_TZ))
+    recalc=MagicMock(return_value=({"Транспорт":1},"x"))
+    monkeypatch.setattr(app,"recalc_and_apply",recalc)
+    monkeypatch.delenv("AUTO_GENERATE_LIMITS",raising=False)
+    tick(app.monthly_limits_scheduler)
+    assert not recalc.called

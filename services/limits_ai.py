@@ -1,5 +1,9 @@
-"""Генерация лимитов бюджета на основе истории трат через DeepSeek."""
+"""Пересчёт лимитов бюджета по истории трат: считает код (services/limits_engine.py).
 
+Старый промпт для DeepSeek (LIMITS_SYSTEM_PROMPT) оставлен в файле, но больше не используется."""
+
+import asyncio
+import datetime
 import json
 from openai import AsyncOpenAI
 from config import DEEPSEEK_API_KEY
@@ -8,6 +12,7 @@ from services.categories import (
     EXPENSE_CATEGORIES, DEFAULT_EXPENSE_LIMITS, TYPE_EXPENSE,
 )
 from services.sheets import get_last_200_transactions, save_category_limits
+from services.timezone import now_astana
 
 client = AsyncOpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
@@ -28,62 +33,87 @@ LIMITS_SYSTEM_PROMPT = f"""
 """
 
 
+SNAPSHOT_NAMESPACE = "limits_snapshot"
+
+
+def _load_inputs(now):
+    """Один проход по Google Sheets: транзакции за 6 месяцев, лимиты, закреплённые."""
+    from services import sheets
+    from services.limits_engine import _shift
+
+    fy, fm = _shift(now.year, now.month, -6)
+    start = f"{fy:04d}-{fm:02d}-01"
+    end = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+    return (
+        sheets.get_transactions_for_period(start, end),
+        sheets.get_category_limits(),
+        sheets.get_pinned_categories(),
+    )
+
+
+def build_plan(now=None) -> dict | None:
+    """Считает новые лимиты, ничего не записывая. None — если данных нет
+    (в т.ч. если чтение таблицы не удалось: тогда лимиты трогать нельзя)."""
+    from services.limits_engine import compute_limits
+
+    now = now or now_astana()
+    transactions, current, pinned = _load_inputs(now)
+    if not transactions:
+        return None
+    result = compute_limits(transactions, now, current, pinned)
+    return {"result": result, "old": current, "now": now}
+
+
+def preview_limits_text() -> str:
+    """Черновик для команды /limits_plan: ничего не записывает."""
+    from services.limits_engine import format_summary
+
+    plan = build_plan()
+    if not plan:
+        return "Не удалось прочитать траты из таблицы, поэтому ничего не считаю. Лимиты не тронуты."
+    return format_summary(plan["result"], plan["old"], plan["now"], preview=True)
+
+
+def recalc_and_apply() -> tuple[dict, str] | None:
+    """Пересчитывает и ЗАПИСЫВАЕТ лимиты. Перед записью сохраняет снимок старых
+    (для /limits_undo). Возвращает (новые лимиты, текст сводки) или None."""
+    from services import state
+    from services.limits_engine import format_summary
+
+    plan = build_plan()
+    if not plan:
+        return None
+    result, old, now = plan["result"], plan["old"], plan["now"]
+    state.put(SNAPSHOT_NAMESPACE, "last", {
+        "saved_at": now.isoformat(),
+        "limits": old,
+        "pinned": sorted(result["pinned"]),
+    })
+    save_category_limits(result["limits"], pinned=set(result["pinned"]))
+    return result["limits"], format_summary(result, old, now)
+
+
+def restore_previous_limits() -> str:
+    """Откат к лимитам до последнего пересчёта (команда /limits_undo)."""
+    from services import state
+
+    snap = state.get(SNAPSHOT_NAMESPACE, "last")
+    if not snap or not snap.get("limits"):
+        return "Нечего откатывать: снимка прежних лимитов нет."
+    save_category_limits(snap["limits"], pinned=set(snap.get("pinned") or []))
+    state.delete(SNAPSHOT_NAMESPACE, "last")
+    return f"Вернула лимиты, которые были до пересчёта от {str(snap.get('saved_at', ''))[:10]}."
+
+
 async def generate_limits_from_history() -> dict:
-    """Сгенерировать лимиты на основе истории трат."""
+    """Пересчитать лимиты по истории трат (детерминированно, без ИИ).
+
+    Имя и тип результата сохранены для старых вызовов (интент «сгенерируй
+    лимиты»). При ошибке лимиты остаются как были, а не сбрасываются в дефолт.
+    """
     try:
-        transactions = get_last_200_transactions()
-
-        # Группируем траты по категориям за последние 3 месяца
-        from collections import defaultdict
-        from datetime import datetime
-
-        monthly_by_cat = defaultdict(lambda: defaultdict(float))
-
-        for t in transactions:
-            if str(t.get("type")) != TYPE_EXPENSE:
-                continue
-            date_str = str(t.get("date", ""))
-            if len(date_str) >= 7:
-                month_key = date_str[:7]  # YYYY-MM
-                cat = str(t.get("cat") or "Прочее")
-                try:
-                    amt = float(str(t.get("amt", 0)).replace(",", "."))
-                    monthly_by_cat[cat][month_key] += amt
-                except (ValueError, TypeError):
-                    pass
-
-        # Формируем контекст для ИИ
-        context = []
-        for cat, months in monthly_by_cat.items():
-            avg = sum(months.values()) / max(len(months), 1)
-            context.append(f"{cat}: среднее {avg:.0f} тг/мес (данные за {len(months)} мес)")
-
-        messages = [
-            {"role": "system", "content": LIMITS_SYSTEM_PROMPT},
-            {"role": "user", "content": f"История трат:\n{chr(10).join(context)}\n\nСгенерируй лимиты."}
-        ]
-
-        response = await client.chat.completions.create(
-            model=DEEPSEEK_MODEL,
-            messages=messages,
-            response_format={"type": "json_object"}
-        )
-
-        result = json.loads(response.choices[0].message.content)
-        limits = result.get("limits", {})
-
-        # Валидация: все категории из EXPENSE_CATEGORIES должны быть
-        final_limits = {}
-        for cat in EXPENSE_CATEGORIES:
-            final_limits[cat] = float(limits.get(cat, DEFAULT_EXPENSE_LIMITS.get(cat, 10000)))
-
-        save_category_limits(final_limits)
-        return final_limits
-
+        out = await asyncio.to_thread(recalc_and_apply)
+        return out[0] if out else {}
     except Exception as e:
-        print(f"[Лимиты AI] Ошибка генерации: {e}")
-        # Возвращаем дефолтные
-        save_category_limits(DEFAULT_EXPENSE_LIMITS)
-        return DEFAULT_EXPENSE_LIMITS
-
-
+        print(f"[Лимиты] Ошибка пересчёта: {e}")
+        return {}

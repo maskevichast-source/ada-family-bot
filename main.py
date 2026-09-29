@@ -37,7 +37,11 @@ from services.charts import generate_expense_chart, generate_trend_chart
 from services.reports import generate_pdf_report, generate_excel_export
 from services.analytics import analyze_budget_leaks, detect_category_pace_anomalies
 from services.deepseek_service import generate_budget_reflection
-from services.limits_ai import generate_limits_from_history
+from services.limits_ai import (
+    generate_limits_from_history, recalc_and_apply, preview_limits_text, restore_previous_limits,
+)
+from services import fx
+from services import sheets as sheets_module
 from services.timezone import now_astana
 from services.reminders import deliver_due
 from services import preflight, state, debts
@@ -131,6 +135,8 @@ async def cmd_help(message: types.Message):
         "/report — скачать PDF-буклет за месяц\n"
         "/export — скачать выписку в Excel (.xlsx)\n"
         "/app — открыть мини-апп с дашбордом\n"
+        "/limits_plan — показать, как Ада пересчитала бы лимиты (без записи)\n"
+        "/limits_undo — вернуть лимиты, что были до последнего пересчёта\n"
         "/debug — диагностика таблицы\n\n"
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
@@ -168,6 +174,26 @@ async def cmd_app(message: types.Message):
         await safe_answer(message, "Мини-апп открывается в личной переписке со мной. Напиши мне туда /app.", reply_markup=markup)
     else:
         await safe_answer(message, "Мини-апп открывается в личной переписке со мной. Напиши мне туда /app.")
+
+
+@dp.message(Command("limits_plan"))
+async def cmd_limits_plan(message: types.Message):
+    try:
+        text = await asyncio.to_thread(preview_limits_text)
+    except Exception as e:
+        print(f"[Лимиты] /limits_plan: {e}")
+        text = "Не получилось посчитать черновик лимитов. Лимиты не тронуты."
+    await safe_answer(message, text)
+
+
+@dp.message(Command("limits_undo"))
+async def cmd_limits_undo(message: types.Message):
+    try:
+        text = await asyncio.to_thread(restore_previous_limits)
+    except Exception as e:
+        print(f"[Лимиты] /limits_undo: {e}")
+        text = "Не получилось откатить лимиты. Проверь лист Limits в таблице."
+    await safe_answer(message, text)
 
 
 @dp.message(Command("chatid"))
@@ -672,33 +698,67 @@ async def finance_report_scheduler():
 
 
 async def monthly_limits_scheduler():
-    """Автоподтверждение/перегенерация лимитов 1-го числа.
+    """Пересчёт лимитов 1-го числа (детерминированно, без ИИ).
 
-    Маркер "уже сделано в этом месяце" — в state.py (переживает
-    перезапуск), как и для остальных шедулеров выше.
+    Маркер "уже сделано в этом месяце" — в state.py (переживает перезапуск).
+    Он ставится ТОЛЬКО после успешной записи; при сбое чтения таблицы пробуем
+    снова не чаще раза в 10 минут, а после 3 неудач честно сообщаем в чат.
     """
+    attempts: dict[str, list] = {}   # month_key -> [число попыток, время последней]
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             month_key = now.strftime("%Y-%m")
             marker_key = f"limits:{month_key}"
             auto_enabled = os.environ.get("AUTO_GENERATE_LIMITS", "").strip().lower() in {"1", "true", "yes"}
-            if now.day == 1 and now.hour == 9 and now.minute >= 20 and auto_enabled and not state.get("scheduler", marker_key):
-                new_limits = await generate_limits_from_history()
-                if new_limits:
-                    await safe_send_message(
-                        bot, chat_id=FAMILY_CHAT_ID,
-                        text=f"✅ Лимиты на {month_key} автоматически обновлены и подтверждены."
-                    )
-                state.put("scheduler", marker_key, {"generated_at": now.isoformat()})
+            in_window = now.day == 1 and now.hour == 9 and now.minute >= 20
+            if in_window and auto_enabled and not state.get("scheduler", marker_key):
+                count, last = attempts.get(month_key, [0, None])
+                if count < 3 and (last is None or (now - last).total_seconds() >= 600):
+                    attempts[month_key] = [count + 1, now]
+                    out = await asyncio.to_thread(recalc_and_apply)
+                    if out:
+                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=out[1])
+                        state.put("scheduler", marker_key, {"generated_at": now.isoformat()})
+                    elif count + 1 >= 3:
+                        await safe_send_message(
+                            bot, chat_id=FAMILY_CHAT_ID,
+                            text="Не смогла пересчитать лимиты: не удалось прочитать траты из таблицы. "
+                                 "Лимиты остались прежними. Позже можно посмотреть черновик командой /limits_plan.",
+                        )
+                        state.put("scheduler", marker_key, {"failed_at": now.isoformat()})
         except Exception as e:
             print(f"[Автолимиты] Ошибка: {e}")
         await asyncio.sleep(60)
 
 
+async def fix_foreign_currency_rows():
+    """Разовая починка старых записей в валюте (до автоконвертации 13.09.2026).
+
+    Идемпотентна: исправленная строка получает валюту KZT и больше не попадает
+    в выборку. Если курс узнать не удалось — строка остаётся до следующего старта.
+    Курс берётся на сегодня (исторический бесплатно недоступен), пометка — в ai_comment.
+    """
+    rows = await asyncio.to_thread(sheets_module.find_foreign_currency_rows)
+    for r in rows:
+        converted = await fx.convert_to_kzt(r["amount"], r["currency"])
+        if not converted:
+            print(f"[Валюта] Нет курса {r['currency']}, строка {r['row']} пропущена")
+            continue
+        kzt, rate = converted
+        await asyncio.to_thread(
+            sheets_module.apply_currency_fix, r["row"], kzt, r["amount"], r["currency"], rate, r["comment"]
+        )
+        print(f"[Валюта] Строка {r['row']}: {r['amount']} {r['currency']} -> {kzt} KZT")
+
+
 async def main():
     await asyncio.to_thread(ensure_power_bi_dimension_table)
     await asyncio.to_thread(normalize_existing_family_table_values)
+    try:
+        await fix_foreign_currency_rows()
+    except Exception as e:
+        print(f"[Валюта] Не удалось починить записи в валюте: {e}")
     try:
         # Создаёт недостающие листы (в т.ч. Debts) с нужными заголовками.
         # Ничего не удаляет и не трогает уже существующие данные.
