@@ -102,15 +102,27 @@ async def handle_me(request: web.Request) -> web.Response:
 
 
 async def handle_dashboard(request: web.Request) -> web.Response:
-    if not authorize_request(request):
+    viewer = authorize_request(request)
+    if not viewer:
         return web.json_response({"error": "forbidden"}, status=403)
-    from services.dashboard import get_dashboard
+    from services.dashboard import ALLOWED_PERIODS, FAMILY, get_dashboard
+
     force = request.query.get("refresh") == "1"
     try:
-        data = await asyncio.to_thread(get_dashboard, force)
+        months = int(request.query.get("period", "1"))
+    except ValueError:
+        months = 1
+    if months not in ALLOWED_PERIODS:
+        months = 1
+    other = next((n for n in FAMILY if n != viewer), None)
+    who = request.query.get("who", "family")
+    person = {"me": viewer, "other": other}.get(who)   # family и всё прочее -> вся семья
+    try:
+        data = await asyncio.to_thread(get_dashboard, force, months, person)
     except Exception as e:  # noqa: BLE001
         logger.error("Дашборд: ошибка расчёта: %s", e)
         return web.json_response({"error": "unavailable"}, status=503)
+    data = dict(data, viewer=viewer, other=other)
     return web.json_response(data, headers={"Cache-Control": "no-store"})
 
 

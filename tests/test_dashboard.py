@@ -70,37 +70,47 @@ def test_january_uses_december_and_empty_month():
     assert empty["prev"]["expense_delta_pct"] is None
 
 
+def _raw(n_tx=1):
+    return {"transactions": [tx("2026-09-01 10:00:00", 1000)] * n_tx, "limits": {}, "now": NOW}
+
+
 def test_cache_ttl_and_refresh_throttle():
     dashboard.reset_cache()
     calls = []
     t = [1000.0]
-    data = {"operations": 1, "prev": {"expense": 1}}
 
     def loader():
         calls.append(1)
-        return data
+        return _raw()
 
     clock = lambda: t[0]
     dashboard.get_dashboard(loader=loader, clock=clock)
     t[0] += 30
-    dashboard.get_dashboard(loader=loader, clock=clock)          # из кэша
+    dashboard.get_dashboard(loader=loader, clock=clock)              # из кэша
+    dashboard.get_dashboard(months=6, person="Влад", loader=loader, clock=clock)  # другой вид — тот же кэш
     assert len(calls) == 1
-    dashboard.get_dashboard(force=True, loader=loader, clock=clock)  # свежий (30 с) — можно
+    dashboard.get_dashboard(force=True, loader=loader, clock=clock)  # 30 с — можно обновить
     assert len(calls) == 2
     t[0] += 5
     dashboard.get_dashboard(force=True, loader=loader, clock=clock)  # слишком рано — из кэша
     assert len(calls) == 2
     t[0] += dashboard.CACHE_TTL_SECONDS
-    dashboard.get_dashboard(loader=loader, clock=clock)          # протух
+    dashboard.get_dashboard(loader=loader, clock=clock)              # протух
     assert len(calls) == 3
     dashboard.reset_cache()
 
 
 def test_empty_result_gets_short_ttl():
     dashboard.reset_cache()
-    empty = {"operations": 0, "prev": {"expense": 0}}
-    dashboard.get_dashboard(loader=lambda: empty, clock=lambda: 0.0)
+    dashboard.get_dashboard(loader=lambda: _raw(0), clock=lambda: 0.0)
     assert dashboard._cache["ttl"] == dashboard.EMPTY_CACHE_TTL_SECONDS
+    dashboard.reset_cache()
+
+
+def test_unknown_period_falls_back_to_month():
+    dashboard.reset_cache()
+    d = dashboard.get_dashboard(months=7, loader=_raw, clock=lambda: 0.0)
+    assert d["period"] == 1
     dashboard.reset_cache()
 
 
@@ -110,8 +120,8 @@ def test_dashboard_endpoint_auth_and_payload(monkeypatch):
     monkeypatch.setattr(config, "DIANA_TELEGRAM_ID", "222")
     seen = {}
 
-    def fake(force=False):
-        seen["force"] = force
+    def fake(force=False, months=1, person=None):
+        seen.update(force=force, months=months, person=person)
         return {"month_label": "Сентябрь 2026", "categories": []}
 
     monkeypatch.setattr(dashboard, "get_dashboard", fake)
@@ -125,8 +135,18 @@ def test_dashboard_endpoint_auth_and_payload(monkeypatch):
             r = await client.get("/api/dashboard", headers={h: make_init_data(user_id=333)})
             assert r.status == 403
             r = await client.get("/api/dashboard?refresh=1", headers={h: make_init_data(user_id=111)})
-            assert r.status == 200 and (await r.json())["month_label"] == "Сентябрь 2026"
-            assert seen["force"] is True
+            body = await r.json()
+            assert r.status == 200 and body["month_label"] == "Сентябрь 2026"
+            assert seen == {"force": True, "months": 1, "person": None}
+            assert body["viewer"] == "Влад" and body["other"] == "Диана"
+            # «я» — тот, кто смотрит; «other» — второй член семьи
+            await client.get("/api/dashboard?who=me&period=6", headers={h: make_init_data(user_id=222)})
+            assert seen["person"] == "Диана" and seen["months"] == 6
+            await client.get("/api/dashboard?who=other&period=12", headers={h: make_init_data(user_id=222)})
+            assert seen["person"] == "Влад" and seen["months"] == 12
+            # мусор в параметрах не ломает запрос
+            r = await client.get("/api/dashboard?who=x&period=abc", headers={h: make_init_data(user_id=111)})
+            assert r.status == 200 and seen["person"] is None and seen["months"] == 1
         finally:
             await client.close()
 
@@ -137,7 +157,7 @@ def test_dashboard_endpoint_failure_is_503_not_crash(monkeypatch):
     monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", TOKEN)
     monkeypatch.setattr(config, "VLAD_TELEGRAM_ID", "111")
 
-    def boom(force=False):
+    def boom(force=False, months=1, person=None):
         raise RuntimeError("sheets down")
 
     monkeypatch.setattr(dashboard, "get_dashboard", boom)
@@ -185,3 +205,88 @@ def test_load_dashboard_end_to_end_on_fake_sheets(db):
     from services.sheets import get_transactions_for_period
     txs = get_transactions_for_period("2026-09-01", "2026-09-16")
     assert sum(t["amt"] for t in txs if t["type"] == "РАСХОД") == d["expense"]
+
+
+def txu(date, amt, user, cat="Еда и продукты", text="", typ="РАСХОД"):
+    return {"date": date, "amt": amt, "cat": cat, "type": typ, "user": user, "merchant": text}
+
+
+MULTI = [
+    txu("2026-09-10 10:00:00", 30000, "Влад", text="Magnum"),
+    txu("2026-09-11 10:00:00", 50000, "Диана", "Красота и уход", "Салон"),
+    txu("2026-08-05 10:00:00", 10000, "Влад", text="Small"),
+    txu("2026-07-20 10:00:00", 70000, "Диана", "Одежда и обувь", "Zara"),
+    txu("2026-04-02 10:00:00", 5000, "Влад"),
+    txu("2026-03-02 10:00:00", 99999, "Влад"),                  # старше полугода
+    txu("2025-11-02 10:00:00", 8000, "Диана"),                  # в пределах года
+    txu("2025-09-30 10:00:00", 77777, "Влад"),                  # старше года
+    txu("2026-09-05 10:00:00", 300000, "Влад", "Зарплата", typ="ДОХОД"),
+]
+
+
+def test_periods_are_calendar_months_including_current():
+    m1 = dashboard.compute_dashboard(MULTI, {}, NOW, months=1)
+    m3 = dashboard.compute_dashboard(MULTI, {}, NOW, months=3)
+    m6 = dashboard.compute_dashboard(MULTI, {}, NOW, months=6)
+    m12 = dashboard.compute_dashboard(MULTI, {}, NOW, months=12)
+    assert m1["expense"] == 80000
+    assert m3["expense"] == 160000               # июль + август + сентябрь
+    assert m6["expense"] == 165000               # + апрель (5 000); март уже не входит
+    assert m12["expense"] == 272999              # + март 2026 (99 999) и ноябрь 2025 (8 000); сентябрь 2025 не входит
+    assert m3["month_label"] == "июл 2026 – сен 2026"
+    assert m1["month_label"] == "Сентябрь 2026"
+
+
+def test_person_filter_and_no_limits_for_person():
+    limits = {"Еда и продукты": 20000}
+    fam = dashboard.compute_dashboard(MULTI, limits, NOW, months=1)
+    vlad = dashboard.compute_dashboard(MULTI, limits, NOW, months=1, person="Влад")
+    diana = dashboard.compute_dashboard(MULTI, limits, NOW, months=1, person="Диана")
+    assert (vlad["expense"], diana["expense"]) == (30000, 50000)
+    assert vlad["income"] == 300000 and diana["income"] == 0
+    assert vlad["who"] == "Влад" and fam["who"] == "family"
+    assert fam["categories"][1]["limit"] == 20000                    # у семьи лимит есть
+    assert vlad["categories"][0]["limit"] is None                    # у человека — нет
+    assert vlad["categories"][0]["status"] == "none"
+
+
+def test_limits_scale_with_period():
+    limits = {"Еда и продукты": 20000}
+    m3 = dashboard.compute_dashboard(MULTI, limits, NOW, months=3)
+    food = next(c for c in m3["categories"] if c["name"] == "Еда и продукты")
+    assert food["limit"] == 60000 and food["spent"] == 40000 and food["status"] == "ok"
+
+
+def test_expenses_sorted_desc_with_details_and_cap():
+    d = dashboard.compute_dashboard(MULTI, {}, NOW, months=3)
+    amounts = [e["amount"] for e in d["expenses"]]
+    assert amounts == sorted(amounts, reverse=True) == [70000, 50000, 30000, 10000]
+    assert d["expenses"][0] == {"date": "20.07.2026", "amount": 70000, "category": "Одежда и обувь",
+                                "text": "Zara", "user": "Диана"}
+    assert d["expenses_total"] == 4
+    many = [txu("2026-09-02 10:00:00", i + 1, "Влад") for i in range(dashboard.MAX_EXPENSE_ROWS + 25)]
+    capped = dashboard.compute_dashboard(many, {}, NOW)
+    assert len(capped["expenses"]) == dashboard.MAX_EXPENSE_ROWS
+    assert capped["expenses_total"] == dashboard.MAX_EXPENSE_ROWS + 25
+    assert capped["expenses"][0]["amount"] == dashboard.MAX_EXPENSE_ROWS + 25   # крупнейшие
+
+
+def test_previous_period_comparison_for_three_months():
+    txs = [
+        txu("2026-09-02 10:00:00", 30000, "Влад"),
+        txu("2026-06-10 10:00:00", 10000, "Влад"),      # предыдущий трёхмесячник (апр–июн)
+        txu("2026-05-31 10:00:00", 10000, "Влад"),
+    ]
+    d = dashboard.compute_dashboard(txs, {}, NOW, months=3)
+    assert d["prev"]["expense"] == 20000 and d["prev"]["expense_delta_pct"] == 50
+    assert d["prev"]["phrase"] == "в предыдущие 3 мес."
+    m = dashboard.compute_dashboard(txs, {}, NOW, months=1)
+    assert m["prev"]["phrase"] == "в августе"
+
+
+def test_january_boundaries_for_year_view():
+    jan = datetime.datetime(2026, 1, 20, tzinfo=ASTANA_TZ)
+    d = dashboard.compute_dashboard([txu("2025-02-03 10:00:00", 1000, "Влад"),
+                                     txu("2025-01-31 10:00:00", 555, "Влад")], {}, jan, months=12)
+    assert d["expense"] == 1000                       # фев 2025 … янв 2026 включительно
+    assert d["month_label"] == "фев 2025 – янв 2026"

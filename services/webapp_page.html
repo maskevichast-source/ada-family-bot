@@ -44,6 +44,18 @@
   .meta { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: var(--hint); }
   .meta .over { color: var(--over); } .meta .warn { color: var(--warn); }
   .msg { text-align: center; color: var(--hint); padding: 40px 10px; }
+  .seg { display: flex; gap: 6px; margin: 0 0 8px; }
+  .seg button {
+    flex: 1; margin: 0; padding: 8px 4px; border-radius: 10px; font-size: 14px;
+    background: var(--card); color: var(--text);
+  }
+  .seg button.on { background: var(--accent); color: var(--tg-theme-button-text-color, #fff); }
+  .exp { display: flex; justify-content: space-between; gap: 10px; padding: 9px 2px; border-bottom: 1px solid rgba(127,127,127,.18); }
+  .exp .l { min-width: 0; }
+  .exp .t { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .exp .s { font-size: 12px; color: var(--hint); margin-top: 2px; }
+  .exp .a { font-size: 15px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .note { font-size: 12px; color: var(--hint); margin-top: 8px; text-align: center; }
   button {
     margin-top: 14px; width: 100%; padding: 12px; border: 0; border-radius: 12px;
     background: var(--accent); color: var(--tg-theme-button-text-color, #fff); font-size: 15px;
@@ -56,6 +68,17 @@
   <h1 id="title">Ада</h1>
   <span class="sub" id="updated"></span>
 </header>
+<div class="seg" id="who">
+  <button data-v="family" class="on">Семья</button>
+  <button data-v="me">Я</button>
+  <button data-v="other">Диана</button>
+</div>
+<div class="seg" id="per">
+  <button data-v="1" class="on">Месяц</button>
+  <button data-v="3">3 мес.</button>
+  <button data-v="6">Полгода</button>
+  <button data-v="12">Год</button>
+</div>
 <div id="root"><div class="msg">Загружаю…</div></div>
 <script>
 (function () {
@@ -78,18 +101,25 @@
     return c;
   }
 
+  function raz(n) {
+    var m10 = n % 10, m100 = n % 100;
+    return (m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14)) ? "раза" : "раз";
+  }
+
   function comparison(d) {
     var p = d.prev;
     if (p.expense_delta_pct === null) return null;
-    var pct = p.expense_delta_pct, abs = Math.abs(pct);
-    var text;
-    if (abs < 1) text = "Расходы на уровне " + p.label.toLowerCase() + " за тот же срок.";
-    else text = "Расходы на " + abs + "% " + (pct > 0 ? "больше" : "меньше") +
-      ", чем за то же время (" + d.day + " дн.) в " + p.label.toLowerCase() + "е: было " + money(p.expense) + ".";
+    var pct = p.expense_delta_pct, abs = Math.abs(pct), text;
+    var tail = " за то же время " + p.phrase + ": было " + money(p.expense) + ".";
+    if (abs < 1) text = "Расходы на уровне, что и" + tail;
+    else if (pct >= 400) {
+      var k = Math.round(d.expense / p.expense);
+      text = "Расходы в " + k + " " + raz(k) + " больше, чем" + tail;
+    } else text = "Расходы на " + abs + "% " + (pct > 0 ? "больше" : "меньше") + ", чем" + tail;
     return el("div", "cmp", text);
   }
 
-  function category(c) {
+  function category(c, family) {
     var box = el("div", "cat");
     var row = el("div", "row");
     row.appendChild(el("span", "name", c.name));
@@ -103,21 +133,55 @@
     box.appendChild(bar);
     var meta = el("div", "meta");
     if (c.limit) {
-      var left = el("span", c.status === "ok" ? "" : c.status,
-        c.status === "over" ? "Перерасход " + money(c.spent - c.limit) : "Использовано " + c.limit_pct + "%");
-      meta.appendChild(left);
+      meta.appendChild(el("span", c.status === "ok" ? "" : c.status,
+        c.status === "over" ? "Перерасход " + money(c.spent - c.limit) : "Использовано " + c.limit_pct + "%"));
       meta.appendChild(el("span", "", "лимит " + money(c.limit)));
     } else {
       meta.appendChild(el("span", "", c.share_pct + "% всех трат"));
-      meta.appendChild(el("span", "", "без лимита"));
+      meta.appendChild(el("span", "", family ? "без лимита" : ""));
     }
     box.appendChild(meta);
     return box;
   }
 
+  var PAGE = 30;
+  function expensesBlock(d) {
+    var wrap = el("div");
+    wrap.appendChild(el("h2", "", "Траты по убыванию"));
+    if (!d.expenses.length) { wrap.appendChild(el("div", "msg", "Расходов за этот период нет.")); return wrap; }
+    var list = el("div");
+    wrap.appendChild(list);
+    var shown = 0;
+    var more = el("button", "more", "");
+    function showMore() {
+      d.expenses.slice(shown, shown + PAGE).forEach(function (e) {
+        var row = el("div", "exp");
+        var l = el("div", "l");
+        l.appendChild(el("div", "t", e.text || e.category));
+        var sub = e.date + " · " + e.category + (d.who === "family" ? " · " + e.user : "");
+        l.appendChild(el("div", "s", sub));
+        row.appendChild(l);
+        row.appendChild(el("div", "a", money(e.amount)));
+        list.appendChild(row);
+      });
+      shown = Math.min(d.expenses.length, shown + PAGE);
+      if (shown >= d.expenses.length) more.remove();
+      else more.textContent = "Показать ещё (" + (d.expenses.length - shown) + ")";
+    }
+    more.addEventListener("click", showMore);
+    showMore();
+    if (shown < d.expenses.length) wrap.appendChild(more);
+    if (d.expenses_total > d.expenses.length)
+      wrap.appendChild(el("div", "note", "Показаны " + d.expenses.length + " крупнейших из " + d.expenses_total + "."));
+    return wrap;
+  }
+
   function render(d) {
     document.getElementById("title").textContent = d.month_label;
     document.getElementById("updated").textContent = "обновлено " + d.updated_at;
+    var otherBtn = document.querySelector('#who button[data-v="other"]');
+    if (d.other) otherBtn.textContent = d.other;
+    var family = d.who === "family";
     var frag = document.createDocumentFragment();
     var cards = el("div", "cards");
     cards.appendChild(card("Расход", money(d.expense)));
@@ -127,26 +191,47 @@
     var cmp = comparison(d);
     if (cmp) frag.appendChild(cmp);
     frag.appendChild(el("h2", "", "Категории"));
-    if (!d.categories.length) frag.appendChild(el("div", "msg", "Пока нет расходов за этот месяц."));
-    d.categories.forEach(function (c) { frag.appendChild(category(c)); });
+    if (!d.categories.length) frag.appendChild(el("div", "msg", "Пока нет расходов за этот период."));
+    d.categories.forEach(function (c) { frag.appendChild(category(c, family)); });
+    frag.appendChild(expensesBlock(d));
     var btn = el("button", "", "Обновить");
     btn.addEventListener("click", function () { load(true, btn); });
     frag.appendChild(btn);
     root.replaceChildren(frag);
   }
 
+  var state = { who: "family", period: "1" };
+  var seq = 0;
+
   async function load(force, btn) {
+    var my = ++seq;
     if (btn) btn.disabled = true;
+    var q = "?period=" + state.period + "&who=" + state.who + (force ? "&refresh=1" : "");
     try {
-      var r = await fetch("/api/dashboard" + (force ? "?refresh=1" : ""),
-        { headers: { "X-Telegram-Init-Data": tg.initData } });
+      var r = await fetch("/api/dashboard" + q, { headers: { "X-Telegram-Init-Data": tg.initData } });
+      if (my !== seq) return;              // пришёл устаревший ответ — пользователь уже переключил
       if (r.status === 403) return message("Доступ закрыт.");
       if (!r.ok) return message("Не удалось загрузить данные. Попробуй чуть позже.");
-      render(await r.json());
+      var d = await r.json();
+      if (my !== seq) return;
+      render(d);
     } catch (e) {
-      message("Не удалось связаться с сервером.");
+      if (my === seq) message("Не удалось связаться с сервером.");
     }
   }
+
+  function bindSeg(id, key) {
+    document.getElementById(id).addEventListener("click", function (ev) {
+      var b = ev.target.closest("button");
+      if (!b || b.dataset.v === state[key]) return;
+      state[key] = b.dataset.v;
+      this.querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
+      message("Загружаю…");
+      load(false);
+    });
+  }
+  bindSeg("who", "who");
+  bindSeg("per", "period");
 
   if (!tg || !tg.initData) {
     message("Открой мини-апп из Telegram, через кнопку в боте.");
