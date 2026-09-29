@@ -10,8 +10,10 @@
 import hashlib
 import hmac
 import json
+import asyncio
 import logging
 import os
+from pathlib import Path
 import time
 from urllib.parse import parse_qsl
 
@@ -27,53 +29,8 @@ INIT_DATA_MAX_AGE_SECONDS = 24 * 60 * 60
 
 INIT_DATA_HEADER = "X-Telegram-Init-Data"
 
-PAGE_HTML = """<!doctype html>
-<html lang="ru">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Ада — семейный бюджет</title>
-<script src="https://telegram.org/js/telegram-web-app.js"></script>
-<style>
-  :root { color-scheme: light dark; }
-  body {
-    margin: 0; padding: 24px 16px;
-    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
-    background: var(--tg-theme-bg-color, #fff);
-    color: var(--tg-theme-text-color, #111);
-  }
-  h1 { font-size: 22px; margin: 0 0 8px; }
-  p { margin: 4px 0; color: var(--tg-theme-hint-color, #666); }
-</style>
-</head>
-<body>
-<h1 id="title">Ада</h1>
-<p id="status">Проверяю вход…</p>
-<script>
-(async () => {
-  const tg = window.Telegram && window.Telegram.WebApp;
-  const status = document.getElementById("status");
-  const title = document.getElementById("title");
-  if (!tg || !tg.initData) {
-    status.textContent = "Открой мини-апп из Telegram, через кнопку в боте.";
-    return;
-  }
-  tg.ready();
-  tg.expand();
-  try {
-    const r = await fetch("/api/me", { headers: { "X-Telegram-Init-Data": tg.initData } });
-    if (!r.ok) { status.textContent = "Доступ закрыт."; return; }
-    const me = await r.json();
-    title.textContent = "Привет, " + me.name + "!";
-    status.textContent = "Вход подтверждён. Дашборд появится на следующем шаге.";
-  } catch (e) {
-    status.textContent = "Не удалось связаться с сервером.";
-  }
-})();
-</script>
-</body>
-</html>
-"""
+PAGE_PATH = Path(__file__).with_name("webapp_page.html")
+PAGE_HTML = PAGE_PATH.read_text(encoding="utf-8")
 
 
 def verify_init_data(init_data: str, bot_token: str, max_age: int = INIT_DATA_MAX_AGE_SECONDS,
@@ -144,11 +101,25 @@ async def handle_me(request: web.Request) -> web.Response:
     return web.json_response({"name": name})
 
 
+async def handle_dashboard(request: web.Request) -> web.Response:
+    if not authorize_request(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from services.dashboard import get_dashboard
+    force = request.query.get("refresh") == "1"
+    try:
+        data = await asyncio.to_thread(get_dashboard, force)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Дашборд: ошибка расчёта: %s", e)
+        return web.json_response({"error": "unavailable"}, status=503)
+    return web.json_response(data, headers={"Cache-Control": "no-store"})
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", handle_health)
     app.router.add_get("/app", handle_page)
     app.router.add_get("/api/me", handle_me)
+    app.router.add_get("/api/dashboard", handle_dashboard)
     return app
 
 

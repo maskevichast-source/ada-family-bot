@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Ада — семейный бюджет</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: var(--tg-theme-bg-color, #ffffff);
+    --text: var(--tg-theme-text-color, #111111);
+    --hint: var(--tg-theme-hint-color, #6b6b6b);
+    --card: var(--tg-theme-secondary-bg-color, #f1f1f4);
+    --accent: var(--tg-theme-button-color, #2481cc);
+    --ok: #2fae66; --warn: #e0a30c; --over: #e5484d;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 16px 14px 32px;
+    font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+    background: var(--bg); color: var(--text);
+  }
+  header { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 12px; }
+  h1 { font-size: 20px; margin: 0; }
+  .sub { color: var(--hint); font-size: 13px; }
+  .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .card { background: var(--card); border-radius: 14px; padding: 12px 14px; }
+  .card.wide { grid-column: 1 / -1; }
+  .label { color: var(--hint); font-size: 13px; }
+  .value { font-size: 22px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
+  .value.neg { color: var(--over); }
+  .cmp { margin: 12px 2px 4px; font-size: 14px; color: var(--hint); }
+  h2 { font-size: 16px; margin: 20px 2px 8px; }
+  .cat { background: var(--card); border-radius: 14px; padding: 11px 14px; margin-bottom: 8px; }
+  .row { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
+  .name { font-size: 15px; }
+  .amt { font-size: 15px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .bar { height: 7px; border-radius: 4px; background: rgba(127,127,127,.22); margin-top: 8px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; border-radius: 4px; background: var(--ok); }
+  .bar.warn > i { background: var(--warn); }
+  .bar.over > i { background: var(--over); }
+  .bar.none > i { background: var(--accent); opacity: .55; }
+  .meta { display: flex; justify-content: space-between; margin-top: 5px; font-size: 12px; color: var(--hint); }
+  .meta .over { color: var(--over); } .meta .warn { color: var(--warn); }
+  .msg { text-align: center; color: var(--hint); padding: 40px 10px; }
+  button {
+    margin-top: 14px; width: 100%; padding: 12px; border: 0; border-radius: 12px;
+    background: var(--accent); color: var(--tg-theme-button-text-color, #fff); font-size: 15px;
+  }
+  button:disabled { opacity: .6; }
+</style>
+</head>
+<body>
+<header>
+  <h1 id="title">Ада</h1>
+  <span class="sub" id="updated"></span>
+</header>
+<div id="root"><div class="msg">Загружаю…</div></div>
+<script>
+(function () {
+  var tg = window.Telegram && window.Telegram.WebApp;
+  var root = document.getElementById("root");
+  var fmt = new Intl.NumberFormat("ru-RU", { maximumFractionDigits: 0 });
+  function money(v) { return fmt.format(Math.round(v)).replace(/\u00a0/g, " ") + " ₸"; }
+  function el(tag, cls, text) {
+    var e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function message(text) { root.replaceChildren(el("div", "msg", text)); }
+
+  function card(label, value, extra) {
+    var c = el("div", "card" + (extra && extra.wide ? " wide" : ""));
+    c.appendChild(el("div", "label", label));
+    c.appendChild(el("div", "value" + (extra && extra.neg ? " neg" : ""), value));
+    return c;
+  }
+
+  function comparison(d) {
+    var p = d.prev;
+    if (p.expense_delta_pct === null) return null;
+    var pct = p.expense_delta_pct, abs = Math.abs(pct);
+    var text;
+    if (abs < 1) text = "Расходы на уровне " + p.label.toLowerCase() + " за тот же срок.";
+    else text = "Расходы на " + abs + "% " + (pct > 0 ? "больше" : "меньше") +
+      ", чем за то же время (" + d.day + " дн.) в " + p.label.toLowerCase() + "е: было " + money(p.expense) + ".";
+    return el("div", "cmp", text);
+  }
+
+  function category(c) {
+    var box = el("div", "cat");
+    var row = el("div", "row");
+    row.appendChild(el("span", "name", c.name));
+    row.appendChild(el("span", "amt", money(c.spent)));
+    box.appendChild(row);
+    var bar = el("div", "bar " + c.status);
+    var fill = el("i");
+    var width = c.limit ? Math.min(100, c.limit_pct) : c.share_pct;
+    fill.style.width = Math.max(2, width) + "%";
+    bar.appendChild(fill);
+    box.appendChild(bar);
+    var meta = el("div", "meta");
+    if (c.limit) {
+      var left = el("span", c.status === "ok" ? "" : c.status,
+        c.status === "over" ? "Перерасход " + money(c.spent - c.limit) : "Использовано " + c.limit_pct + "%");
+      meta.appendChild(left);
+      meta.appendChild(el("span", "", "лимит " + money(c.limit)));
+    } else {
+      meta.appendChild(el("span", "", c.share_pct + "% всех трат"));
+      meta.appendChild(el("span", "", "без лимита"));
+    }
+    box.appendChild(meta);
+    return box;
+  }
+
+  function render(d) {
+    document.getElementById("title").textContent = d.month_label;
+    document.getElementById("updated").textContent = "обновлено " + d.updated_at;
+    var frag = document.createDocumentFragment();
+    var cards = el("div", "cards");
+    cards.appendChild(card("Расход", money(d.expense)));
+    cards.appendChild(card("Доход", money(d.income)));
+    cards.appendChild(card("Остаток", money(d.balance), { wide: true, neg: d.balance < 0 }));
+    frag.appendChild(cards);
+    var cmp = comparison(d);
+    if (cmp) frag.appendChild(cmp);
+    frag.appendChild(el("h2", "", "Категории"));
+    if (!d.categories.length) frag.appendChild(el("div", "msg", "Пока нет расходов за этот месяц."));
+    d.categories.forEach(function (c) { frag.appendChild(category(c)); });
+    var btn = el("button", "", "Обновить");
+    btn.addEventListener("click", function () { load(true, btn); });
+    frag.appendChild(btn);
+    root.replaceChildren(frag);
+  }
+
+  async function load(force, btn) {
+    if (btn) btn.disabled = true;
+    try {
+      var r = await fetch("/api/dashboard" + (force ? "?refresh=1" : ""),
+        { headers: { "X-Telegram-Init-Data": tg.initData } });
+      if (r.status === 403) return message("Доступ закрыт.");
+      if (!r.ok) return message("Не удалось загрузить данные. Попробуй чуть позже.");
+      render(await r.json());
+    } catch (e) {
+      message("Не удалось связаться с сервером.");
+    }
+  }
+
+  if (!tg || !tg.initData) {
+    message("Открой мини-апп из Telegram, через кнопку в боте.");
+    return;
+  }
+  tg.ready();
+  tg.expand();
+  load(false);
+})();
+</script>
+</body>
+</html>
