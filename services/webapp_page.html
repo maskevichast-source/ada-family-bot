@@ -55,6 +55,14 @@
   .exp .t { font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .exp .s { font-size: 12px; color: var(--hint); margin-top: 2px; }
   .exp .a { font-size: 15px; font-weight: 600; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .chart { background: var(--card); border-radius: 14px; padding: 12px 10px 10px; margin-bottom: 10px; }
+  .chart h3 { font-size: 14px; font-weight: 600; margin: 0 4px 6px; }
+  .chart svg { width: 100%; height: auto; display: block; }
+  .chart text { fill: var(--hint); font-size: 9px; font-family: inherit; }
+  .chart text.val { fill: var(--text); font-size: 9.5px; }
+  .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 6px 4px 0; font-size: 12px; color: var(--hint); }
+  .legend i { display: inline-block; width: 16px; height: 0; border-top: 3px solid var(--accent); vertical-align: middle; margin-right: 5px; }
+  .legend i.dash { border-top: 2px dashed var(--hint); }
   .note { font-size: 12px; color: var(--hint); margin-top: 8px; text-align: center; }
   button {
     margin-top: 14px; width: 100%; padding: 12px; border: 0; border-radius: 12px;
@@ -176,6 +184,95 @@
     return wrap;
   }
 
+  var NS = "http://www.w3.org/2000/svg";
+  function svgEl(tag, attrs, text) {
+    var e = document.createElementNS(NS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+  function compact(v) {
+    if (v >= 1e6) return (v / 1e6).toFixed(1).replace(".", ",") + " млн";
+    if (v >= 1e3) return Math.round(v / 1e3) + " тыс.";
+    return String(Math.round(v));
+  }
+
+  function lineChart(dy) {
+    var W = 340, H = 150, L = 6, R = 44, T = 10, B = 20;
+    var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, role: "img" });
+    var all = dy.cur.concat(dy.prev);
+    var max = Math.max.apply(null, all.concat([1])) * 1.08;
+    var n = dy.days_in_month;
+    function x(day) { return L + (W - L - R) * (day - 1) / Math.max(n - 1, 1); }
+    function y(v) { return T + (H - T - B) * (1 - v / max); }
+    [0, 0.5, 1].forEach(function (f) {
+      var gy = y(max / 1.08 * f);
+      svg.appendChild(svgEl("line", { x1: L, x2: W - R, y1: gy, y2: gy, stroke: "rgba(127,127,127,.25)", "stroke-width": 1 }));
+      svg.appendChild(svgEl("text", { x: W - R + 4, y: gy + 3 }, compact(max / 1.08 * f)));
+    });
+    function path(arr) {
+      return arr.map(function (v, i) { return (i ? "L" : "M") + x(i + 1).toFixed(1) + " " + y(v).toFixed(1); }).join(" ");
+    }
+    if (dy.prev.length) svg.appendChild(svgEl("path", { d: path(dy.prev), fill: "none", stroke: "var(--hint)",
+      "stroke-width": 1.6, "stroke-dasharray": "4 3" }));
+    if (dy.cur.length) {
+      var last = dy.cur.length;
+      svg.appendChild(svgEl("path", { d: path(dy.cur) + " L" + x(last).toFixed(1) + " " + y(0) + " L" + x(1).toFixed(1) + " " + y(0) + " Z",
+        fill: "var(--accent)", opacity: 0.12 }));
+      svg.appendChild(svgEl("path", { d: path(dy.cur), fill: "none", stroke: "var(--accent)", "stroke-width": 2.5,
+        "stroke-linejoin": "round", "stroke-linecap": "round" }));
+      svg.appendChild(svgEl("circle", { cx: x(last), cy: y(dy.cur[last - 1]), r: 3.5, fill: "var(--accent)" }));
+    }
+    [1, 8, 15, 22, n].forEach(function (d, i, a) {
+      if (i === a.length - 1 && n - 22 < 4) return;
+      svg.appendChild(svgEl("text", { x: x(d), y: H - 5, "text-anchor": "middle" }, String(d)));
+    });
+    return svg;
+  }
+
+  function barChart(bars) {
+    var W = 340, H = 140, T = 16, B = 20, gap = 8;
+    var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, role: "img" });
+    var max = Math.max.apply(null, bars.map(function (b) { return b.value; }).concat([1]));
+    var bw = Math.min(46, (W - gap * (bars.length + 1)) / bars.length);
+    var total = bw * bars.length + gap * (bars.length - 1);
+    var x0 = (W - total) / 2;
+    bars.forEach(function (b, i) {
+      var h = Math.max(b.value > 0 ? 2 : 0, (H - T - B) * b.value / max);
+      var bx = x0 + i * (bw + gap), by = H - B - h;
+      svg.appendChild(svgEl("rect", { x: bx, y: by, width: bw, height: h, rx: 4, fill: "var(--accent)",
+        opacity: i === bars.length - 1 ? 1 : 0.55 }));
+      if (b.value > 0) svg.appendChild(svgEl("text", { x: bx + bw / 2, y: by - 3, "text-anchor": "middle", "class": "val" }, compact(b.value)));
+      svg.appendChild(svgEl("text", { x: bx + bw / 2, y: H - 6, "text-anchor": "middle" }, b.label));
+    });
+    return svg;
+  }
+
+  function chartCard(title, svg, legend) {
+    var c = el("div", "chart");
+    c.appendChild(el("h3", "", title));
+    c.appendChild(svg);
+    if (legend) c.appendChild(legend);
+    return c;
+  }
+
+  function chartsBlock(d) {
+    var dy = d.dynamics, wrap = el("div");
+    if (!dy) return wrap;
+    wrap.appendChild(el("h2", "", "Динамика"));
+    if (dy.kind === "daily") {
+      var legend = el("div", "legend");
+      var a = el("span"); a.appendChild(el("i")); a.appendChild(document.createTextNode("этот месяц"));
+      var b = el("span"); b.appendChild(el("i", "dash")); b.appendChild(document.createTextNode(dy.prev_label));
+      legend.appendChild(a); legend.appendChild(b);
+      wrap.appendChild(chartCard("Накопленные расходы по дням", lineChart(dy), legend));
+      wrap.appendChild(chartCard("По неделям", barChart(dy.bars)));
+    } else {
+      wrap.appendChild(chartCard("Расходы по месяцам", barChart(dy.bars)));
+    }
+    return wrap;
+  }
+
   function render(d) {
     document.getElementById("title").textContent = d.month_label;
     document.getElementById("updated").textContent = "обновлено " + d.updated_at;
@@ -190,6 +287,7 @@
     frag.appendChild(cards);
     var cmp = comparison(d);
     if (cmp) frag.appendChild(cmp);
+    frag.appendChild(chartsBlock(d));
     frag.appendChild(el("h2", "", "Категории"));
     if (!d.categories.length) frag.appendChild(el("div", "msg", "Пока нет расходов за этот период."));
     d.categories.forEach(function (c) { frag.appendChild(category(c, family)); });

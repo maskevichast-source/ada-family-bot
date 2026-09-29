@@ -290,3 +290,51 @@ def test_january_boundaries_for_year_view():
                                      txu("2025-01-31 10:00:00", 555, "Влад")], {}, jan, months=12)
     assert d["expense"] == 1000                       # фев 2025 … янв 2026 включительно
     assert d["month_label"] == "фев 2025 – янв 2026"
+
+
+DYN = [
+    txu("2026-09-01 10:00:00", 100, "Влад"),
+    txu("2026-09-01 18:00:00", 50, "Диана"),
+    txu("2026-09-03 10:00:00", 200, "Влад"),
+    txu("2026-09-09 10:00:00", 70, "Влад"),
+    txu("2026-09-15 09:00:00", 30, "Влад"),
+    txu("2026-08-02 10:00:00", 40, "Влад"),
+    txu("2026-08-31 10:00:00", 60, "Диана"),       # последний день прошлого месяца
+    txu("2026-09-05 10:00:00", 999, "Влад", "Зарплата", typ="ДОХОД"),   # доход в расходах не участвует
+]
+
+
+def test_daily_dynamics_cumulative_and_previous_month_line():
+    d = dashboard.compute_dashboard(DYN, {}, NOW, months=1)["dynamics"]
+    assert d["kind"] == "daily" and d["days_in_month"] == 30
+    assert len(d["cur"]) == 15                              # по сегодняшнее число
+    assert d["cur"][0] == 150 and d["cur"][2] == 350 and d["cur"][8] == 420 and d["cur"][14] == 450
+    assert d["cur"] == sorted(d["cur"])                     # накопление не убывает
+    assert len(d["prev"]) == 31 and d["prev_label"] == "Август"
+    assert d["prev"][1] == 40 and d["prev"][30] == 100      # 2 авг, и итог за август
+    assert d["bars"] == [{"label": "1–7", "value": 350}, {"label": "8–14", "value": 70},
+                         {"label": "15–21", "value": 30}]
+
+
+def test_dynamics_respect_person_filter():
+    d = dashboard.compute_dashboard(DYN, {}, NOW, months=1, person="Диана")["dynamics"]
+    assert d["cur"][0] == 50 and d["cur"][-1] == 50
+    assert d["prev"][-1] == 60
+
+
+def test_monthly_bars_for_longer_periods():
+    txs = [txu("2026-07-10 10:00:00", 10, "Влад"), txu("2026-09-10 10:00:00", 30, "Влад"),
+           txu("2026-09-11 10:00:00", 5, "Влад")]
+    d = dashboard.compute_dashboard(txs, {}, NOW, months=3)["dynamics"]
+    assert d["kind"] == "monthly"
+    assert d["bars"] == [{"label": "июл 26", "value": 10}, {"label": "авг", "value": 0},
+                         {"label": "сен", "value": 35}]
+    y = dashboard.compute_dashboard(txs, {}, NOW, months=12)["dynamics"]
+    assert len(y["bars"]) == 12 and y["bars"][0]["label"] == "окт 25"
+    assert [b["label"] for b in y["bars"]][3] == "янв 26"      # год меняется на январе
+    assert sum(b["value"] for b in y["bars"]) == 45
+
+
+def test_dynamics_empty_month():
+    d = dashboard.compute_dashboard([], {}, NOW, months=1)["dynamics"]
+    assert d["cur"] == [0.0] * 15 and d["bars"][0]["value"] == 0

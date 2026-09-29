@@ -89,6 +89,44 @@ def _short_text(t: dict) -> str:
     return ""
 
 
+def _cumulative(by_day: dict[int, float], length: int) -> list[float]:
+    total, out = 0.0, []
+    for day in range(1, length + 1):
+        total += by_day.get(day, 0.0)
+        out.append(round(total, 2))
+    return out
+
+
+def _build_dynamics(months, now, sy, sm, py, pm, day_cur, day_prev, by_month) -> dict:
+    """Данные для графиков.
+
+    Вид «месяц»: накопленные расходы по дням (до сегодня) и пунктир прошлого
+    месяца целиком; столбики по неделям (1–7, 8–14, …).
+    Виды «3 мес.» и дальше: столбики по месяцам периода.
+    """
+    if months == 1:
+        dim = _days_in_month(now.year, now.month)
+        weeks = []
+        for w in range((now.day - 1) // 7 + 1):
+            first, last = w * 7 + 1, min(w * 7 + 7, dim)
+            value = sum(v for d, v in day_cur.items() if first <= d <= last)
+            weeks.append({"label": f"{first}–{last}", "value": round(value, 2)})
+        return {
+            "kind": "daily",
+            "days_in_month": dim,
+            "cur": _cumulative(day_cur, now.day),
+            "prev": _cumulative(day_prev, _days_in_month(py, pm)),
+            "prev_label": _MONTHS_RU[pm - 1],
+            "bars": weeks,
+        }
+    bars = []
+    for i in range(months):
+        y, m = add_months(sy, sm, i)
+        label = _MONTHS_SHORT[m - 1] + (f" {str(y)[2:]}" if m == 1 or i == 0 else "")
+        bars.append({"label": label, "value": round(by_month.get((y, m), 0.0), 2)})
+    return {"kind": "monthly", "bars": bars}
+
+
 def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.datetime,
                       months: int = 1, person: str | None = None) -> dict:
     """Чистая функция: ничего не читает из сети, удобна для тестов.
@@ -111,6 +149,10 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     by_cat: dict[str, float] = {}
     expenses: list[dict] = []
     cur_count = 0
+    # для графиков: расходы по дням (только вид «месяц») и по месяцам периода
+    day_cur: dict[int, float] = {}
+    day_prev: dict[int, float] = {}
+    by_month: dict[tuple[int, int], float] = {}
 
     for t in transactions:
         if person and _user_of(t) != person:
@@ -120,12 +162,17 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
             continue
         amount = parse_amount(t.get("amt", 0))
         income = is_income_type(t.get("type"))
+        if months == 1 and not income and prev_start <= dt < start:
+            day_prev[dt.day] = day_prev.get(dt.day, 0.0) + amount   # весь прошлый месяц, для пунктира
         if start <= dt < end:
             cur_count += 1
             if income:
                 cur_income += amount
             else:
                 cur_expense += amount
+                by_month[(dt.year, dt.month)] = by_month.get((dt.year, dt.month), 0.0) + amount
+                if months == 1:
+                    day_cur[dt.day] = day_cur.get(dt.day, 0.0) + amount
                 cat = str(t.get("cat") or "").strip() or "Без категории"
                 by_cat[cat] = by_cat.get(cat, 0.0) + amount
                 expenses.append({
@@ -161,6 +208,8 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     expenses.sort(key=lambda e: (e["amount"], e["_ts"]), reverse=True)
     top = [{k: v for k, v in e.items() if k != "_ts"} for e in expenses[:MAX_EXPENSE_ROWS]]
 
+    dynamics = _build_dynamics(months, now, sy, sm, py, pm, day_cur, day_prev, by_month)
+
     if months == 1:
         prev_label = _MONTHS_RU[pm - 1]
         prev_phrase = f"в {_MONTHS_PREP[pm - 1]}"
@@ -188,6 +237,7 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
             "income_delta_pct": _delta_pct(cur_income, prev_income),
         },
         "categories": categories,
+        "dynamics": dynamics,
         "expenses": top,
         "expenses_total": len(expenses),
     }
