@@ -126,12 +126,27 @@ async def handle_dashboard(request: web.Request) -> web.Response:
     return web.json_response(data, headers={"Cache-Control": "no-store"})
 
 
+async def handle_lists(request: web.Request) -> web.Response:
+    if not authorize_request(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from services.lists_view import get_lists
+
+    force = request.query.get("refresh") == "1"
+    try:
+        data = await asyncio.to_thread(get_lists, force)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Списки: ошибка загрузки: %s", e)
+        return web.json_response({"error": "unavailable"}, status=503)
+    return web.json_response(data, headers={"Cache-Control": "no-store"})
+
+
 def build_app() -> web.Application:
     app = web.Application()
     app.router.add_get("/health", handle_health)
     app.router.add_get("/app", handle_page)
     app.router.add_get("/api/me", handle_me)
     app.router.add_get("/api/dashboard", handle_dashboard)
+    app.router.add_get("/api/lists", handle_lists)
     return app
 
 

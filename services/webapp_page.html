@@ -63,6 +63,26 @@
   .legend { display: flex; gap: 14px; flex-wrap: wrap; margin: 6px 4px 0; font-size: 12px; color: var(--hint); }
   .legend i { display: inline-block; width: 16px; height: 0; border-top: 3px solid var(--accent); vertical-align: middle; margin-right: 5px; }
   .legend i.dash { border-top: 2px dashed var(--hint); }
+  body { padding-bottom: calc(72px + env(safe-area-inset-bottom, 0px)); }
+  nav#tabs {
+    position: fixed; left: 0; right: 0; bottom: 0; display: flex; gap: 2px;
+    padding: 6px 6px calc(6px + env(safe-area-inset-bottom, 0px));
+    background: var(--tg-theme-secondary-bg-color, #f1f1f4); border-top: 1px solid rgba(127,127,127,.25);
+  }
+  nav#tabs button {
+    flex: 1; margin: 0; padding: 6px 2px; border-radius: 10px; background: transparent;
+    color: var(--hint); font-size: 11px; line-height: 1.25;
+  }
+  nav#tabs button span { display: block; font-size: 18px; }
+  nav#tabs button.on { color: var(--accent); background: rgba(127,127,127,.14); }
+  .chip { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 9px; background: rgba(127,127,127,.2); color: var(--hint); }
+  .chip.good { background: rgba(47,174,102,.2); color: var(--ok); }
+  .chip.bad { background: rgba(229,72,77,.2); color: var(--over); }
+  .item { background: var(--card); border-radius: 14px; padding: 12px 14px; margin-bottom: 8px; }
+  .item .sub { margin-top: 4px; font-size: 12px; }
+  .item .sub.over { color: var(--over); } .item .sub.warn { color: var(--warn); }
+  .item a.link { display: inline-block; margin-top: 8px; font-size: 13px; color: var(--accent); text-decoration: none; }
+  .good { color: var(--ok); } .bad { color: var(--over); }
   .note { font-size: 12px; color: var(--hint); margin-top: 8px; text-align: center; }
   button {
     margin-top: 14px; width: 100%; padding: 12px; border: 0; border-radius: 12px;
@@ -76,6 +96,7 @@
   <h1 id="title">Ада</h1>
   <span class="sub" id="updated"></span>
 </header>
+<div id="controls">
 <div class="seg" id="who">
   <button data-v="family" class="on">Семья</button>
   <button data-v="me">Я</button>
@@ -87,7 +108,15 @@
   <button data-v="6">Полгода</button>
   <button data-v="12">Год</button>
 </div>
+</div>
 <div id="root"><div class="msg">Загружаю…</div></div>
+<nav id="tabs">
+  <button data-t="overview" class="on"><span>📊</span>Обзор</button>
+  <button data-t="debts"><span>🤝</span>Долги</button>
+  <button data-t="goals"><span>🎯</span>Цели</button>
+  <button data-t="subscriptions"><span>🔁</span>Подписки</button>
+  <button data-t="prices"><span>🏷️</span>Цены</button>
+</nav>
 <script>
 (function () {
   var tg = window.Telegram && window.Telegram.WebApp;
@@ -298,7 +327,7 @@
     root.replaceChildren(frag);
   }
 
-  var state = { who: "family", period: "1" };
+  var state = { who: "family", period: "1", tab: "overview" };
   var seq = 0;
 
   async function load(force, btn) {
@@ -317,6 +346,155 @@
       if (my === seq) message("Не удалось связаться с сервером.");
     }
   }
+
+  // ---------- вкладки со списками ----------
+  var TAB_TITLES = { debts: "Долги", goals: "Цели", subscriptions: "Подписки", prices: "Цены" };
+
+  function daysText(n) {
+    if (n === null || n === undefined) return "";
+    if (n === 0) return "сегодня";
+    if (n === 1) return "завтра";
+    if (n > 0) return "через " + n + " дн.";
+    return "просрочено на " + Math.abs(n) + " дн.";
+  }
+  function itemRow(title, right, subs) {
+    var box = el("div", "item");
+    var row = el("div", "row");
+    row.appendChild(el("span", "name", title));
+    if (right) row.appendChild(el("span", "amt", right));
+    box.appendChild(row);
+    (subs || []).forEach(function (s) {
+      if (!s) return;
+      box.appendChild(el("div", "sub" + (s.cls ? " " + s.cls : ""), s.text));
+    });
+    return box;
+  }
+  function emptyOrError(sec, emptyText) {
+    if (sec.error) return el("div", "msg", "Не удалось загрузить этот раздел. Попробуй позже.");
+    if (!sec.items.length) return el("div", "msg", emptyText);
+    return null;
+  }
+
+  function renderDebts(sec) {
+    var f = document.createDocumentFragment();
+    if (sec.error || !sec.items.length) { f.appendChild(emptyOrError(sec, "Открытых долгов нет.")); return f; }
+    var cards = el("div", "cards");
+    cards.appendChild(card("Нам должны", money(sec.lent_total)));
+    cards.appendChild(card("Мы должны", money(sec.borrowed_total)));
+    f.appendChild(cards);
+    f.appendChild(el("h2", "", "Открытые долги"));
+    sec.items.forEach(function (d) {
+      var who = d.direction === "lent" ? "нам должны" : "мы должны";
+      var subs = [{ text: who + (d.amount !== d.balance ? " · изначально " + money(d.amount) : "") }];
+      if (d.due_date) subs.push({
+        text: "Срок " + d.due_date + " · " + daysText(d.days_left),
+        cls: d.days_left < 0 ? "over" : (d.days_left <= 3 ? "warn" : ""),
+      });
+      if (d.note) subs.push({ text: d.note });
+      f.appendChild(itemRow(d.counterparty || "Без имени", money(d.balance), subs));
+    });
+    return f;
+  }
+
+  function renderGoals(sec) {
+    var f = document.createDocumentFragment();
+    if (sec.error || !sec.items.length) { f.appendChild(emptyOrError(sec, "Активных целей пока нет.")); return f; }
+    f.appendChild(el("div", "cards")).appendChild(card("Накоплено по целям", money(sec.saved_total), { wide: true }));
+    f.appendChild(el("h2", "", "Копилки"));
+    sec.items.forEach(function (g) {
+      var box = itemRow(g.name, g.pct + "%", []);
+      var bar = el("div", "bar " + (g.pct >= 100 ? "" : "none"));
+      var fill = el("i"); fill.style.width = Math.max(2, Math.min(100, g.pct)) + "%";
+      bar.appendChild(fill); box.appendChild(bar);
+      box.appendChild(el("div", "sub", money(g.current) + " из " + money(g.target) + (g.remaining > 0 ? " · осталось " + money(g.remaining) : " · цель достигнута")));
+      if (g.deadline) box.appendChild(el("div", "sub" + (g.days_left !== null && g.days_left < 0 && g.remaining > 0 ? " over" : ""),
+        "до " + g.deadline + (g.days_left !== null ? " · " + daysText(g.days_left) : "")));
+      f.appendChild(box);
+    });
+    return f;
+  }
+
+  function renderSubs(sec) {
+    var f = document.createDocumentFragment();
+    if (sec.error || !sec.items.length) { f.appendChild(emptyOrError(sec, "Активных подписок нет.")); return f; }
+    f.appendChild(el("div", "cards")).appendChild(card("В месяц", money(sec.month_total), { wide: true }));
+    f.appendChild(el("h2", "", "Ближайшие списания"));
+    sec.items.forEach(function (s) {
+      f.appendChild(itemRow(s.name, money(s.amount), [{
+        text: "спишется " + s.next_date + " · " + daysText(s.days_left) + (s.bank ? " · " + s.bank : ""),
+        cls: s.days_left <= 2 ? "warn" : "",
+      }]));
+    });
+    return f;
+  }
+
+  var PRICE_STATUS = { active: ["следим", ""], reached: ["цель достигнута", "good"], broken: ["не удалось проверить", "bad"] };
+  function renderPrices(sec) {
+    var f = document.createDocumentFragment();
+    if (sec.error || !sec.items.length) { f.appendChild(emptyOrError(sec, "Ничего не отслеживаем. Пришли боту ссылку Kaspi и «следи за ценой».")); return f; }
+    f.appendChild(el("h2", "", "Отслеживаемые товары"));
+    sec.items.forEach(function (p) {
+      var st = PRICE_STATUS[p.status];
+      var subs = [];
+      if (p.first_price > 0) {
+        var line = "было " + money(p.first_price);
+        if (p.change_pct !== null && p.change_pct !== 0) line += " · " + (p.change_pct < 0 ? "" : "+") + String(p.change_pct).replace(".", ",") + "%";
+        subs.push({ text: line, cls: p.change_pct !== null && p.change_pct < 0 ? "good" : "" });
+      }
+      if (p.target_price) subs.push({ text: "цель " + money(p.target_price) });
+      var box = itemRow(p.name, p.last_price ? money(p.last_price) : "—", subs);
+      var chip = el("span", "chip " + st[1], st[0]);
+      var wrapChip = el("div", "sub"); wrapChip.appendChild(chip); box.appendChild(wrapChip);
+      if (p.url) {
+        var a = el("a", "link", "Открыть в Kaspi"); a.href = p.url;
+        a.addEventListener("click", function (ev) { if (tg.openLink) { ev.preventDefault(); tg.openLink(p.url); } });
+        box.appendChild(a);
+      }
+      f.appendChild(box);
+    });
+    return f;
+  }
+
+  var listsCache = null;
+  function renderList(tab, data) {
+    document.getElementById("title").textContent = TAB_TITLES[tab];
+    document.getElementById("updated").textContent = "обновлено " + data.updated_at;
+    var frag = document.createDocumentFragment();
+    var sec = data[tab];
+    var body = { debts: renderDebts, goals: renderGoals, subscriptions: renderSubs, prices: renderPrices }[tab](sec);
+    frag.appendChild(body);
+    var btn = el("button", "", "Обновить");
+    btn.addEventListener("click", function () { loadLists(true, btn); });
+    frag.appendChild(btn);
+    root.replaceChildren(frag);
+  }
+
+  async function loadLists(force, btn) {
+    var my = ++seq;
+    if (btn) btn.disabled = true;
+    if (!force && listsCache) { renderList(state.tab, listsCache); return; }
+    try {
+      var r = await fetch("/api/lists" + (force ? "?refresh=1" : ""), { headers: { "X-Telegram-Init-Data": tg.initData } });
+      if (my !== seq) return;
+      if (r.status === 403) return message("Доступ закрыт.");
+      if (!r.ok) return message("Не удалось загрузить данные. Попробуй чуть позже.");
+      listsCache = await r.json();
+      if (my !== seq) return;
+      renderList(state.tab, listsCache);
+    } catch (e) {
+      if (my === seq) message("Не удалось связаться с сервером.");
+    }
+  }
+
+  document.getElementById("tabs").addEventListener("click", function (ev) {
+    var b = ev.target.closest("button");
+    if (!b || b.dataset.t === state.tab) return;
+    state.tab = b.dataset.t;
+    this.querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
+    document.getElementById("controls").style.display = state.tab === "overview" ? "" : "none";
+    message("Загружаю…");
+    if (state.tab === "overview") load(false); else loadLists(false);
+  });
 
   function bindSeg(id, key) {
     document.getElementById(id).addEventListener("click", function (ev) {
