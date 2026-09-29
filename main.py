@@ -6,7 +6,7 @@ import os
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command
-from aiogram.types import BufferedInputFile
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, WebAppInfo
 try:
     from aiogram.client.default import DefaultBotProperties
 except Exception:
@@ -41,6 +41,7 @@ from services.limits_ai import generate_limits_from_history
 from services.timezone import now_astana
 from services.reminders import deliver_due
 from services import preflight, state, debts
+from services.webapp import start_webapp, webapp_url
 
 if DefaultBotProperties:
     bot = Bot(token=TELEGRAM_BOT_TOKEN, default=DefaultBotProperties(parse_mode="Markdown"))
@@ -129,6 +130,7 @@ async def cmd_help(message: types.Message):
         "/leaks — анализ утечек бюджета (микротраты)\n"
         "/report — скачать PDF-буклет за месяц\n"
         "/export — скачать выписку в Excel (.xlsx)\n"
+        "/app — открыть мини-апп с дашбордом\n"
         "/debug — диагностика таблицы\n\n"
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
@@ -140,6 +142,32 @@ async def cmd_help(message: types.Message):
         "• 'Добавь в покупки: молоко, хлеб'\n"
         "• 'Покажи лимиты'"
     )
+
+
+@dp.message(Command("app"))
+async def cmd_app(message: types.Message):
+    url = webapp_url()
+    if not url:
+        await safe_answer(message, "Мини-апп ещё не настроен: не задан адрес WEBAPP_URL.")
+        return
+    if message.chat.type == "private":
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="📊 Открыть дашборд", web_app=WebAppInfo(url=url))
+        ]])
+        await safe_answer(message, "Мини-апп с семейным бюджетом:", reply_markup=markup)
+        return
+    # В группах Telegram не открывает мини-апп по кнопке — отправляем в личку с ботом.
+    try:
+        username = (await bot.get_me()).username
+    except Exception:
+        username = None
+    if username:
+        markup = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="Открыть в личке с ботом", url=f"https://t.me/{username}")
+        ]])
+        await safe_answer(message, "Мини-апп открывается в личной переписке со мной. Напиши мне туда /app.", reply_markup=markup)
+    else:
+        await safe_answer(message, "Мини-апп открывается в личной переписке со мной. Напиши мне туда /app.")
 
 
 @dp.message(Command("chatid"))
@@ -688,6 +716,18 @@ async def main():
     asyncio.create_task(monthly_limits_scheduler())
     asyncio.create_task(sweep_pending_receipts())
     asyncio.create_task(sweep_clarifications())
+
+    # Мини-апп (только чтение). Любой сбой здесь не должен мешать боту.
+    web_runner = await start_webapp()
+    url = webapp_url()
+    if web_runner and url:
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Бюджет", web_app=WebAppInfo(url=url))
+            )
+        except Exception as e:
+            print(f"[Мини-апп] Не удалось поставить кнопку меню: {e}")
+
     await dp.start_polling(bot)
 
 
