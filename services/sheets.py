@@ -132,6 +132,12 @@ def get_db():
     return _cached_db
 
 
+def get_client():
+    """Клиент gspread (для операций с файлами Google Drive, например резервных копий)."""
+    get_db()
+    return _cached_client
+
+
 def normalize_necessity(raw, category=None):
     if not raw:
         return "Want"

@@ -41,6 +41,7 @@ from services.limits_ai import (
     generate_limits_from_history, recalc_and_apply, preview_limits_text, restore_previous_limits,
 )
 from services import fx
+from services import backup as backup_module
 from services import sheets as sheets_module
 from services.timezone import now_astana
 from services.reminders import deliver_due
@@ -164,6 +165,7 @@ async def cmd_help(message: types.Message):
         "/app — открыть мини-апп с дашбордом\n"
         "/limits_plan — показать, как Ада пересчитала бы лимиты (без записи)\n"
         "/limits_undo — вернуть лимиты, что были до последнего пересчёта\n"
+        "/backup — сделать резервную копию таблицы сейчас\n"
         "/debug — диагностика таблицы\n\n"
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
@@ -221,6 +223,33 @@ async def cmd_limits_undo(message: types.Message):
         print(f"[Лимиты] /limits_undo: {e}")
         text = "Не получилось откатить лимиты. Проверь лист Limits в таблице."
     await safe_answer(message, text)
+
+
+_BACKUP_HELP = (
+    "Резервные копии пока не настроены. Как включить:\n"
+    "1. В Google Drive создай папку, например «Ada backups».\n"
+    "2. Открой доступ к ней (Поделиться) для email сервисного аккаунта бота — роль «Редактор». "
+    "Email лежит в файле ключа Google (поле client_email).\n"
+    "3. Скопируй id папки из адреса (часть после /folders/) и вставь в Railway → Variables → BACKUP_FOLDER_ID.\n"
+    "После перезапуска бот будет делать копию каждое воскресенье ночью и хранить 8 последних."
+)
+
+
+def _backup_result_text(result: dict) -> str:
+    if result.get("ok"):
+        extra = f" Старых удалено: {result['deleted']}." if result.get("deleted") else ""
+        link = f"\n{result['url']}" if result.get("url") else ""
+        return f"Резервная копия готова: {result['title']}.{extra}{link}"
+    if result.get("reason") == "not_configured":
+        return _BACKUP_HELP
+    return f"Не получилось сделать резервную копию: {result.get('reason')}."
+
+
+@dp.message(Command("backup"))
+async def cmd_backup(message: types.Message):
+    now = datetime.datetime.now(ASTANA_TZ)
+    result = await asyncio.to_thread(backup_module.make_backup, now)
+    await safe_answer(message, _backup_result_text(result))
 
 
 @dp.message(Command("chatid"))
@@ -767,6 +796,37 @@ async def monthly_limits_scheduler():
         await asyncio.sleep(60)
 
 
+async def backup_scheduler():
+    """Еженедельная копия таблицы: воскресенье с 03:30 до 03:59 по Астане.
+
+    Маркер недели ставится после успеха или после 3 неудач (тогда один раз пишем в чат).
+    Без BACKUP_FOLDER_ID ничего не делает.
+    """
+    attempts: dict[str, list] = {}
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            week = now.strftime("%G-W%V")
+            marker = f"backup:{week}"
+            if (backup_module.backup_folder_id() and now.weekday() == 6 and now.hour == 3 and now.minute >= 30
+                    and not state.get("scheduler", marker)):
+                count, last = attempts.get(week, [0, None])
+                if count < 3 and (last is None or (now - last).total_seconds() >= 600):
+                    attempts[week] = [count + 1, now]
+                    result = await asyncio.to_thread(backup_module.make_backup, now)
+                    if result.get("ok"):
+                        state.put("scheduler", marker, {"done_at": now.isoformat(), "title": result["title"]})
+                    elif count + 1 >= 3:
+                        await safe_send_message(
+                            bot, chat_id=FAMILY_CHAT_ID,
+                            text=f"Не получилось сделать еженедельную резервную копию таблицы: {result.get('reason')}. "
+                                 "Можно попробовать вручную командой /backup.")
+                        state.put("scheduler", marker, {"failed_at": now.isoformat()})
+        except Exception as e:
+            print(f"[Бэкап] Ошибка планировщика: {e}")
+        await asyncio.sleep(60)
+
+
 async def fix_foreign_currency_rows():
     """Разовая починка старых записей в валюте (до автоконвертации 13.09.2026).
 
@@ -811,6 +871,7 @@ async def main():
     asyncio.create_task(monthly_limits_scheduler())
     asyncio.create_task(sweep_pending_receipts())
     asyncio.create_task(sweep_clarifications())
+    asyncio.create_task(backup_scheduler())
 
     # Мини-апп (только чтение). Любой сбой здесь не должен мешать боту.
     web_runner = await start_webapp()
