@@ -67,13 +67,16 @@ async def safe_send_message(bot, chat_id, text: str, **kwargs):
     """Замена bot.send_message(chat_id=..., text=...) — с тем же откатом и разбивкой."""
     parts = list(chunks(text))
     result = None
-    for part in parts:
+    for i, part in enumerate(parts):
         text_to_send = _telegram_markdown(part)
+        kwargs_part = dict(kwargs)
+        if i < len(parts) - 1:
+            kwargs_part.pop("reply_markup", None)     # кнопки — только под последней частью длинного текста
         try:
-            result = await bot.send_message(chat_id=chat_id, text=text_to_send, **kwargs)
+            result = await bot.send_message(chat_id=chat_id, text=text_to_send, **kwargs_part)
         except TelegramBadRequest as error:
             if _looks_like_markdown_error(error):
-                kw = dict(kwargs)
+                kw = dict(kwargs_part)
                 kw.pop("parse_mode", None)
                 result = await bot.send_message(chat_id=chat_id, text=part, parse_mode=None, **kw)
             else:

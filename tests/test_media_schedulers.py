@@ -238,3 +238,57 @@ def test_monthly_limits_disabled_without_env(app,monkeypatch):
     monkeypatch.delenv("AUTO_GENERATE_LIMITS",raising=False)
     tick(app.monthly_limits_scheduler)
     assert not recalc.called
+
+
+def _monday_report(app, monkeypatch, when):
+    frozen(monkeypatch, app, when)
+    monkeypatch.setattr(app, "_period_summary_text", lambda *args: "Отчет")
+    monkeypatch.setattr(app, "generate_budget_reflection", AsyncMock(return_value=""))
+    app.bot.send_message.reset_mock()
+    tick(app.finance_report_scheduler)
+
+
+def test_weekly_and_monthly_reports_get_dashboard_button(app, monkeypatch):
+    monkeypatch.setenv("WEBAPP_URL", "https://ada.up.railway.app")
+    app.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="FamilyFinance1337Bot"))
+    app._bot_username.clear()
+    _monday_report(app, monkeypatch, dt.datetime(2026, 9, 7, 9, 15, tzinfo=ASTANA_TZ))        # понедельник
+    markup = app.bot.send_message.call_args.kwargs["reply_markup"]
+    button = markup.inline_keyboard[0][0]
+    assert button.url == "https://t.me/FamilyFinance1337Bot?start=app" and "дашборд" in button.text
+    _monday_report(app, monkeypatch, dt.datetime(2026, 10, 1, 9, 20, tzinfo=ASTANA_TZ))       # 1-е число
+    assert app.bot.send_message.call_args.kwargs["reply_markup"].inline_keyboard[0][0].url.endswith("?start=app")
+
+
+def test_reports_without_webapp_or_username_have_no_button_and_still_send(app, monkeypatch):
+    monkeypatch.delenv("WEBAPP_URL", raising=False)
+    _monday_report(app, monkeypatch, dt.datetime(2026, 9, 7, 9, 15, tzinfo=ASTANA_TZ))
+    assert app.bot.send_message.called and "reply_markup" not in app.bot.send_message.call_args.kwargs
+    monkeypatch.setenv("WEBAPP_URL", "https://ada.up.railway.app")
+    app.bot.get_me = AsyncMock(side_effect=RuntimeError("нет сети"))
+    app._bot_username.clear()
+    _monday_report(app, monkeypatch, dt.datetime(2026, 9, 14, 9, 15, tzinfo=ASTANA_TZ))
+    assert app.bot.send_message.called and "reply_markup" not in app.bot.send_message.call_args.kwargs
+
+
+def test_start_with_app_payload_gives_web_app_button_in_private_chat(app, monkeypatch):
+    monkeypatch.setenv("WEBAPP_URL", "https://ada.up.railway.app")
+    msg = SimpleNamespace(chat=SimpleNamespace(id=1, type="private"), from_user=SimpleNamespace(id=11, first_name="Влад"),
+                          answer=AsyncMock(), message_id=1)
+    asyncio.run(app.cmd_start(msg, SimpleNamespace(args="app")))
+    markup = msg.answer.call_args.kwargs["reply_markup"]
+    assert markup.inline_keyboard[0][0].web_app.url == "https://ada.up.railway.app/app"
+    plain = SimpleNamespace(chat=SimpleNamespace(id=1, type="private"), answer=AsyncMock(), message_id=2)
+    asyncio.run(app.cmd_start(plain, SimpleNamespace(args="")))
+    assert "Я Ада" in plain.answer.call_args.args[0]                     # обычный /start не изменился
+    asyncio.run(app.cmd_start(plain))                                     # и вызов без command тоже работает
+
+
+def test_safe_send_puts_markup_only_on_last_chunk():
+    from services import telegram_safe
+    bot = SimpleNamespace(send_message=AsyncMock())
+    text = ("абзац " * 200 + "\n\n") * 8                                    # заведомо длиннее лимита Telegram
+    asyncio.run(telegram_safe.safe_send_message(bot, chat_id=1, text=text, reply_markup="KB"))
+    calls = bot.send_message.call_args_list
+    assert len(calls) > 1
+    assert all("reply_markup" not in c.kwargs for c in calls[:-1]) and calls[-1].kwargs["reply_markup"] == "KB"

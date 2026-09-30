@@ -5,7 +5,7 @@ import datetime
 import os
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
-from aiogram.filters import Command
+from aiogram.filters import Command, CommandObject
 from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, WebAppInfo
 try:
     from aiogram.client.default import DefaultBotProperties
@@ -100,8 +100,35 @@ def _format_currency(value):
         return str(value)
 
 
+_bot_username: dict = {}
+
+
+async def dashboard_link_markup():
+    """Кнопка «Открыть дашборд» для сообщений в общем чате.
+
+    В группах Telegram не открывает мини-апп по кнопке, поэтому ведём в личную
+    переписку с ботом по ссылке /start app (там сразу приходит кнопка мини-аппа).
+    Возвращает None, если мини-апп не настроен или имя бота узнать не удалось.
+    """
+    if not webapp_url():
+        return None
+    username = _bot_username.get("name")
+    if not username:
+        try:
+            username = (await bot.get_me()).username
+        except Exception:
+            return None
+        _bot_username["name"] = username
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="📊 Открыть дашборд", url=f"https://t.me/{username}?start=app")
+    ]])
+
+
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, command: CommandObject = None):
+    if command is not None and (command.args or "").strip() == "app":
+        await cmd_app(message)          # переход по ссылке из отчёта: сразу даём кнопку мини-аппа
+        return
     await safe_answer(
         message,
         "Привет! Я Ада — твоя финансовая помощница.\n\n"
@@ -628,6 +655,14 @@ def _period_summary_text(title: str, start: str, end: str, compare_start: str = 
     return "\n".join(lines)
 
 
+async def _send_report(text: str):
+    """Отправка недельного/месячного отчёта в семейный чат; под ним кнопка «Открыть дашборд»
+    (если мини-апп настроен)."""
+    markup = await dashboard_link_markup()
+    kwargs = {"reply_markup": markup} if markup else {}
+    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text, **kwargs)
+
+
 async def finance_report_scheduler():
     """Еженедельный и месячный автоотчёт в семейный чат.
 
@@ -671,7 +706,7 @@ async def finance_report_scheduler():
                     except Exception as pace_error:
                         print(f"[Темп категорий] Пропущено: {pace_error}")
 
-                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
+                    await _send_report(text)
 
             # Месячный дайджест — 1-го числа в 09:15 за прошлый месяц, со
             # сравнением с позапрошлым.
@@ -691,7 +726,7 @@ async def finance_report_scheduler():
                     reflection = await generate_budget_reflection("monthly", text)
                     if reflection:
                         text = f"{reflection}\n\n{text}"
-                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
+                    await _send_report(text)
         except Exception as e:
             print(f"[Автоотчёты] Ошибка: {e}")
         await asyncio.sleep(60)
