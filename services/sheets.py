@@ -568,13 +568,94 @@ def mark_reminder_done(row_idx: int, recurrence: str = "once", remind_at: str = 
         print(f"[Напоминания] Ошибка завершения: {e}")
 
 
+def _write_split(ws, target_idx: int, target_record: dict, a1: float, part1_cat: str, part1_comm: str,
+                 a2: float, part2_cat: str, part2_comm: str, part1_sub: str = "", part2_sub: str = "") -> bool:
+    """Заменяет запись target_idx двумя частями одним атомарным batch_update
+    (вставить строку + записать обе части). Раньше это были delete_rows + два
+    insert_row: между запросами таблица оставалась «разбитой наполовину», и при
+    сбое второго терялись деньги."""
+    from services.categories import validate_transaction_category_subcategory
+
+    now = datetime.datetime.now(ASTANA_TZ)
+    base_id = str(target_record.get("transaction_id") or "").strip()
+    base_date = target_record.get("date", now.strftime("%Y-%m-%d %H:%M:%S"))
+    base_user = target_record.get("user", "Влад")
+    base_type = target_record.get("type") or TYPE_EXPENSE
+    base_bank = target_record.get("bank") or "BCC"
+    base_source = target_record.get("source") or "BCC Pay"
+    base_funds = target_record.get("funds_type") or "Собственные"
+    base_resource = target_record.get("resource") or "Карта"
+    base_merchant = target_record.get("merchant", "")
+    base_necessity = target_record.get("necessity", "Want")
+    base_cat = str(target_record.get("category") or "")
+    base_sub = str(target_record.get("subcategory") or "")
+
+    def resolve(cat_raw, sub_hint):
+        cat, sub = validate_transaction_category_subcategory(cat_raw, sub_hint)
+        if not sub_hint and cat == base_cat and base_sub:
+            sub = base_sub     # часть осталась в той же категории — сохраняем исходную подкатегорию
+        return cat, sub
+
+    cat1, sub1 = resolve(part1_cat, part1_sub)
+    cat2, sub2 = resolve(part2_cat, part2_sub)
+    id1 = f"{base_id}_1" if base_id else f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_1"
+    id2 = f"{base_id}_2" if base_id else f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_2"
+
+    columns = [
+        "transaction_id", "date", "user", "type", "amount", "currency",
+        "bank", "source", "funds_type", "resource", "category",
+        "subcategory", "merchant", "necessity", "user_comment", "ai_comment",
+    ]
+
+    def part(tid, amount, cat, sub, comm):
+        return {
+            "transaction_id": tid, "date": base_date, "user": base_user,
+            "type": base_type, "amount": amount, "currency": "KZT", "bank": base_bank, "source": base_source,
+            "funds_type": base_funds, "resource": base_resource, "category": cat, "subcategory": sub,
+            "merchant": base_merchant, "necessity": base_necessity, "user_comment": comm,
+            "ai_comment": "Разделено по запросу.",
+        }
+
+    def _cell_row(data: dict) -> dict:
+        values = []
+        for col in columns:
+            val = data.get(col, "")
+            if col == "amount":
+                values.append({"userEnteredValue": {"numberValue": float(val)}})
+            else:
+                values.append({"userEnteredValue": {"stringValue": str(val or "")}})
+        return {"values": values}
+
+    row_index_0based = target_idx  # header=0, первая запись=1 -> совпадает с 1-based позицией
+    sheet_id = getattr(ws, "id", 0)
+    get_db().batch_update({
+        "requests": [
+            {
+                "insertDimension": {
+                    "range": {
+                        "sheetId": sheet_id,
+                        "dimension": "ROWS",
+                        "startIndex": row_index_0based + 1,
+                        "endIndex": row_index_0based + 2,
+                    },
+                    "inheritFromBefore": True,
+                }
+            },
+            {
+                "updateCells": {
+                    "rows": [_cell_row(part(id1, a1, cat1, sub1, part1_comm)),
+                             _cell_row(part(id2, a2, cat2, sub2, part2_comm))],
+                    "fields": "userEnteredValue",
+                    "start": {"sheetId": sheet_id, "rowIndex": row_index_0based, "columnIndex": 0},
+                }
+            },
+        ]
+    })
+    return True
+
+
 def split_last_transaction_by_amount(target_amount: float, part1_amt: float, part1_cat: str, part1_comm: str, part2_amt: float, part2_cat: str, part2_comm: str):
-    """Разбивает найденную транзакцию на две. Раньше делала это как
-    delete_rows + два insert_row — три отдельных запроса к Google Sheets,
-    между которыми таблица какое-то время видна в промежуточном
-    (разбитом наполовину) состоянии, и если второй insert_row не пройдёт —
-    получаем потерянные деньги. Теперь один атомарный batch_update
-    (вставить строку + сразу записать обе части)."""
+    """Разбивает найденную по сумме транзакцию на две (обе суммы названы явно)."""
     a1 = parse_amount(part1_amt)
     a2 = parse_amount(part2_amt)
     total = parse_amount(target_amount)
@@ -599,80 +680,92 @@ def split_last_transaction_by_amount(target_amount: float, part1_amt: float, par
 
         if target_idx == -1 or not target_record:
             return False
-
-        now = datetime.datetime.now(ASTANA_TZ)
-        base_date = target_record.get("date", now.strftime("%Y-%m-%d %H:%M:%S"))
-        base_user = target_record.get("user", "Влад")
-        base_type = target_record.get("type") or TYPE_EXPENSE
-        base_bank = target_record.get("bank") or "BCC"
-        base_source = target_record.get("source") or "BCC Pay"
-        base_funds = target_record.get("funds_type") or "Собственные"
-        base_resource = target_record.get("resource") or "Карта"
-        base_merchant = target_record.get("merchant", "")
-        base_necessity = target_record.get("necessity", "Want")
-
-        from services.categories import validate_transaction_category_subcategory
-        _, p1_sub = validate_transaction_category_subcategory(part1_cat, "")
-        _, p2_sub = validate_transaction_category_subcategory(part2_cat, "")
-
-        columns = [
-            "transaction_id", "date", "user", "type", "amount", "currency",
-            "bank", "source", "funds_type", "resource", "category",
-            "subcategory", "merchant", "necessity", "user_comment", "ai_comment",
-        ]
-        part1 = {
-            "transaction_id": f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_1", "date": base_date, "user": base_user,
-            "type": base_type, "amount": a1, "currency": "KZT", "bank": base_bank, "source": base_source,
-            "funds_type": base_funds, "resource": base_resource, "category": part1_cat, "subcategory": p1_sub,
-            "merchant": base_merchant, "necessity": base_necessity, "user_comment": part1_comm,
-            "ai_comment": "Разделено по запросу.",
-        }
-        part2 = {
-            "transaction_id": f"TRX_{now.strftime('%Y%m%d_%H%M%S')}_2", "date": base_date, "user": base_user,
-            "type": base_type, "amount": a2, "currency": "KZT", "bank": base_bank, "source": base_source,
-            "funds_type": base_funds, "resource": base_resource, "category": part2_cat, "subcategory": p2_sub,
-            "merchant": base_merchant, "necessity": base_necessity, "user_comment": part2_comm,
-            "ai_comment": "Разделено по запросу.",
-        }
-
-        def _cell_row(data: dict) -> dict:
-            values = []
-            for col in columns:
-                val = data.get(col, "")
-                if col == "amount":
-                    values.append({"userEnteredValue": {"numberValue": float(val)}})
-                else:
-                    values.append({"userEnteredValue": {"stringValue": str(val or "")}})
-            return {"values": values}
-
-        row_index_0based = target_idx  # header=0, первая запись=1 -> совпадает с 1-based позицией
-        sheet_id = getattr(ws, "id", 0)
-        get_db().batch_update({
-            "requests": [
-                {
-                    "insertDimension": {
-                        "range": {
-                            "sheetId": sheet_id,
-                            "dimension": "ROWS",
-                            "startIndex": row_index_0based + 1,
-                            "endIndex": row_index_0based + 2,
-                        },
-                        "inheritFromBefore": True,
-                    }
-                },
-                {
-                    "updateCells": {
-                        "rows": [_cell_row(part1), _cell_row(part2)],
-                        "fields": "userEnteredValue",
-                        "start": {"sheetId": sheet_id, "rowIndex": row_index_0based, "columnIndex": 0},
-                    }
-                },
-            ]
-        })
-        return True
+        return _write_split(ws, target_idx, target_record, a1, part1_cat, part1_comm, a2, part2_cat, part2_comm)
     except Exception as e:
         print(f"[Транзакции] Ошибка разделения: {e}")
         return False
+
+
+def split_last_transaction(user: str, target_amount, parts: list) -> dict:
+    """Разбивка «по-человечески»: «разбей последнюю трату, стики 1230 отдельно».
+
+    Сама находит запись (по названной сумме, иначе — последнюю расходную запись
+    этого человека), считает остаток, подставляет категорию и комментарий исходной
+    записи там, где они не названы, и пишет одним batch_update.
+    Возвращает {"ok": bool, "reason": str, "total": число, "parts": [{amount, category, comment}]}.
+    """
+    from services.categories import validate_transaction_category_subcategory
+
+    def fail(reason):
+        return {"ok": False, "reason": reason, "total": 0, "parts": []}
+
+    parts = [p for p in (parts or []) if isinstance(p, dict)]
+    if not parts or len(parts) > 2:
+        return fail("не поняла, на какие части разделить: назови сумму хотя бы одной части")
+
+    try:
+        ws = get_db().worksheet("Transactions")
+        records = _get_all_records_safe(ws)
+    except Exception as e:
+        print(f"[Транзакции] Ошибка чтения перед разделением: {e}")
+        return fail("не смогла прочитать таблицу, попробуй чуть позже")
+
+    named_total = parse_amount(target_amount) if target_amount not in (None, "") else 0.0
+    target_idx, target = -1, None
+    for only_this_user in ((True, False) if named_total else (True,)):
+        for pos in range(len(records), 0, -1):
+            r = records[pos - 1]
+            if not str(r.get("transaction_id", "")).strip() or is_income_type(r.get("type")):
+                continue
+            if only_this_user and user and str(r.get("user", "")).strip() != user:
+                continue
+            if named_total and abs(parse_amount(r.get("amount", 0)) - named_total) >= 1.0:
+                continue
+            target_idx, target = pos, r
+            break
+        if target:
+            break
+    if not target:
+        if named_total:
+            return fail(f"не нашла расходную запись на {named_total:g}")
+        return fail("не нашла твою последнюю расходную запись")
+
+    total = round(parse_amount(target.get("amount", 0)), 2)
+    if total <= 0:
+        return fail("у найденной записи нет суммы")
+
+    amounts = [None if p.get("amount") in (None, "") else round(parse_amount(p.get("amount")), 2) for p in parts]
+    if len(parts) == 1:
+        parts = parts + [{}]     # названа одна часть — вторая это остаток
+        amounts.append(None)
+    if amounts.count(None) == 2:
+        return fail("не названа сумма ни одной части")
+    if amounts.count(None) == 1:
+        amounts[amounts.index(None)] = round(total - sum(a for a in amounts if a is not None), 2)
+    if any(a <= 0 for a in amounts):
+        return fail(f"части должны быть меньше всей записи ({total:g}), а получилось {amounts[0]:g} и {amounts[1]:g}")
+    if abs(sum(amounts) - total) > 0.01:
+        return fail(f"суммы {amounts[0]:g} + {amounts[1]:g} не равны записи {total:g}")
+
+    orig_cat = str(target.get("category") or "")
+    orig_comm = str(target.get("user_comment") or "")
+    resolved = []
+    for p, amount in zip(parts, amounts):
+        cat_raw = str(p.get("category") or "").strip() or orig_cat
+        sub_hint = str(p.get("subcategory") or "").strip()
+        cat, _ = validate_transaction_category_subcategory(cat_raw, sub_hint)
+        resolved.append({"amount": amount, "category": cat, "comment": str(p.get("comment") or "").strip() or orig_comm,
+                         "subcategory": sub_hint})
+
+    try:
+        _write_split(ws, target_idx, target, resolved[0]["amount"], resolved[0]["category"], resolved[0]["comment"],
+                     resolved[1]["amount"], resolved[1]["category"], resolved[1]["comment"],
+                     resolved[0]["subcategory"], resolved[1]["subcategory"])
+    except Exception as e:
+        print(f"[Транзакции] Ошибка разделения: {e}")
+        return fail("таблица не приняла изменение, запись осталась как была")
+    return {"ok": True, "reason": "", "total": total,
+            "parts": [{k: v for k, v in r.items() if k != "subcategory"} for r in resolved]}
 
 
 def process_due_subscriptions(now: datetime.datetime) -> list:

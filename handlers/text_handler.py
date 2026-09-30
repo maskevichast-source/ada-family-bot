@@ -27,6 +27,7 @@ from services.sheets import (
     add_installment, get_installments, close_installment,
     add_price_tracking, get_user_price_trackings, stop_price_tracking,
     split_last_transaction_by_amount,
+    split_last_transaction,
     get_transactions_for_period, find_recent_duplicate_transaction,
     debug_transactions_snapshot, normalize_necessity,
     update_last_transaction_bank_and_source,
@@ -866,40 +867,44 @@ async def _process_text_message(message: Message, text: str):
 
     # РАССРОЧКИ
     if intent == "add_installment":
-        data = parsed.get("installment", {})
-        if data:
-            await asyncio.to_thread(add_installment, data)
-        res = reply or "Записала рассрочку."
+        data = parsed.get("installment") or {}
+        saved = await asyncio.to_thread(add_installment, data) if data else None
+        # Ответ модели идёт в чат только если запись реально сделана.
+        res = (reply or "Записала рассрочку.") if saved else \
+            "Не записала рассрочку: не разобрала данные (сумма, банк, срок). Напиши подробнее, ничего не записано."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
     if intent == "close_installment":
         query = parsed.get("search_query", "")
-        if query:
-            await asyncio.to_thread(close_installment, query)
-        res = reply or "Закрыла рассрочку."
+        closed = await asyncio.to_thread(close_installment, query) if query else False
+        res = (reply or "Закрыла рассрочку.") if closed else \
+            "Не нашла такую рассрочку, ничего не закрыла. Назови её описание или банк."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
 
     if intent == "split_transaction":
+        # Текст ответа здесь ВСЕГДА пишет код по фактическому результату записи.
+        # Ответ модели (reply) не используем: раньше при неполных данных он уходил
+        # в чат как «Разбила…», хотя в таблице ничего не менялось.
         split = parsed.get("split") or {}
-        parts = split.get("parts") or []
-        target_amount = split.get("amount")
-        if len(parts) == 2 and target_amount is not None:
-            success = await asyncio.to_thread(
-                split_last_transaction_by_amount,
-                target_amount,
-                parts[0].get("amount"), parts[0].get("category", ""), parts[0].get("comment", ""),
-                parts[1].get("amount"), parts[1].get("category", ""), parts[1].get("comment", ""),
-            )
+        result = await asyncio.to_thread(
+            split_last_transaction, user_name, split.get("amount"), split.get("parts") or []
+        )
+        if result["ok"]:
+            def _part_text(part):
+                comment = f" ({part['comment']})" if part.get("comment") else ""
+                return f"{_format_currency(part['amount'])} ₸ — {part['category']}{comment}"
+            p1, p2 = result["parts"]
             res = (
-                f"Разделила: {parts[0].get('category')} — {parts[0].get('amount')} тг, "
-                f"{parts[1].get('category')} — {parts[1].get('amount')} тг."
-            ) if success else "Не нашла такую транзакцию или суммы не сходятся."
+                f"Разделила запись на {_format_currency(result['total'])} ₸:\n"
+                f"• {_part_text(p1)}\n• {_part_text(p2)}\n"
+                "Вместо одной записи теперь две."
+            )
         else:
-            res = reply or "Уточни, на какие две части разделить и какие суммы."
+            res = f"Не разделила: {result['reason']}. Запись в таблице осталась как была."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
@@ -943,9 +948,9 @@ async def _process_text_message(message: Message, text: str):
 
     if intent == "cancel_subscription":
         name = parsed.get("subscription_name", "")
-        if name:
-            await asyncio.to_thread(deactivate_subscription, name)
-        res = reply or "Отменила подписку."
+        found = await asyncio.to_thread(deactivate_subscription, name) if name else None
+        res = (reply or "Отменила подписку.") if found else \
+            "Не нашла такую подписку, ничего не отменила. Проверь название в списке подписок."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
@@ -1007,9 +1012,9 @@ async def _process_text_message(message: Message, text: str):
     # СПИСОК ПОКУПОК
     if intent == "add_shopping":
         items = parsed.get("shopping_items", [])
-        if items:
-            await asyncio.to_thread(add_shopping_items, items, user_name)
-        res = reply or "Добавила в список покупок."
+        added = await asyncio.to_thread(add_shopping_items, items, user_name) if items else []
+        res = (reply or "Добавила в список покупок.") if added else \
+            "Не поняла, что добавить в список покупок, ничего не записано. Назови товары."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
@@ -1048,9 +1053,9 @@ async def _process_text_message(message: Message, text: str):
         dates = parsed.get("dates", "")
         budget = _to_number_or_blank(parsed.get("budget", 0))
         notes = parsed.get("notes", "")
-        if destination:
-            await asyncio.to_thread(add_trip_plan, destination, dates, budget, notes)
-        res = reply or "Записала поездку."
+        saved_trip = await asyncio.to_thread(add_trip_plan, destination, dates, budget, notes) if destination else None
+        res = (reply or "Записала поездку.") if saved_trip else \
+            "Не записала поездку: не поняла, куда едете. Назови направление, ничего не записано."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return
