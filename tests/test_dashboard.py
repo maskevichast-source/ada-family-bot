@@ -120,8 +120,8 @@ def test_dashboard_endpoint_auth_and_payload(monkeypatch):
     monkeypatch.setattr(config, "DIANA_TELEGRAM_ID", "222")
     seen = {}
 
-    def fake(force=False, months=1, person=None):
-        seen.update(force=force, months=months, person=person)
+    def fake(force=False, months=1, person=None, category=None, query=None):
+        seen.update(force=force, months=months, person=person, category=category, query=query)
         return {"month_label": "Сентябрь 2026", "categories": []}
 
     monkeypatch.setattr(dashboard, "get_dashboard", fake)
@@ -137,7 +137,7 @@ def test_dashboard_endpoint_auth_and_payload(monkeypatch):
             r = await client.get("/api/dashboard?refresh=1", headers={h: make_init_data(user_id=111)})
             body = await r.json()
             assert r.status == 200 and body["month_label"] == "Сентябрь 2026"
-            assert seen == {"force": True, "months": 1, "person": None}
+            assert seen == {"force": True, "months": 1, "person": None, "category": None, "query": None}
             assert body["viewer"] == "Влад" and body["other"] == "Диана"
             # «я» — тот, кто смотрит; «other» — второй член семьи
             await client.get("/api/dashboard?who=me&period=6", headers={h: make_init_data(user_id=222)})
@@ -157,7 +157,7 @@ def test_dashboard_endpoint_failure_is_503_not_crash(monkeypatch):
     monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", TOKEN)
     monkeypatch.setattr(config, "VLAD_TELEGRAM_ID", "111")
 
-    def boom(force=False, months=1, person=None):
+    def boom(force=False, months=1, person=None, category=None, query=None):
         raise RuntimeError("sheets down")
 
     monkeypatch.setattr(dashboard, "get_dashboard", boom)

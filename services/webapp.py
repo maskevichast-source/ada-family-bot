@@ -117,12 +117,32 @@ async def handle_dashboard(request: web.Request) -> web.Response:
     other = next((n for n in FAMILY if n != viewer), None)
     who = request.query.get("who", "family")
     person = {"me": viewer, "other": other}.get(who)   # family и всё прочее -> вся семья
+    category = request.query.get("cat", "").strip()[:80] or None
+    query = request.query.get("q", "").strip()[:60] or None
     try:
-        data = await asyncio.to_thread(get_dashboard, force, months, person)
+        data = await asyncio.to_thread(get_dashboard, force, months, person, category, query)
     except Exception as e:  # noqa: BLE001
         logger.error("Дашборд: ошибка расчёта: %s", e)
         return web.json_response({"error": "unavailable"}, status=503)
     data = dict(data, viewer=viewer, other=other)
+    return web.json_response(data, headers={"Cache-Control": "no-store"})
+
+
+async def handle_loans(request: web.Request) -> web.Response:
+    if not authorize_request(request):
+        return web.json_response({"error": "forbidden"}, status=403)
+    from services import dashboard
+    from services.loans_view import compute_loans
+
+    def build():
+        raw = dashboard.get_raw(request.query.get("refresh") == "1")
+        return compute_loans(raw["transactions"], raw["now"])
+
+    try:
+        data = await asyncio.to_thread(build)
+    except Exception as e:  # noqa: BLE001
+        logger.error("Кредиты: ошибка расчёта: %s", e)
+        return web.json_response({"error": "unavailable"}, status=503)
     return web.json_response(data, headers={"Cache-Control": "no-store"})
 
 
@@ -147,6 +167,7 @@ def build_app() -> web.Application:
     app.router.add_get("/api/me", handle_me)
     app.router.add_get("/api/dashboard", handle_dashboard)
     app.router.add_get("/api/lists", handle_lists)
+    app.router.add_get("/api/loans", handle_loans)
     return app
 
 

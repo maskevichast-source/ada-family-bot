@@ -6,6 +6,7 @@ Limits. Сырые данные за 2 года читаются ОДНИМ за
 кэшируются; переключение периода и человека считается уже в памяти.
 """
 import datetime
+import re
 import threading
 import time
 
@@ -25,6 +26,9 @@ MAX_EXPENSE_ROWS = 200            # сколько крупнейших трат
 FETCH_MONTHS_BACK = 23            # хватает для «год» и сравнения с предыдущим годом
 
 FAMILY = ("Влад", "Диана")
+
+MAX_MERCHANTS = 15
+MAX_QUERY_CHARS = 60
 
 _MONTHS_RU = [
     "Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
@@ -135,13 +139,46 @@ def _build_dynamics(months, now, sy, sm, py, pm, day_cur, day_prev, by_month) ->
     return {"kind": "monthly", "bars": bars}
 
 
+def _bank_label(t: dict) -> str:
+    """Откуда потрачено: наличные, иначе карта/источник, иначе банк."""
+    if str(t.get("resource") or "").strip().lower() == "наличные":
+        return "Наличные"
+    return str(t.get("source") or "").strip() or str(t.get("bank") or "").strip() or "Не указан"
+
+
+def _norm_key(text: str) -> str:
+    return " ".join(str(text or "").lower().split())
+
+
+def _matches(query: str, title: str, note: str, cat: str, subcat: str, amount: float) -> bool:
+    """Поиск: по тексту (название, заметка, категория) и по сумме («480» найдёт 480 000)."""
+    q = query.lower()
+    if any(q in field.lower() for field in (title, note, cat, subcat)):
+        return True
+    digits = re.sub(r"\D", "", q)
+    return bool(digits) and digits in str(int(round(amount)))
+
+
+def _share_rows(totals: dict, counts: dict, total: float, limit: int | None = None, names: dict | None = None) -> list[dict]:
+    rows = [{"name": (names or {}).get(k, k), "spent": round(v, 2), "count": counts.get(k, 0),
+             "share_pct": round(v / total * 100) if total > 0 else 0}
+            for k, v in totals.items()]
+    rows.sort(key=lambda r: r["spent"], reverse=True)
+    return rows[:limit] if limit else rows
+
+
 def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.datetime,
-                      months: int = 1, person: str | None = None) -> dict:
+                      months: int = 1, person: str | None = None,
+                      category: str | None = None, query: str | None = None) -> dict:
     """Чистая функция: ничего не читает из сети, удобна для тестов.
 
     months — сколько календарных месяцев включая текущий (1/3/6/12).
     person — имя (Влад/Диана) или None для всей семьи.
+    category — если задана, считаем только расходы этой категории (детализация).
+    query — поиск по списку трат (итоги периода от него не зависят).
     """
+    query = " ".join(str(query or "").split())[:MAX_QUERY_CHARS]
+    category = (category or "").strip() or None
     year, month = now.year, now.month
     sy, sm = add_months(year, month, -(months - 1))
     start = _month_start(sy, sm)
@@ -161,6 +198,13 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     day_cur: dict[int, float] = {}
     day_prev: dict[int, float] = {}
     by_month: dict[tuple[int, int], float] = {}
+    # разрезы текущего периода
+    by_bank: dict[str, float] = {}; bank_n: dict[str, int] = {}
+    by_merchant: dict[str, float] = {}; merchant_n: dict[str, int] = {}; merchant_names: dict[str, dict] = {}
+    by_subcat: dict[str, float] = {}; subcat_n: dict[str, int] = {}
+    people_exp = {n: 0.0 for n in FAMILY}; people_inc = {n: 0.0 for n in FAMILY}
+    people_cat: dict[str, dict[str, float]] = {n: {} for n in FAMILY}
+    matched_count = 0; matched_sum = 0.0
 
     for t in transactions:
         if person and _user_of(t) != person:
@@ -170,25 +214,50 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
             continue
         amount = parse_amount(t.get("amt", 0))
         income = is_income_type(t.get("type"))
+        cat = str(t.get("cat") or "").strip() or "Без категории"
+        if category and (income or cat != category):
+            continue          # детализация категории: только расходы этой категории
         if months == 1 and not income and prev_start <= dt < start:
             day_prev[dt.day] = day_prev.get(dt.day, 0.0) + amount   # весь прошлый месяц, для пунктира
         if start <= dt < end:
             cur_count += 1
+            user_name = _user_of(t)
             if income:
                 cur_income += amount
+                if user_name in people_inc:
+                    people_inc[user_name] += amount
             else:
                 cur_expense += amount
                 by_month[(dt.year, dt.month)] = by_month.get((dt.year, dt.month), 0.0) + amount
                 if months == 1:
                     day_cur[dt.day] = day_cur.get(dt.day, 0.0) + amount
-                cat = str(t.get("cat") or "").strip() or "Без категории"
                 by_cat[cat] = by_cat.get(cat, 0.0) + amount
                 title, note = _title_and_note(t)
+                sub = str(t.get("subcat") or "").strip()
+                bank = _bank_label(t)
+                by_bank[bank] = by_bank.get(bank, 0.0) + amount
+                bank_n[bank] = bank_n.get(bank, 0) + 1
+                by_subcat[sub or "Без подкатегории"] = by_subcat.get(sub or "Без подкатегории", 0.0) + amount
+                subcat_n[sub or "Без подкатегории"] = subcat_n.get(sub or "Без подкатегории", 0) + 1
+                mkey = _norm_key(t.get("merchant"))
+                if mkey:
+                    by_merchant[mkey] = by_merchant.get(mkey, 0.0) + amount
+                    merchant_n[mkey] = merchant_n.get(mkey, 0) + 1
+                    spell = merchant_names.setdefault(mkey, {})
+                    original = str(t.get("merchant")).strip()
+                    spell[original] = spell.get(original, 0) + 1
+                if user_name in people_exp:
+                    people_exp[user_name] += amount
+                    people_cat[user_name][cat] = people_cat[user_name].get(cat, 0.0) + amount
+                if query and not _matches(query, title, note, cat, sub, amount):
+                    continue
+                matched_count += 1
+                matched_sum += amount
                 expenses.append({
                     "date": dt.strftime("%d.%m.%Y"),
                     "amount": round(amount, 2),
                     "category": cat,
-                    "subcat": str(t.get("subcat") or "").strip(),
+                    "subcat": sub,
                     "text": title,
                     "note": note,
                     "user": _user_of(t),
@@ -221,6 +290,28 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
 
     dynamics = _build_dynamics(months, now, sy, sm, py, pm, day_cur, day_prev, by_month)
 
+    merchant_display = {k: max(v, key=v.get) for k, v in merchant_names.items()}
+    banks = _share_rows(by_bank, bank_n, cur_expense)
+    merchants = _share_rows(by_merchant, merchant_n, cur_expense, MAX_MERCHANTS, merchant_display)
+    subcats = _share_rows(by_subcat, subcat_n, cur_expense) if category else []
+    people = []
+    if not person:
+        for name in FAMILY:
+            top_cats = sorted(people_cat[name].items(), key=lambda kv: kv[1], reverse=True)[:3]
+            people.append({
+                "name": name,
+                "expense": round(people_exp[name], 2),
+                "income": round(people_inc[name], 2),
+                "share_pct": round(people_exp[name] / cur_expense * 100) if cur_expense > 0 else 0,
+                "top": [{"category": c, "spent": round(v, 2)} for c, v in top_cats],
+            })
+    category_limit = None
+    if category and not person:
+        lim = float(limits.get(category) or 0) * months or None
+        spent = by_cat.get(category, 0.0)
+        category_limit = {"limit": lim, "pct": round(spent / lim * 100) if lim else None,
+                          "status": limit_status(spent, lim)} if lim else None
+
     if months == 1:
         prev_label = _MONTHS_RU[pm - 1]
         prev_phrase = f"в {_MONTHS_PREP[pm - 1]}"
@@ -251,6 +342,13 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
         "dynamics": dynamics,
         "expenses": top,
         "expenses_total": len(expenses),
+        "banks": banks,
+        "merchants": merchants,
+        "subcats": subcats,
+        "people": people,
+        "category": category,
+        "category_limit": category_limit,
+        "search": {"q": query, "count": matched_count, "sum": round(matched_sum, 2)} if query else None,
     }
 
 
@@ -299,12 +397,23 @@ def _get_raw(force: bool, loader, clock) -> dict:
 
 
 def get_dashboard(force: bool = False, months: int = 1, person: str | None = None,
+                  category: str | None = None, query: str | None = None,
                   loader=load_raw, clock=time.monotonic) -> dict:
     """Дашборд с кэшем сырых данных на 1–2 минуты (лимиты Google Sheets)."""
     if months not in ALLOWED_PERIODS:
         months = 1
     raw = _get_raw(force, loader, clock)
-    return compute_dashboard(raw["transactions"], raw["limits"], raw["now"], months, person)
+    data = compute_dashboard(raw["transactions"], raw["limits"], raw["now"], months, person, category, query)
+    if not category:
+        # «Внимание» всегда про текущий месяц и всю семью, независимо от выбранного вида
+        from services.dashboard_alerts import compute_alerts
+        data["alerts"] = compute_alerts(raw["transactions"], raw["limits"], raw["now"])
+    return data
+
+
+def get_raw(force: bool = False, loader=load_raw, clock=time.monotonic) -> dict:
+    """Сырые данные (кэшированные) для других разделов мини-аппа."""
+    return _get_raw(force, loader, clock)
 
 
 def reset_cache() -> None:
