@@ -1,25 +1,24 @@
 """Кредитная нагрузка для мини-аппа (только чтение).
 
-Платежи по кредитам и рассрочкам в таблице разложены по разным категориям
-(«Электроника», «Финансовые расходы»...), поэтому определяем их по словам в названии,
-подкатегории и комментарии. Это эвристика: мини-апп честно об этом пишет.
+Определение погашений — общее с /fix_loans (services/loan_rules.py): подкатегория
+«Кредиты и рассрочки» или слово «погашение» вместе со словом про кредит/рассрочку.
 """
 import datetime
 
 from services.categories import is_income_type
+from services.loan_rules import looks_like_repayment
 from services.money import parse_amount
 from services.timezone import parse_flexible_datetime
 
-LOAN_KEYWORDS = ("кредит", "рассрочк", "погашени", "kaspi red", "ozen")
 HISTORY_MONTHS = 3
 MAX_PAYEES = 12
 
 
 def is_loan_payment(t: dict) -> bool:
+    """Погашение кредита/рассрочки (правило общее с /fix_loans, см. loan_rules)."""
     if is_income_type(t.get("type")):
         return False
-    text = " ".join(str(t.get(k) or "") for k in ("merchant", "subcat", "comm")).lower()
-    return any(k in text for k in LOAN_KEYWORDS)
+    return looks_like_repayment(t.get("merchant"), t.get("comm"), t.get("subcat"), t.get("funds_type"))
 
 
 def _payee(t: dict) -> str:
@@ -75,5 +74,5 @@ def compute_loans(transactions: list[dict], now: datetime.datetime) -> dict:
             "share_pct": round(pay_total[(y, m)] / income[(y, m)] * 100) if income[(y, m)] > 0 else None,
         } for y, m in months],
         "payees": rows[:MAX_PAYEES],
-        "note": "Определено по словам «кредит», «рассрочка», «погашение», Kaspi Red, ozen в названии, подкатегории и комментарии.",
+        "note": "Считаются платежи банку с подкатегорией «Кредиты и рассрочки» и записи со словом «погашение» вместе с «кредит», «рассрочка» и т.п. Покупки через рассрочку не входят.",
     }

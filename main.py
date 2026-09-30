@@ -42,6 +42,7 @@ from services.limits_ai import (
 )
 from services import fx
 from services import backup as backup_module
+from services import loan_fix
 from services import sheets as sheets_module
 from services.timezone import now_astana
 from services.reminders import deliver_due
@@ -166,6 +167,7 @@ async def cmd_help(message: types.Message):
         "/limits_plan — показать, как Ада пересчитала бы лимиты (без записи)\n"
         "/limits_undo — вернуть лимиты, что были до последнего пересчёта\n"
         "/backup — сделать резервную копию таблицы сейчас\n"
+        "/fix_loans — привести погашения кредитов и рассрочек к «Кредиты и рассрочки»\n"
         "/debug — диагностика таблицы\n\n"
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
@@ -250,6 +252,37 @@ async def cmd_backup(message: types.Message):
     now = datetime.datetime.now(ASTANA_TZ)
     result = await asyncio.to_thread(backup_module.make_backup, now)
     await safe_answer(message, _backup_result_text(result))
+
+
+@dp.message(Command("fix_loans"))
+async def cmd_fix_loans(message: types.Message, command: CommandObject = None):
+    """/fix_loans — показать, /fix_loans да — применить, /fix_loans откат — вернуть."""
+    arg = ((command.args if command else "") or "").strip().lower()
+    try:
+        if arg in ("откат", "undo"):
+            text = await asyncio.to_thread(loan_fix.undo_last)
+        elif arg in ("да", "yes", "применить"):
+            changes = await asyncio.to_thread(loan_fix.find_changes)
+            if not changes:
+                text = loan_fix.preview_text([])
+            else:
+                note = " Откатить: /fix_loans откат."
+                if backup_module.backup_folder_id():
+                    result = await asyncio.to_thread(backup_module.make_backup, datetime.datetime.now(ASTANA_TZ))
+                    if not result.get("ok"):
+                        await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
+                                                   f"({result.get('reason')}). Ничего не изменено.")
+                        return
+                    note = " Резервная копия таблицы сделана." + note
+                done = await asyncio.to_thread(loan_fix.apply_changes, changes)
+                text = (f"Исправила {done} записей: теперь это «Финансовые расходы и переводы › Кредиты и рассрочки»."
+                        f"{note} Посмотреть, как изменятся лимиты: /limits_plan")
+        else:
+            text = loan_fix.preview_text(await asyncio.to_thread(loan_fix.find_changes))
+    except Exception as e:
+        print(f"[Кредиты] /fix_loans: {e}")
+        text = "Не получилось выполнить команду. Ничего не изменено."
+    await safe_answer(message, text)
 
 
 @dp.message(Command("chatid"))

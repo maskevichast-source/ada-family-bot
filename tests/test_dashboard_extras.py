@@ -12,9 +12,10 @@ NOW = datetime.datetime(2026, 9, 29, 12, 0, tzinfo=ASTANA_TZ)
 
 
 def t(date, amt, cat="Еда и продукты", user="Влад", merchant="", comm="", subcat="", typ="РАСХОД",
-      source="Kaspi Gold", resource="Карта", bank="Kaspi"):
+      source="Kaspi Gold", resource="Карта", bank="Kaspi", funds_type="Собственные"):
     return {"date": date, "amt": amt, "cat": cat, "user": user, "merchant": merchant, "comm": comm,
-            "subcat": subcat, "type": typ, "source": source, "resource": resource, "bank": bank}
+            "subcat": subcat, "type": typ, "source": source, "resource": resource, "bank": bank,
+            "funds_type": funds_type}
 
 
 DATA = [
@@ -144,7 +145,12 @@ LOANS = [
     t("2026-09-08 10:00:00", 151304, "Электроника и техника", merchant="Погашение кредита Forte"),
     t("2026-09-11 10:00:00", 131347, "Финансовые расходы и переводы", merchant="По номеру телефона",
       comm="Погашение кредитной задолженности по карте ozen"),
-    t("2026-09-25 10:00:00", 34450, "Финансовые расходы и переводы", merchant="Kaspi Red"),
+    t("2026-09-25 10:00:00", 34450, "Финансовые расходы и переводы", merchant="Kaspi Red", subcat="Кредиты и рассрочки"),
+    t("2026-09-26 10:00:00", 4981, "Еда и продукты", merchant="7DAN", comm="Сладкое, оплата картой ozen",
+      funds_type="Рассрочка"),                                   # покупка через рассрочку — не погашение
+    t("2026-09-27 10:00:00", 7000, "Еда и продукты", merchant="Kaspi Red", comm="Погашение кредита за покупку",
+      funds_type="Рассрочка"),                                   # даже со словом «погашение»: это покупка через рассрочку
+    t("2026-09-28 10:00:00", 15000, "Подарки, праздники и благотворительность", comm="Погашение долга Саше"),  # личный долг
     t("2026-08-08 10:00:00", 151304, "Электроника и техника", merchant="Погашение кредита Forte"),
     t("2026-09-05 10:00:00", 1119018, "Зарплата", typ="ДОХОД"),
     t("2026-09-06 10:00:00", 90000, "Еда и продукты", merchant="Magnum"),            # не кредит
@@ -162,7 +168,7 @@ def test_loans_detects_payments_groups_payees_and_share_of_income():
     forte = next(p for p in d["payees"] if p["name"] == "Погашение кредита Forte")
     assert forte["amount"] == 151304 and forte["months_seen"] == 2
     assert d["payees"][0]["name"] == "Погашение кредита Forte"                      # по убыванию
-    assert "эвристика" not in d["note"] and "кредит" in d["note"]
+    assert "Покупки через рассрочку не входят" in d["note"]
 
 
 def test_loans_share_is_none_without_income_and_no_false_positives():
