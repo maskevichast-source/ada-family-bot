@@ -90,6 +90,17 @@
   .item .sub.over { color: var(--over); } .item .sub.warn { color: var(--warn); }
   .item a.link { display: inline-block; margin-top: 8px; font-size: 13px; color: var(--accent); text-decoration: none; }
   .good { color: var(--ok); } .bad { color: var(--over); }
+  .cat.click { cursor: pointer; } .cat.click:active { opacity: .7; }
+  button.back { background: transparent; color: var(--accent); text-align: left; padding: 4px 0; margin: 0 0 6px; width: auto; }
+  .alerts { background: var(--card); border-radius: 14px; padding: 10px 12px 6px; margin: 12px 0 4px; }
+  .alerts h3 { font-size: 14px; margin: 0 0 4px; }
+  .alert { display: flex; gap: 8px; padding: 7px 0; font-size: 13px; line-height: 1.35; cursor: pointer; }
+  .alert + .alert { border-top: 1px solid rgba(127,127,127,.18); }
+  input.search {
+    width: 100%; padding: 10px 12px; margin: 0 0 6px; border: 0; border-radius: 10px; font-size: 15px;
+    background: var(--card); color: var(--text); outline: none;
+  }
+  .sub-line { font-size: 12px; color: var(--hint); margin-top: 6px; }
   .note { font-size: 12px; color: var(--hint); margin-top: 8px; text-align: center; }
   button {
     margin-top: 14px; width: 100%; padding: 12px; border: 0; border-radius: 12px;
@@ -163,10 +174,10 @@
     return el("div", "cmp", text);
   }
 
-  function category(c, family) {
-    var box = el("div", "cat");
+  function category(c, family, onOpen) {
+    var box = el("div", "cat" + (onOpen ? " click" : ""));
     var row = el("div", "row");
-    row.appendChild(el("span", "name", c.name));
+    row.appendChild(el("span", "name", c.name + (onOpen ? " ›" : "")));
     row.appendChild(el("span", "amt", money(c.spent)));
     box.appendChild(row);
     var bar = el("div", "bar " + c.status);
@@ -185,41 +196,79 @@
       meta.appendChild(el("span", "", family ? "без лимита" : ""));
     }
     box.appendChild(meta);
+    if (onOpen) box.addEventListener("click", function () { onOpen(c.name); });
     return box;
   }
 
   var PAGE = 30;
+  var expensesUI = null;
+  function opWord(n) {
+    var m10 = n % 10, m100 = n % 100;
+    if (m10 === 1 && m100 !== 11) return "операция";
+    return (m10 >= 2 && m10 <= 4 && !(m100 >= 12 && m100 <= 14)) ? "операции" : "операций";
+  }
+
   function expensesBlock(d) {
     var wrap = el("div");
     wrap.appendChild(el("h2", "", "Траты по убыванию"));
-    if (!d.expenses.length) { wrap.appendChild(el("div", "msg", "Расходов за этот период нет.")); return wrap; }
+    var input = el("input", "search");
+    input.type = "search";
+    input.placeholder = "Найти трату: магазин, слово, сумма";
+    input.value = state.q || "";
+    input.setAttribute("enterkeyhint", "search");
+    wrap.appendChild(input);
+    var summary = el("div", "sub-line");
+    wrap.appendChild(summary);
     var list = el("div");
     wrap.appendChild(list);
-    var shown = 0;
     var more = el("button", "more", "");
-    function showMore() {
-      d.expenses.slice(shown, shown + PAGE).forEach(function (e) {
+    wrap.appendChild(more);
+    var note = el("div", "note");
+    wrap.appendChild(note);
+    var data = d, shown = 0;
+
+    function addRows() {
+      data.expenses.slice(shown, shown + PAGE).forEach(function (e) {
         var row = el("div", "exp" + (e.note ? " has-note" : ""));
         var l = el("div", "l");
         l.appendChild(el("div", "t", e.text || e.subcat || e.category));
         if (e.note) l.appendChild(el("div", "n", e.note));
         var sub = e.date + " · " + e.category + (e.subcat && e.subcat !== e.text ? " › " + e.subcat : "") +
-          (d.who === "family" ? " · " + e.user : "");
+          (data.who === "family" ? " · " + e.user : "");
         l.appendChild(el("div", "s", sub));
         row.appendChild(l);
         if (e.note) row.addEventListener("click", function () { row.classList.toggle("open"); });
         row.appendChild(el("div", "a", money(e.amount)));
         list.appendChild(row);
       });
-      shown = Math.min(d.expenses.length, shown + PAGE);
-      if (shown >= d.expenses.length) more.remove();
-      else more.textContent = "Показать ещё (" + (d.expenses.length - shown) + ")";
+      shown = Math.min(data.expenses.length, shown + PAGE);
+      more.style.display = shown >= data.expenses.length ? "none" : "";
+      more.textContent = "Показать ещё (" + (data.expenses.length - shown) + ")";
     }
-    more.addEventListener("click", showMore);
-    showMore();
-    if (shown < d.expenses.length) wrap.appendChild(more);
-    if (d.expenses_total > d.expenses.length)
-      wrap.appendChild(el("div", "note", "Показаны " + d.expenses.length + " крупнейших из " + d.expenses_total + "."));
+    function fill(nd) {
+      data = nd; shown = 0;
+      list.replaceChildren();
+      if (data.search) summary.textContent = data.search.count
+        ? "Найдено: " + data.search.count + " " + opWord(data.search.count) + " на " + money(data.search.sum)
+        : "Ничего не найдено.";
+      else summary.textContent = "";
+      if (!data.expenses.length) {
+        if (!data.search) list.appendChild(el("div", "msg", "Расходов за этот период нет."));
+        more.style.display = "none"; note.textContent = "";
+        return;
+      }
+      addRows();
+      note.textContent = data.expenses_total > data.expenses.length
+        ? "Показаны " + data.expenses.length + " крупнейших из " + data.expenses_total + "." : "";
+    }
+    more.addEventListener("click", addRows);
+    var timer = null;
+    input.addEventListener("input", function () {
+      clearTimeout(timer);
+      timer = setTimeout(function () { state.q = input.value.trim(); searchLoad(); }, 350);
+    });
+    expensesUI = { fill: fill };
+    fill(d);
     return wrap;
   }
 
@@ -312,7 +361,143 @@
     return wrap;
   }
 
+  function openCategory(name) { state.cat = name; state.q = ""; message("Загружаю…"); load(false); }
+  function closeCategory() { state.cat = null; state.q = ""; message("Загружаю…"); load(false); }
+  function syncBack() {
+    if (!tg || !tg.BackButton) return;
+    if (state.cat && state.tab === "overview") tg.BackButton.show(); else tg.BackButton.hide();
+  }
+
+  function alertLine(a) {
+    var line = el("div", "alert");
+    var icon, text;
+    if (a.type === "limit") {
+      icon = a.status === "over" ? "🔴" : "🟡";
+      text = a.status === "over"
+        ? "перерасход " + money(a.spent - a.limit) + " (лимит " + money(a.limit) + ")"
+        : a.pct + "% лимита: " + money(a.spent) + " из " + money(a.limit);
+    } else if (a.type === "big") {
+      icon = "💸";
+      text = (a.text ? a.text + " — " : "") + money(a.amount) + " · " + a.date + " (" + a.user +
+        "). Раньше максимум был " + money(a.prev_max);
+    } else {
+      icon = "📈";
+      text = money(a.spent) + " — в " + String(a.ratio).replace(".", ",") + " раза выше обычного темпа (" + money(a.usual) + ")";
+    }
+    line.appendChild(el("span", "", icon));
+    var body = el("div");
+    body.appendChild(el("b", "", a.category));
+    body.appendChild(document.createTextNode(": " + text));
+    line.appendChild(body);
+    line.addEventListener("click", function () { openCategory(a.category); });
+    return line;
+  }
+  function alertsBlock(d) {
+    if (!d.alerts || !d.alerts.length) return null;
+    var box = el("div", "alerts");
+    box.appendChild(el("h3", "", "Внимание · текущий месяц, вся семья"));
+    d.alerts.forEach(function (a) { box.appendChild(alertLine(a)); });
+    return box;
+  }
+
+  function shareRow(name, spent, share, left, right) {
+    var box = el("div", "cat");
+    var row = el("div", "row");
+    row.appendChild(el("span", "name", name));
+    row.appendChild(el("span", "amt", money(spent)));
+    box.appendChild(row);
+    var bar = el("div", "bar none");
+    var fill = el("i"); fill.style.width = Math.max(2, share) + "%";
+    bar.appendChild(fill); box.appendChild(bar);
+    var meta = el("div", "meta");
+    meta.appendChild(el("span", "", left)); meta.appendChild(el("span", "", right || ""));
+    box.appendChild(meta);
+    return box;
+  }
+
+  function peopleBlock(d) {
+    if (!d.people || !d.people.length || d.expense <= 0) return null;
+    var wrap = el("div");
+    wrap.appendChild(el("h2", "", "Кто сколько потратил"));
+    d.people.forEach(function (p) {
+      var box = shareRow(p.name, p.expense, p.share_pct, p.share_pct + "% всех трат",
+        p.income > 0 ? "доход " + money(p.income) : "");
+      if (p.top.length) box.appendChild(el("div", "sub-line",
+        "Чаще всего: " + p.top.map(function (t) { return t.category + " " + money(t.spent); }).join(", ")));
+      wrap.appendChild(box);
+    });
+    return wrap;
+  }
+
+  function breakdownBlock(d, family) {
+    var wrap = el("div");
+    wrap.appendChild(el("h2", "", "Разрез трат"));
+    var seg = el("div", "seg");
+    var box = el("div");
+    var views = [["categories", "Категории"], ["banks", "Банки и карты"], ["merchants", "Магазины"]];
+    function paint() {
+      seg.querySelectorAll("button").forEach(function (b) { b.classList.toggle("on", b.dataset.v === state.view); });
+      var f = document.createDocumentFragment();
+      if (state.view === "banks") {
+        d.banks.forEach(function (b) { f.appendChild(shareRow(b.name, b.spent, b.share_pct, b.count + " " + opWord(b.count), b.share_pct + "%")); });
+        if (!d.banks.length) f.appendChild(el("div", "msg", "Расходов за этот период нет."));
+      } else if (state.view === "merchants") {
+        d.merchants.forEach(function (m) { f.appendChild(shareRow(m.name, m.spent, m.share_pct, m.count + " " + opWord(m.count), m.share_pct + "%")); });
+        if (!d.merchants.length) f.appendChild(el("div", "msg", "В записях за этот период нет названий магазинов."));
+      } else {
+        if (!d.categories.length) f.appendChild(el("div", "msg", "Пока нет расходов за этот период."));
+        d.categories.forEach(function (c) { f.appendChild(category(c, family, openCategory)); });
+      }
+      box.replaceChildren(f);
+    }
+    views.forEach(function (v) {
+      var b = el("button", "", v[1]); b.dataset.v = v[0];
+      b.addEventListener("click", function () { state.view = v[0]; paint(); });
+      seg.appendChild(b);
+    });
+    wrap.appendChild(seg); wrap.appendChild(box);
+    paint();
+    return wrap;
+  }
+
+  function subcatsBlock(d) {
+    var wrap = el("div");
+    wrap.appendChild(el("h2", "", "Подкатегории"));
+    if (!d.subcats.length) { wrap.appendChild(el("div", "msg", "Расходов в этой категории за период нет.")); return wrap; }
+    d.subcats.forEach(function (s) {
+      wrap.appendChild(shareRow(s.name, s.spent, s.share_pct, s.count + " " + opWord(s.count), s.share_pct + "%"));
+    });
+    return wrap;
+  }
+
+  function renderDetail(d) {
+    document.getElementById("title").textContent = d.category;
+    document.getElementById("updated").textContent = "обновлено " + d.updated_at;
+    var frag = document.createDocumentFragment();
+    var back = el("button", "back", "‹ Все категории");
+    back.addEventListener("click", closeCategory);
+    frag.appendChild(back);
+    frag.appendChild(el("div", "cmp", d.month_label + (d.who === "family" ? " · вся семья" : " · " + d.who)));
+    var cards = el("div", "cards");
+    cards.appendChild(card("Расход в категории", money(d.expense), { wide: true }));
+    frag.appendChild(cards);
+    if (d.category_limit) frag.appendChild(category({
+      name: "Лимит категории", spent: d.expense, limit: d.category_limit.limit,
+      limit_pct: d.category_limit.pct, status: d.category_limit.status, share_pct: 0 }, true));
+    var cmp = comparison(d);
+    if (cmp) frag.appendChild(cmp);
+    frag.appendChild(chartsBlock(d));
+    frag.appendChild(subcatsBlock(d));
+    frag.appendChild(expensesBlock(d));
+    var btn = el("button", "", "Обновить");
+    btn.addEventListener("click", function () { load(true, btn); });
+    frag.appendChild(btn);
+    root.replaceChildren(frag);
+  }
+
   function render(d) {
+    syncBack();
+    if (d.category) return renderDetail(d);
     document.getElementById("title").textContent = d.month_label;
     document.getElementById("updated").textContent = "обновлено " + d.updated_at;
     var otherBtn = document.querySelector('#who button[data-v="other"]');
@@ -326,10 +511,12 @@
     frag.appendChild(cards);
     var cmp = comparison(d);
     if (cmp) frag.appendChild(cmp);
+    var alerts = alertsBlock(d);
+    if (alerts) frag.appendChild(alerts);
+    var people = peopleBlock(d);
+    if (people) frag.appendChild(people);
     frag.appendChild(chartsBlock(d));
-    frag.appendChild(el("h2", "", "Категории"));
-    if (!d.categories.length) frag.appendChild(el("div", "msg", "Пока нет расходов за этот период."));
-    d.categories.forEach(function (c) { frag.appendChild(category(c, family)); });
+    frag.appendChild(breakdownBlock(d, family));
     frag.appendChild(expensesBlock(d));
     var btn = el("button", "", "Обновить");
     btn.addEventListener("click", function () { load(true, btn); });
@@ -337,15 +524,20 @@
     root.replaceChildren(frag);
   }
 
-  var state = { who: "family", period: "1", tab: "overview" };
-  var seq = 0;
+  var state = { who: "family", period: "1", tab: "overview", cat: null, q: "", view: "categories" };
+  var seq = 0, qseq = 0;
+
+  function buildQuery(force) {
+    return "?period=" + state.period + "&who=" + state.who +
+      (state.cat ? "&cat=" + encodeURIComponent(state.cat) : "") +
+      (state.q ? "&q=" + encodeURIComponent(state.q) : "") + (force ? "&refresh=1" : "");
+  }
 
   async function load(force, btn) {
     var my = ++seq;
     if (btn) btn.disabled = true;
-    var q = "?period=" + state.period + "&who=" + state.who + (force ? "&refresh=1" : "");
     try {
-      var r = await fetch("/api/dashboard" + q, { headers: { "X-Telegram-Init-Data": tg.initData } });
+      var r = await fetch("/api/dashboard" + buildQuery(force), { headers: { "X-Telegram-Init-Data": tg.initData } });
       if (my !== seq) return;              // пришёл устаревший ответ — пользователь уже переключил
       if (r.status === 403) return message("Доступ закрыт.");
       if (!r.ok) return message("Не удалось загрузить данные. Попробуй чуть позже.");
@@ -355,6 +547,18 @@
     } catch (e) {
       if (my === seq) message("Не удалось связаться с сервером.");
     }
+  }
+
+  // Поиск обновляет только список трат: поле ввода не пересоздаётся, клавиатура не закрывается.
+  async function searchLoad() {
+    var my = ++qseq;
+    try {
+      var r = await fetch("/api/dashboard" + buildQuery(false), { headers: { "X-Telegram-Init-Data": tg.initData } });
+      if (my !== qseq || !r.ok) return;
+      var nd = await r.json();
+      if (my !== qseq || !expensesUI) return;
+      expensesUI.fill(nd);
+    } catch (e) { /* оставляем прежний список */ }
   }
 
   // ---------- вкладки со списками ----------
@@ -465,14 +669,58 @@
     return f;
   }
 
+  function renderLoans(d) {
+    var f = document.createDocumentFragment();
+    f.appendChild(el("h2", "", "Кредитная нагрузка"));
+    var cur = d.months[d.months.length - 1];
+    if (!d.months.some(function (m) { return m.total > 0; })) {
+      f.appendChild(el("div", "msg", "Платежей по кредитам и рассрочкам за 3 месяца не нашла."));
+      f.appendChild(el("div", "note", d.note));
+      return f;
+    }
+    var cards = el("div", "cards");
+    cards.appendChild(card("Платежи в этом месяце", money(cur.total)));
+    cards.appendChild(card("От дохода месяца", cur.share_pct === null ? "—" : cur.share_pct + "%"));
+    f.appendChild(cards);
+    d.months.slice().reverse().forEach(function (m) {
+      f.appendChild(itemRow(m.label, money(m.total),
+        [{ text: m.count + " " + (m.count === 1 ? "платёж" : "платежей") + (m.share_pct !== null ? " · " + m.share_pct + "% дохода" : "") }]));
+    });
+    if (d.payees.length) {
+      f.appendChild(el("h2", "", "Кому платим"));
+      d.payees.forEach(function (p) {
+        f.appendChild(itemRow(p.name, p.amount > 0 ? money(p.amount) : "—",
+          [{ text: (p.amount > 0 ? "в этом месяце · " : "в этом месяце не платили · ") + "в среднем " + money(p.avg) + " · платежи в " + p.months_seen + " из 3 мес." }]));
+      });
+    }
+    f.appendChild(el("div", "note", d.note));
+    return f;
+  }
+
+  var loansCache = null;
+  async function fillLoans(box, force) {
+    if (loansCache && !force) { box.replaceChildren(renderLoans(loansCache)); return; }
+    try {
+      var r = await fetch("/api/loans" + (force ? "?refresh=1" : ""), { headers: { "X-Telegram-Init-Data": tg.initData } });
+      if (!r.ok) return;
+      loansCache = await r.json();
+      box.replaceChildren(renderLoans(loansCache));
+    } catch (e) { /* раздел кредитов необязателен: список долгов покажется и без него */ }
+  }
+
   var listsCache = null;
-  function renderList(tab, data) {
+  function renderList(tab, data, force) {
     document.getElementById("title").textContent = TAB_TITLES[tab];
     document.getElementById("updated").textContent = "обновлено " + data.updated_at;
     var frag = document.createDocumentFragment();
     var sec = data[tab];
     var body = { debts: renderDebts, goals: renderGoals, subscriptions: renderSubs, prices: renderPrices }[tab](sec);
     frag.appendChild(body);
+    if (tab === "debts") {
+      var loansBox = el("div");
+      frag.appendChild(loansBox);
+      fillLoans(loansBox, !!force);
+    }
     var btn = el("button", "", "Обновить");
     btn.addEventListener("click", function () { loadLists(true, btn); });
     frag.appendChild(btn);
@@ -490,7 +738,7 @@
       if (!r.ok) return message("Не удалось загрузить данные. Попробуй чуть позже.");
       listsCache = await r.json();
       if (my !== seq) return;
-      renderList(state.tab, listsCache);
+      renderList(state.tab, listsCache, force);
     } catch (e) {
       if (my === seq) message("Не удалось связаться с сервером.");
     }
@@ -500,6 +748,7 @@
     var b = ev.target.closest("button");
     if (!b || b.dataset.t === state.tab) return;
     state.tab = b.dataset.t;
+    syncBack();
     this.querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
     document.getElementById("controls").style.display = state.tab === "overview" ? "" : "none";
     message("Загружаю…");
@@ -525,6 +774,7 @@
   }
   tg.ready();
   tg.expand();
+  if (tg.BackButton) tg.BackButton.onClick(function () { if (state.cat && state.tab === "overview") closeCategory(); });
   load(false);
 })();
 </script>
