@@ -105,22 +105,33 @@ async def handle_dashboard(request: web.Request) -> web.Response:
     viewer = authorize_request(request)
     if not viewer:
         return web.json_response({"error": "forbidden"}, status=403)
-    from services.dashboard import ALLOWED_PERIODS, FAMILY, get_dashboard
+    from services.dashboard import ALLOWED_DAYS, ALLOWED_PERIODS, FAMILY, get_dashboard
 
     force = request.query.get("refresh") == "1"
-    try:
-        months = int(request.query.get("period", "1"))
-    except ValueError:
-        months = 1
-    if months not in ALLOWED_PERIODS:
-        months = 1
+    period = request.query.get("period", "1").strip().lower()
+    days = None
+    months = 1
+    if period.endswith("d"):                         # «7d» — последние 7 календарных дней
+        try:
+            days = int(period[:-1])
+        except ValueError:
+            days = None
+        if days not in ALLOWED_DAYS:
+            days = None
+    else:
+        try:
+            months = int(period)
+        except ValueError:
+            months = 1
+        if months not in ALLOWED_PERIODS:
+            months = 1
     other = next((n for n in FAMILY if n != viewer), None)
     who = request.query.get("who", "family")
     person = {"me": viewer, "other": other}.get(who)   # family и всё прочее -> вся семья
     category = request.query.get("cat", "").strip()[:80] or None
     query = request.query.get("q", "").strip()[:60] or None
     try:
-        data = await asyncio.to_thread(get_dashboard, force, months, person, category, query)
+        data = await asyncio.to_thread(get_dashboard, force, months, person, category, query, days)
     except Exception as e:  # noqa: BLE001
         logger.error("Дашборд: ошибка расчёта: %s", e)
         return web.json_response({"error": "unavailable"}, status=503)

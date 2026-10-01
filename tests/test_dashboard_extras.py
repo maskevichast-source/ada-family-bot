@@ -185,7 +185,7 @@ def test_endpoints_pass_category_query_and_serve_loans(monkeypatch):
     monkeypatch.setattr(config, "VLAD_TELEGRAM_ID", "111")
     seen = {}
 
-    def fake(force=False, months=1, person=None, category=None, query=None):
+    def fake(force=False, months=1, person=None, category=None, query=None, days=None):
         seen.update(category=category, query=query)
         return {"month_label": "x"}
 

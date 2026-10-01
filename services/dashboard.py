@@ -22,6 +22,7 @@ EMPTY_CACHE_TTL_SECONDS = 15   # пустой результат мог быть
 MIN_REFRESH_INTERVAL_SECONDS = 15
 
 ALLOWED_PERIODS = (1, 3, 6, 12)   # месяцев, включая текущий
+ALLOWED_DAYS = (7,)               # скользящие окна в календарных днях: сегодня и предыдущие
 MAX_EXPENSE_ROWS = 200            # сколько крупнейших трат отдаём в страницу
 FETCH_MONTHS_BACK = 23            # хватает для «год» и сравнения с предыдущим годом
 
@@ -170,7 +171,8 @@ def _share_rows(totals: dict, counts: dict, total: float, limit: int | None = No
 
 def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.datetime,
                       months: int = 1, person: str | None = None,
-                      category: str | None = None, query: str | None = None) -> dict:
+                      category: str | None = None, query: str | None = None,
+                      days: int | None = None) -> dict:
     """Чистая функция: ничего не читает из сети, удобна для тестов.
 
     months — сколько календарных месяцев включая текущий (1/3/6/12).
@@ -190,6 +192,16 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     # Сравниваем с тем же «отрезком» прошлого периода, а не с его итогом —
     # иначе в начале периода всё выглядело бы заниженным.
     prev_cutoff = min(prev_start + (end - start), start)
+
+    # Скользящее окно «последние N календарных дней» (кнопка «7 дн.»): сегодня и N-1 предыдущих;
+    # сравнение — с предыдущими N днями целиком. Месячные лимиты в этом режиме не показываем.
+    days = days if days in ALLOWED_DAYS else None
+    today0 = datetime.datetime(now.year, now.month, now.day, tzinfo=ASTANA_TZ)
+    if days:
+        months = 1
+        start = today0 - datetime.timedelta(days=days - 1)
+        prev_start = start - datetime.timedelta(days=days)
+        prev_cutoff = start
 
     cur_income = cur_expense = prev_income = prev_expense = 0.0
     by_cat: dict[str, float] = {}
@@ -230,7 +242,7 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
                 week_days[dt.date()] = week_days.get(dt.date(), 0.0) + amount
             elif week_prev_start <= dt < week_start:
                 week_prev_total += amount
-        if months == 1 and not income and prev_start <= dt < start:
+        if months == 1 and not days and not income and prev_start <= dt < start:
             day_prev[dt.day] = day_prev.get(dt.day, 0.0) + amount   # весь прошлый месяц, для пунктира
         if start <= dt < end:
             cur_count += 1
@@ -286,7 +298,7 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     # месяцев, а для отдельного человека не показываем (лимит не на него).
     categories = []
     for name, spent in by_cat.items():
-        limit = float(limits.get(name) or 0) * months if not person else 0
+        limit = float(limits.get(name) or 0) * months if not (person or days) else 0
         limit = limit or None
         categories.append({
             "name": name,
@@ -326,14 +338,19 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     week_total = round(sum(d["value"] for d in week_list), 2)
     week = {"days": week_list, "total": week_total, "avg": round(week_total / 7, 2),
             "prev_total": round(week_prev_total, 2), "delta_pct": _delta_pct(week_total, week_prev_total)}
+    if days:
+        dynamics = {"kind": "days", "bars": week_list}
     category_limit = None
-    if category and not person:
+    if category and not (person or days):
         lim = float(limits.get(category) or 0) * months or None
         spent = by_cat.get(category, 0.0)
         category_limit = {"limit": lim, "pct": round(spent / lim * 100) if lim else None,
                           "status": limit_status(spent, lim)} if lim else None
 
-    if months == 1:
+    if days:
+        prev_label = f"предыдущие {days} дней"
+        prev_phrase = f"в предыдущие {days} дней"
+    elif months == 1:
         prev_label = _MONTHS_RU[pm - 1]
         prev_phrase = f"в {_MONTHS_PREP[pm - 1]}"
     else:
@@ -343,7 +360,9 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     return {
         "period": months,
         "who": person or "family",
-        "month_label": _period_label(year, month, months),
+        "month_label": (f"{days} дней · {start.strftime('%d.%m')} – {today0.strftime('%d.%m')}"
+                        if days else _period_label(year, month, months)),
+        "period_days": days,
         "day": now.day,
         "days_in_month": _days_in_month(year, month),
         "updated_at": now.strftime("%H:%M"),
@@ -419,13 +438,13 @@ def _get_raw(force: bool, loader, clock) -> dict:
 
 
 def get_dashboard(force: bool = False, months: int = 1, person: str | None = None,
-                  category: str | None = None, query: str | None = None,
+                  category: str | None = None, query: str | None = None, days: int | None = None,
                   loader=load_raw, clock=time.monotonic) -> dict:
     """Дашборд с кэшем сырых данных на 1–2 минуты (лимиты Google Sheets)."""
     if months not in ALLOWED_PERIODS:
         months = 1
     raw = _get_raw(force, loader, clock)
-    data = compute_dashboard(raw["transactions"], raw["limits"], raw["now"], months, person, category, query)
+    data = compute_dashboard(raw["transactions"], raw["limits"], raw["now"], months, person, category, query, days)
     if not category:
         # «Внимание» всегда про текущий месяц и всю семью, независимо от выбранного вида
         from services.dashboard_alerts import compute_alerts

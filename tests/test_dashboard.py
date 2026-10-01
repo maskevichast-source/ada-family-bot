@@ -120,8 +120,8 @@ def test_dashboard_endpoint_auth_and_payload(monkeypatch):
     monkeypatch.setattr(config, "DIANA_TELEGRAM_ID", "222")
     seen = {}
 
-    def fake(force=False, months=1, person=None, category=None, query=None):
-        seen.update(force=force, months=months, person=person, category=category, query=query)
+    def fake(force=False, months=1, person=None, category=None, query=None, days=None):
+        seen.update(force=force, months=months, person=person, category=category, query=query, days=days)
         return {"month_label": "Сентябрь 2026", "categories": []}
 
     monkeypatch.setattr(dashboard, "get_dashboard", fake)
@@ -137,7 +137,7 @@ def test_dashboard_endpoint_auth_and_payload(monkeypatch):
             r = await client.get("/api/dashboard?refresh=1", headers={h: make_init_data(user_id=111)})
             body = await r.json()
             assert r.status == 200 and body["month_label"] == "Сентябрь 2026"
-            assert seen == {"force": True, "months": 1, "person": None, "category": None, "query": None}
+            assert seen == {"force": True, "months": 1, "person": None, "category": None, "query": None, "days": None}
             assert body["viewer"] == "Влад" and body["other"] == "Диана"
             # «я» — тот, кто смотрит; «other» — второй член семьи
             await client.get("/api/dashboard?who=me&period=6", headers={h: make_init_data(user_id=222)})
@@ -157,7 +157,7 @@ def test_dashboard_endpoint_failure_is_503_not_crash(monkeypatch):
     monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", TOKEN)
     monkeypatch.setattr(config, "VLAD_TELEGRAM_ID", "111")
 
-    def boom(force=False, months=1, person=None, category=None, query=None):
+    def boom(force=False, months=1, person=None, category=None, query=None, days=None):
         raise RuntimeError("sheets down")
 
     monkeypatch.setattr(dashboard, "get_dashboard", boom)
@@ -397,3 +397,73 @@ def test_week_crosses_month_and_year_boundaries():
                                     {}, jan, months=1)["week"]
     assert [d["date"] for d in w["days"]][0] == "28.12" and w["total"] == 15
     assert dashboard.compute_dashboard([], {}, NOW)["week"]["delta_pct"] is None
+
+
+# ---------- период «7 дней» (кнопка рядом с Месяц / 3 мес. / Полгода / Год) ----------
+
+SEVEN = [
+    txu("2026-09-15 09:00:00", 100, "Влад", "Еда и продукты", "Magnum"),            # сегодня (NOW = 15.09)
+    txu("2026-09-09 00:00:00", 30, "Диана", "Питомцы", "Zoo"),                      # первый день окна
+    txu("2026-09-08 23:59:00", 900, "Влад", "Еда и продукты"),                      # предыдущие 7 дней (2–8 сентября)
+    txu("2026-09-02 00:00:00", 100, "Влад", "Еда и продукты"),
+    txu("2026-09-01 12:00:00", 5000, "Влад"),                                       # вне обоих окон
+    txu("2026-09-14 10:00:00", 700, "Влад", "Зарплата", typ="ДОХОД"),
+]
+
+
+def test_seven_day_period_window_totals_and_comparison():
+    d = dashboard.compute_dashboard(SEVEN, {"Еда и продукты": 1000}, NOW, days=7)
+    assert d["period_days"] == 7 and d["month_label"] == "7 дней · 09.09 – 15.09"
+    assert d["expense"] == 130 and d["income"] == 700 and d["balance"] == 570
+    assert d["prev"]["expense"] == 1000 and d["prev"]["expense_delta_pct"] == -87
+    assert d["prev"]["phrase"] == "в предыдущие 7 дней" and d["prev"]["label"] == "предыдущие 7 дней"
+    assert [e["amount"] for e in d["expenses"]] == [100, 30]
+    assert {c["name"] for c in d["categories"]} == {"Еда и продукты", "Питомцы"}
+    assert dashboard.compute_dashboard(SEVEN, {}, NOW)["period_days"] is None          # обычные периоды не затронуты
+
+
+def test_seven_day_period_hides_monthly_limits_and_uses_day_bars():
+    d = dashboard.compute_dashboard(SEVEN, {"Еда и продукты": 1000}, NOW, days=7)
+    assert all(c["limit"] is None and c["status"] == "none" for c in d["categories"])
+    assert dashboard.compute_dashboard(SEVEN, {"Еда и продукты": 1000}, NOW)["categories"][0]["limit"] == 1000
+    assert d["dynamics"]["kind"] == "days" and len(d["dynamics"]["bars"]) == 7
+    assert d["dynamics"]["bars"][-1] == {"label": "вт 15", "date": "15.09", "value": 100}
+    assert d["week"]["total"] == 130
+    cat = dashboard.compute_dashboard(SEVEN, {"Еда и продукты": 1000}, NOW, days=7, category="Еда и продукты")
+    assert cat["category_limit"] is None and cat["expense"] == 100 and cat["prev"]["expense"] == 1000
+
+
+def test_seven_day_period_works_with_person_search_and_unknown_days():
+    assert dashboard.compute_dashboard(SEVEN, {}, NOW, days=7, person="Диана")["expense"] == 30
+    assert dashboard.compute_dashboard(SEVEN, {}, NOW, days=7, query="zoo")["search"]["count"] == 1
+    assert dashboard.compute_dashboard(SEVEN, {}, NOW, days=5)["period_days"] is None     # неподдерживаемое окно -> обычный месяц
+    assert dashboard.compute_dashboard([], {}, NOW, days=7)["prev"]["expense_delta_pct"] is None
+    jan = datetime.datetime(2026, 1, 3, 12, tzinfo=ASTANA_TZ)                              # окно через границу года
+    d = dashboard.compute_dashboard([txu("2025-12-28 10:00:00", 10, "Влад")], {}, jan, days=7)
+    assert d["month_label"] == "7 дней · 28.12 – 03.01" and d["expense"] == 10
+
+
+def test_api_period_7d_maps_to_days(monkeypatch):
+    monkeypatch.setattr(config, "TELEGRAM_BOT_TOKEN", TOKEN)
+    monkeypatch.setattr(config, "VLAD_TELEGRAM_ID", "111")
+    seen = {}
+
+    def fake(force=False, months=1, person=None, category=None, query=None, days=None):
+        seen.update(months=months, days=days)
+        return {"month_label": "x"}
+
+    monkeypatch.setattr(dashboard, "get_dashboard", fake)
+
+    async def run():
+        client = TestClient(TestServer(webapp.build_app()))
+        await client.start_server()
+        try:
+            h = {webapp.INIT_DATA_HEADER: make_init_data(user_id=111)}
+            for query, expected in (("7d", (1, 7)), ("7D", (1, 7)), ("3", (3, None)), ("1", (1, None)),
+                                    ("30d", (1, None)), ("xd", (1, None)), ("abc", (1, None)), ("12", (12, None))):
+                assert (await client.get(f"/api/dashboard?period={query}", headers=h)).status == 200
+                assert (seen["months"], seen["days"]) == expected, query
+        finally:
+            await client.close()
+
+    asyncio.run(run())

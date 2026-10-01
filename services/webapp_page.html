@@ -121,6 +121,7 @@
   <button data-v="other">Диана</button>
 </div>
 <div class="seg" id="per">
+  <button data-v="7d">7 дн.</button>
   <button data-v="1" class="on">Месяц</button>
   <button data-v="3">3 мес.</button>
   <button data-v="6">Полгода</button>
@@ -165,7 +166,9 @@
     var p = d.prev;
     if (p.expense_delta_pct === null) return null;
     var pct = p.expense_delta_pct, abs = Math.abs(pct), text;
-    var tail = " за то же время " + p.phrase + ": было " + money(p.expense) + ".";
+    var tail = d.period_days
+      ? " за предыдущие " + d.period_days + " дн.: было " + money(p.expense) + "."
+      : " за то же время " + p.phrase + ": было " + money(p.expense) + ".";
     if (abs < 1) text = "Расходы на уровне, что и" + tail;
     else if (pct >= 400) {
       var k = Math.round(d.expense / p.expense);
@@ -348,11 +351,12 @@
     var dy = d.dynamics, wrap = el("div");
     if (!dy) return wrap;
     wrap.appendChild(el("h2", "", "Динамика"));
-    if (d.week) {
+    if (d.period_days && d.week) {
       var w = d.week, wl = el("div", "legend");
       var cmpText = w.delta_pct === null ? "" : " · к предыдущим 7 дням " + (w.delta_pct > 0 ? "+" : "") + w.delta_pct + "%";
       wl.appendChild(el("span", "", "всего " + money(w.total) + " · в среднем " + money(w.avg) + " в день" + cmpText));
-      wrap.appendChild(chartCard("Последние 7 дней", barChart(w.days), wl));
+      wrap.appendChild(chartCard("Расходы по дням", barChart(w.days), wl));
+      return wrap;
     }
     if (dy.kind === "daily") {
       var legend = el("div", "legend");
@@ -401,7 +405,7 @@
   function alertsBlock(d) {
     if (!d.alerts || !d.alerts.length) return null;
     var box = el("div", "alerts");
-    box.appendChild(el("h3", "", "Внимание · текущий месяц, вся семья"));
+    box.appendChild(el("h3", "", "Внимание · вся семья"));
     d.alerts.forEach(function (a) { box.appendChild(alertLine(a)); });
     return box;
   }
