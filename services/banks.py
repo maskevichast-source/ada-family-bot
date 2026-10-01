@@ -65,6 +65,19 @@ VALID_SOURCES_LOWER = {
 }
 
 
+# Карты, платёж по которым — РАССРОЧКА/кредит, а не собственные деньги. Тип средств
+# определяем кодом по карте, а не доверяем модели: в таблице Ozen встречался и как
+# «Собственные», и как «Рассрочка».
+INSTALLMENT_SOURCES_LOWER = {
+    "kaspi red", "ozen", "forteblack", "картакарта", "smartcard", "payda", "halyk рассрочка",
+}
+
+
+def funds_type_for_source(source: str | None) -> str | None:
+    """«Рассрочка», если карта рассрочечная; иначе None (тип не меняем)."""
+    return "Рассрочка" if str(source or "").strip().lower() in INSTALLMENT_SOURCES_LOWER else None
+
+
 BANK_NAME_ALIASES = {
     "bcc": "BCC", "бцк": "BCC", "центркредit": "BCC", "центркредит": "BCC",
     "kaspi": "Kaspi", "каспи": "Kaspi", "kaspi gold": "Kaspi", "каспи голд": "Kaspi",

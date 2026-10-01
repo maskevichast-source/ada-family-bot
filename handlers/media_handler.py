@@ -5,7 +5,7 @@ import asyncio
 from aiogram.types import Message
 from services.vision import parse_receipt
 from services.sheets import (
-    append_transaction, normalize_necessity, get_last_200_transactions,
+    append_transaction, normalize_necessity, get_last_200_transactions, find_duplicate_receipt,
     add_trip_plan, get_planned_trips, add_or_update_subscription,
 )
 from services.telegram_safe import safe_answer
@@ -27,6 +27,8 @@ from services.analytics import detect_amount_anomaly, habit_remark_due
 from services.deepseek_service import generate_budget_reflection
 from services.banks import normalize_bank_source
 import re
+from services.receipt_meta import clean_items_summary, format_sheet_datetime, parse_occurred_at
+from services.timezone import now_astana, parse_flexible_datetime
 
 
 def _format_currency(value):
@@ -143,7 +145,14 @@ def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> st
         comm = str(tx.get("user_comment") or "").strip()
         comm_str = f" ({comm})" if comm else ""
         sign = "+ " if is_income_type(tx.get("type")) else ""
-        lines.append(f"• {sign}{amt} {curr} | {bank} | {cat}{comm_str}")
+        extras = []
+        if tx.get("funds_type") and tx.get("funds_type") != "Собственные":
+            extras.append(str(tx["funds_type"]).lower())
+        when = parse_flexible_datetime(tx.get("occurred_at")) if tx.get("occurred_at") else None
+        if when and when.date() != now_astana().date():
+            extras.append(f"чек от {when.strftime('%d.%m.%Y %H:%M')}")      # поздняя загрузка: показываем настоящую дату
+        extra_str = f" · {', '.join(extras)}" if extras else ""
+        lines.append(f"• {sign}{amt} {curr} | {bank} | {cat}{comm_str}{extra_str}")
     if ai_comment:
         lines.append(f"\n💬 {ai_comment}")
     return "\n".join(lines)
@@ -293,12 +302,35 @@ async def handle_media(message: Message):
         if not tx.get("resource"): tx["resource"] = "Карта"
         tx["user"] = user_name
         if not tx.get("merchant"): tx["merchant"] = ""
+        # Время операции из самого чека (чеки часто присылают позже); сводка «что куплено» из позиций чека.
+        occurred = parse_occurred_at(tx.get("occurred_at"), now_astana())
+        tx["occurred_at"] = format_sheet_datetime(occurred) if occurred else ""
+        tx["items_summary"] = clean_items_summary(tx.get("items_summary")) if not is_income else ""
+        if not caption and tx["items_summary"]:
+            tx["user_comment"] = tx["items_summary"]
         if not tx.get("user_comment"): tx["user_comment"] = caption or ("Пополнение/доход" if is_income else "")
         if tx.get("_fx_note"):
             tx["user_comment"] = f"{tx['user_comment']} ({tx['_fx_note']})".strip(" ()")
         if not tx.get("ai_comment"): tx["ai_comment"] = reply or ""
 
         validated_transactions.append(tx)
+
+    # Один и тот же чек могут прислать дважды (Влад и Диана; чек и скриншот банка). Сравниваем по
+    # времени операции из чека, сумме и магазину. «не дубль» в подписи отключает проверку.
+    if not (caption and re.search(r"не\s*дубл", caption.lower())):
+        fresh, duplicates = [], []
+        for tx in validated_transactions:
+            same = await asyncio.to_thread(find_duplicate_receipt, tx) if tx.get("occurred_at") else None
+            (duplicates if same else fresh).append((tx, same))
+        if duplicates:
+            names = "; ".join(f"{_format_currency(t.get('amount', 0))} ₸ · {t.get('merchant') or 'без названия'}"
+                              for t, _ in duplicates)
+            if not fresh:
+                await safe_answer(message, f"Похоже, этот чек уже записан ({names}), поэтому ничего не добавила. "
+                                           "Если это другая покупка — отправь ещё раз с подписью «не дубль».")
+                return
+            validated_transactions = [t for t, _ in fresh]
+            reply = f"{reply}\n(Уже была в таблице и пропущена: {names}.)".strip()
 
     # Стабильный ID на основе сообщения — чтобы повторный вызов handle_media
     # для ТОГО ЖЕ сообщения (retry после сетевой ошибки) не записывал уже
@@ -308,8 +340,18 @@ async def handle_media(message: Message):
         if not tx.get("transaction_id"):
             tx["transaction_id"] = f"MEDIA_{chat_id}_{message.message_id}_{idx}"
 
+    # Если позиции видны в самом чеке (чек Kaspi, длинный чек магазина), спрашивать комментарий
+    # незачем — «что куплено» уже есть. Сомневающиеся категории по-прежнему ждут комментария.
+    needs_clarification = any(
+        float(tx.get("confidence", 1.0)) < 0.8 and tx.get("alternatives") for tx in validated_transactions
+    )
+    receipt_is_self_explanatory = (
+        bool(validated_transactions) and not needs_clarification
+        and all(tx.get("items_summary") for tx in validated_transactions)
+    )
+
     # Доходы записываем сразу и гарантированно в Google Sheets
-    if has_income or caption:
+    if has_income or caption or receipt_is_self_explanatory:
         try:
             for tx in validated_transactions:
                 if caption:

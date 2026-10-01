@@ -132,6 +132,50 @@ def get_db():
     return _cached_db
 
 
+DUPLICATE_WINDOW_MINUTES = 3
+
+
+def _norm_merchant(value) -> str:
+    return " ".join(str(value or "").lower().replace("ё", "е").split())
+
+
+def find_duplicate_receipt(tx: dict):
+    """Уже записанная трата с тем же временем операции (из чека), суммой и магазином.
+
+    Нужна, потому что один чек могут прислать дважды (Влад и Диана, или чек и скриншот
+    банка). Ищем только у транзакций со временем из чека. Возвращает запись или None.
+    """
+    from services.receipt_meta import parse_occurred_at
+
+    now = datetime.datetime.now(ASTANA_TZ)
+    when = parse_occurred_at(tx.get("occurred_at"), now)
+    if when is None:
+        return None
+    amount = parse_amount(tx.get("amount", 0))
+    merchant = _norm_merchant(tx.get("merchant"))
+    try:
+        records = _get_all_records_safe(get_db().worksheet("Transactions"))
+    except Exception as e:
+        print(f"[Чек] Не удалось проверить дубль: {e}")
+        return None
+    for r in records:
+        if is_income_type(r.get("type")) != is_income_type(tx.get("type")):
+            continue
+        try:
+            if abs(parse_amount(r.get("amount", 0)) - amount) >= 0.5:
+                continue
+        except ValueError:
+            continue
+        other = parse_flexible_datetime(r.get("date"))
+        if other is None or abs((other - when).total_seconds()) > DUPLICATE_WINDOW_MINUTES * 60:
+            continue
+        theirs = _norm_merchant(r.get("merchant"))
+        if merchant and theirs and merchant != theirs and merchant not in theirs and theirs not in merchant:
+            continue            # другой магазин в ту же минуту — это другая покупка
+        return r
+    return None
+
+
 def get_client():
     """Клиент gspread (для операций с файлами Google Drive, например резервных копий)."""
     get_db()
@@ -160,7 +204,12 @@ def append_transaction(data: dict):
     if not data.get("transaction_id"):
         data["transaction_id"] = f"TRX_{now.strftime('%Y%m%d_%H%M%S_%f')}_{amount}"
 
-    data["date"] = now.strftime("%Y-%m-%d %H:%M:%S")
+    # Время операции берём из чека, если оно там есть и правдоподобно (Диана присылает чеки
+    # через день-два); иначе — время отправки, как раньше. Проверяется и здесь, потому что
+    # запись может идти позже (чек ждал комментария), и значение должно быть безопасным.
+    from services.receipt_meta import format_sheet_datetime, parse_occurred_at
+    occurred = parse_occurred_at(data.get("occurred_at"), now)
+    data["date"] = format_sheet_datetime(occurred or now)
     if not data.get("user"):
         data["user"] = "Влад"
     else:
@@ -198,6 +247,13 @@ def append_transaction(data: dict):
     data["source"] = normalize_bank_source(data.get("bank"), data.get("source"))
     if not data.get("funds_type"):
         data["funds_type"] = "Собственные"
+    # Покупка картой рассрочки (Kaspi Red, Ozen...) — всегда «Рассрочка»: модель путала.
+    # Платёж БАНКУ по кредиту (подкатегория «Кредиты и рассрочки») — свои деньги, его не трогаем.
+    from services.banks import funds_type_for_source
+    from services.loan_rules import LOAN_SUBCATEGORY
+    installment = funds_type_for_source(data["source"])
+    if installment and data["type"] == TYPE_EXPENSE and str(data.get("subcategory") or "").strip() != LOAN_SUBCATEGORY:
+        data["funds_type"] = installment
     if not data.get("resource"):
         data["resource"] = "Карта"
 

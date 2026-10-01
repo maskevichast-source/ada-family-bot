@@ -16,6 +16,7 @@ from services.categories import (
     is_ambiguous_item,
 )
 from services.banks import BANK_ALIASES_PROMPT
+from services.receipt_meta import extract_pdf_text
 
 _SUBCATEGORIES_VISION_PROMPT = "\n".join(
     f"- {cat}: {', '.join(subs)}" for cat, subs in SUBCATEGORIES_MAP.items()
@@ -43,6 +44,8 @@ VISION_SYSTEM_PROMPT = f"""
       "category": "Еда и продукты",
       "subcategory": "Напитки и вода",
       "merchant": "Название магазина",
+      "occurred_at": "2026-09-25 07:04",
+      "items_summary": "что куплено, коротко",
       "necessity": "Need",
       "user_comment": "Описание покупки",
       "ai_comment": "Короткий комментарий Ады",
@@ -124,6 +127,39 @@ necessity:
 - "Алкоголь, табак и энергетики" → ВСЕГДА Want
 - "Красота и уход" → Want
 - "Развлечения и хобби" → Want
+
+ДАТА И ВРЕМЯ ОПЕРАЦИИ ("occurred_at"):
+- Бери дату и время ИЗ САМОГО ЧЕКА/СКРИНШОТА (строки «Дата и время», «Дата», время под суммой в
+  приложении банка) в формате "ГГГГ-ММ-ДД ЧЧ:ММ", время по Астане. Чеки часто присылают через
+  день или неделю после покупки, поэтому НЕ подставляй текущее время и не угадывай дату.
+- Если на документе нет даты — "occurred_at": null (код возьмёт время отправки).
+- Для скриншота перевода/платежа бери дату ОПЕРАЦИИ, а не дату выписки или время на часах телефона.
+  Год бери с документа; если он не виден — null.
+
+ЧТО КУПЛЕНО ("items_summary"):
+- Если в чеке перечислены позиции — коротко напиши, что куплено, до 140 символов, по-русски, без
+  артикулов и граммовок («кабель Ugreen USB-C — HDMI 1,5 м»).
+- Длинный чек (больше 5–6 позиций): не перечисляй всё, а сгруппируй по смыслу, главное первым:
+  «овощи и зелень, молоко, сыры, крупы и макароны, яйца, бытовая химия». Только то, что реально есть
+  в чеке, ничего не выдумывай.
+- Если позиций в документе нет (слип банка, скриншот платежа, перевод) — "items_summary": "".
+  Если пользователь дал подпись, она важнее, но заполни поле тоже, когда позиции видны.
+
+КОМИССИЯ ЗА ПЕРЕВОД:
+- Если у перевода есть строка «Комиссия» с суммой больше нуля — верни ОТДЕЛЬНУЮ транзакцию на сумму
+  комиссии: category "Финансовые расходы и переводы", subcategory "Банковские комиссии",
+  merchant — название банка, user_comment "Комиссия за перевод", тот же occurred_at, банк и карта.
+  Сумма самого перевода — отдельная транзакция (без комиссии). Итого = перевод + комиссия.
+
+БАНК, КАРТА И «СВОИ ИЛИ РАССРОЧКА» (по чеку, а не наугад):
+- Чек Kaspi: строка «Оплачено …»: «с Kaspi Gold» → source "Kaspi Gold"; «с Kaspi Red» или «с Kaspi Red+» →
+  source "Kaspi Red", funds_type "Рассрочка". Если написано просто «Картой» без названия карты на
+  чеке Kaspi — bank "Kaspi", source "Kaspi Gold", confidence не выше 0.85.
+- Скриншот Wallet/Apple Pay: под статусом видно карту (например «Home Credit OZEN», «#bccpay»);
+  внизу «Обратиться в <банк>» — это эмитент карты. Сопоставляй со словарём ниже.
+- Перевод Forte («Карта отправителя One **1738», логотип Forte) → bank "Forte", source "Forte Card".
+- funds_type "Рассрочка" — когда оплачено картой рассрочки (Kaspi Red, Ozen, ForteBlack, Картакарта),
+  иначе "Собственные". Платёж банку В ПОГАШЕНИЕ кредита — всегда "Собственные".
 
 {BANK_ALIASES_PROMPT}
 
@@ -262,14 +298,29 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
             image_path = source_path
             mime_type = {".png": "image/png", ".jpg": "image/jpeg",
                          ".jpeg": "image/jpeg", ".webp": "image/webp"}.get(suffix)
+            pdf_text = ""
+            image_paths: list[Path] = []
             if suffix == ".pdf":
-                image_path = _render_pdf(source_path, Path(temporary_dir) / "receipt.png")
+                # У чеков Kaspi и банков в PDF есть текстовый слой: он точнее картинки (даты, суммы,
+                # «Оплачено с Kaspi Red») и позволяет прочитать длинный чек целиком. Страницу
+                # всё равно показываем — по логотипу видно, чей это документ. Скан без текста
+                # отправляем постранично (до MAX_PDF_PAGES).
+                pdf_text = extract_pdf_text(source_path)
+                try:
+                    if pdf_text:
+                        image_paths = [_render_pdf(source_path, Path(temporary_dir) / "receipt.png")]
+                    else:
+                        image_paths = _render_pdf_pages(source_path, Path(temporary_dir))
+                except ValueError as too_long:
+                    return {"transactions": [], "reply": str(too_long)}
                 mime_type = "image/png"
+            else:
+                image_paths = [image_path]
             if mime_type is None:
                 print(f"[Распознавание] Неподдерживаемый формат: {suffix or 'без расширения'}")
                 return {}
 
-            encoded_image = base64.b64encode(image_path.read_bytes()).decode("ascii")
+            encoded_images = [base64.b64encode(p.read_bytes()).decode("ascii") for p in image_paths]
             client = AsyncOpenAI(api_key=OPENAI_API_KEY, timeout=45.0, max_retries=2)
             try:
                 from services.timezone import now_astana
@@ -277,8 +328,13 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                 time_hint = get_time_context_hint(now.hour, now.weekday())
                 weekday_ru = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"][now.weekday()]
 
+                pdf_block = (
+                    "ТЕКСТ ИЗ PDF (точный текстовый слой документа; при расхождении с картинкой верь тексту):\n"
+                    f"{pdf_text}\n\n" if pdf_text else ""
+                )
                 prompt = (
-                    f"Файл от {user_name}. "
+                    pdf_block
+                    + f"Файл от {user_name}. "
                     + (f"Подпись пользователя (это и есть ЧТО КУПЛЕНО, опирайся на неё в комментарии): {caption}.\n"
                        if caption else "Подписи нет.\n")
                     +
@@ -292,14 +348,13 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                     model="gpt-4o",
                     messages=[
                         {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                        {"role": "user", "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {
-                                "url": f"data:{mime_type};base64,{encoded_image}"}},
+                        {"role": "user", "content": [{"type": "text", "text": prompt}] + [
+                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{enc}"}}
+                            for enc in encoded_images
                         ]},
                     ],
                     response_format={"type": "json_object"},
-                    max_tokens=900,
+                    max_tokens=1300,
                 )
 
                 choice = response.choices[0]
