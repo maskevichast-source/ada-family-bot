@@ -165,6 +165,7 @@ async def cmd_help(message: types.Message):
         "/export — скачать выписку в Excel (.xlsx)\n"
         "/app — открыть мини-апп с дашбордом\n"
         "/limits_plan — показать, как Ада пересчитала бы лимиты (без записи)\n"
+        "/limits_apply — пересчитать лимиты сейчас и записать\n"
         "/limits_undo — вернуть лимиты, что были до последнего пересчёта\n"
         "/backup — сделать резервную копию таблицы сейчас\n"
         "/fix_loans — привести погашения кредитов и рассрочек к «Кредиты и рассрочки»\n"
@@ -215,6 +216,18 @@ async def cmd_limits_plan(message: types.Message):
         print(f"[Лимиты] /limits_plan: {e}")
         text = "Не получилось посчитать черновик лимитов. Лимиты не тронуты."
     await safe_answer(message, text)
+
+
+@dp.message(Command("limits_apply"))
+async def cmd_limits_apply(message: types.Message):
+    """Пересчитать лимиты по формуле сейчас и записать (перед записью сохраняется снимок для /limits_undo)."""
+    try:
+        out = await asyncio.to_thread(recalc_and_apply)
+    except Exception as e:
+        print(f"[Лимиты] /limits_apply: {e}")
+        out = None
+    await safe_answer(message, out[1] if out else
+                      "Не получилось пересчитать лимиты: не удалось прочитать траты из таблицы. Лимиты не тронуты.")
 
 
 @dp.message(Command("limits_undo"))

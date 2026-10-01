@@ -23,6 +23,7 @@ import datetime
 import math
 
 from services.categories import EXPENSE_CATEGORIES, is_income_type
+from services.loan_rules import looks_like_repayment
 from services.money import parse_amount
 from services.timezone import ASTANA_TZ, parse_flexible_datetime
 
@@ -38,6 +39,13 @@ MONTH_WEIGHTS = (3, 2, 1)     # для последнего, предпосле�
 MAX_HISTORY_MONTHS = 3
 COMPLETE_MONTH_GRACE_DAYS = 5  # месяц «полный», если данные начались не позже 5-го числа
 CHANGE_NOTICE_PCT = 5          # в сообщении показываем изменения от 5%
+
+# Разовые крупные траты (ремонт, мебель, шторы) не должны задавать «обычный» месячный уровень:
+# одна такая трата превращает лимит в бессмысленный. Исключаем из расчёта ОДНУ трату от порога,
+# кроме регулярных обязательных платежей. Что именно исключено, показывается в сводке.
+ONE_OFF_MIN_AMOUNT = 100_000
+ONE_OFF_EXEMPT_CATEGORIES = {"Жильё и коммунальные услуги", "Связь и подписки", "Финансовые расходы и переводы"}
+ONE_OFF_TOP_IN_SUMMARY = 3
 
 # --- Ориентир структуры расходов -------------------------------------------
 # Источники: BLS Consumer Expenditure Survey 2024 (доли основных групп, США:
@@ -114,8 +122,15 @@ def _select_months(data_start: datetime.datetime | None, now: datetime.datetime)
     return [(now.year, now.month, days_in / elapsed)], "partial"
 
 
+def is_one_off(t: dict, amount: float, cat: str) -> bool:
+    """Разовая крупная трата: от порога, не регулярный платёж и не погашение кредита."""
+    return (amount >= ONE_OFF_MIN_AMOUNT and cat not in ONE_OFF_EXEMPT_CATEGORIES
+            and not looks_like_repayment(t.get("merchant"), t.get("comm"), t.get("subcat"), t.get("funds_type")))
+
+
 def compute_limits(transactions: list[dict], now: datetime.datetime,
-                   current_limits: dict | None = None, pinned: set | None = None) -> dict:
+                   current_limits: dict | None = None, pinned: set | None = None,
+                   exclude_one_off: bool = True) -> dict:
     """Чистая функция. Ничего не читает и не пишет.
 
     transactions — как из get_transactions_for_period (ключи date, type, amt, cat).
@@ -135,6 +150,7 @@ def compute_limits(transactions: list[dict], now: datetime.datetime,
 
     spend = {(y, m): {} for y, m, _ in months}
     income = {(y, m): 0.0 for y, m, _ in months}
+    excluded: list[dict] = []
     for t, dt in zip(transactions, dates):
         if dt is None or (dt.year, dt.month) not in spend:
             continue
@@ -143,6 +159,10 @@ def compute_limits(transactions: list[dict], now: datetime.datetime,
             income[(dt.year, dt.month)] += amount
         else:
             cat = str(t.get("cat") or "").strip()
+            if exclude_one_off and is_one_off(t, amount, cat):
+                excluded.append({"amount": round(amount), "category": cat,
+                                 "text": str(t.get("merchant") or t.get("subcat") or cat).strip()[:40]})
+                continue
             spend[(dt.year, dt.month)][cat] = spend[(dt.year, dt.month)].get(cat, 0.0) + amount
 
     def weighted(values_by_month) -> float:
@@ -179,6 +199,11 @@ def compute_limits(transactions: list[dict], now: datetime.datetime,
         "income_avg": round(income_avg),
         "spendable": round(spendable),
         "pinned": sorted(c for c, d in details.items() if d["pinned"]),
+        "excluded": {
+            "count": len(excluded),
+            "total": sum(e["amount"] for e in excluded),
+            "top": sorted(excluded, key=lambda e: e["amount"], reverse=True)[:ONE_OFF_TOP_IN_SUMMARY],
+        },
     }
 
 
@@ -201,6 +226,11 @@ def format_summary(result: dict, old_limits: dict, now: datetime.datetime, previ
         used = ", ".join(_MONTHS_RU[m - 1] for _, m in result["months"])
         lines.append(f"(по данным: {used})")
 
+    ex = result.get("excluded") or {}
+    if ex.get("count"):
+        top = ", ".join(f"{e['text']} {_money(e['amount'])}" for e in ex["top"])
+        lines.append(f"Разовые крупные траты (от {_money(ONE_OFF_MIN_AMOUNT)} ₸) в расчёт не вошли: "
+                     f"{ex['count']} на {_money(ex['total'])} ₸ ({top}).")
     rows = []
     for cat in sorted(new, key=lambda c: new[c], reverse=True):
         old = old_limits.get(cat)

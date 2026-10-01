@@ -16,7 +16,9 @@ def tx(date, amt, cat="Еда и продукты", typ="РАСХОД"):
 
 # История с 1 августа: август и сентябрь полные
 FULL = [
-    tx("2026-08-02 10:00:00", 100000), tx("2026-09-02 10:00:00", 200000),
+    tx("2026-08-02 10:00:00", 50000), tx("2026-08-20 10:00:00", 50000),                       # август: 100 000
+    tx("2026-09-02 10:00:00", 50000), tx("2026-09-09 10:00:00", 50000),
+    tx("2026-09-16 10:00:00", 50000), tx("2026-09-23 10:00:00", 50000),                       # сентябрь: 200 000
     tx("2026-08-03 10:00:00", 50000, "Транспорт и авто"), tx("2026-09-03 10:00:00", 50000, "Транспорт и авто"),
     tx("2026-08-05 10:00:00", 1000000, "Зарплата", "ДОХОД"), tx("2026-09-05 10:00:00", 1000000, "Зарплата", "ДОХОД"),
 ]
@@ -32,7 +34,8 @@ def test_benchmark_covers_all_categories_and_sums_to_one():
 
 def test_partial_month_is_not_used_when_full_months_exist():
     # данные начались 26 августа: август неполный, полный только сентябрь
-    txs = [tx("2026-08-26 10:00:00", 999999), tx("2026-09-02 10:00:00", 200000),
+    txs = [tx("2026-08-26 10:00:00", 90000), tx("2026-09-02 10:00:00", 50000), tx("2026-09-09 10:00:00", 50000),
+           tx("2026-09-16 10:00:00", 50000), tx("2026-09-23 10:00:00", 50000),
            tx("2026-09-05 10:00:00", 1000000, "Зарплата", "ДОХОД")]
     r = le.compute_limits(txs, NOW)
     assert r["mode"] == "complete" and r["months"] == [(2026, 9)]
@@ -40,7 +43,8 @@ def test_partial_month_is_not_used_when_full_months_exist():
 
 
 def test_no_full_months_extrapolates_current_month():
-    txs = [tx("2026-09-02 10:00:00", 145000), tx("2026-09-05 10:00:00", 1000000, "Зарплата", "ДОХОД")]
+    txs = [tx("2026-09-02 10:00:00", 72500), tx("2026-09-03 10:00:00", 72500),
+           tx("2026-09-05 10:00:00", 1000000, "Зарплата", "ДОХОД")]
     now = datetime.datetime(2026, 9, 29, 12, tzinfo=ASTANA_TZ)
     r = le.compute_limits(txs, now)
     assert r["mode"] == "partial"
@@ -207,3 +211,39 @@ def test_startup_fix_skips_row_when_rate_unavailable(db, monkeypatch):
     asyncio.run(app_main.fix_foreign_currency_rows())
     row = db.sheets["Transactions"].get_all_values()[1]
     assert row[5] == "KZT" and row[4] == 5220.0
+
+
+# ---------- разовые крупные траты ----------
+
+def test_one_off_large_expense_is_excluded_but_reported():
+    txs = FULL + [
+        tx("2026-09-10 10:00:00", 640800, "Дом и быт"),             # шторы
+        tx("2026-09-12 10:00:00", 30000, "Дом и быт"),              # обычная трата
+    ]
+    ex = le.compute_limits(txs, NOW)
+    inc = le.compute_limits(txs, NOW, exclude_one_off=False)
+    assert ex["details"]["Дом и быт"]["own"] == 18000                         # 30 000 с весом 3 из 5 (август пуст)
+    assert inc["details"]["Дом и быт"]["own"] == 402480                       # (640 800 + 30 000) × 3 / 5 — если выключено
+    assert ex["limits"]["Дом и быт"] * 5 < inc["limits"]["Дом и быт"]
+    assert ex["excluded"]["count"] == 1 and ex["excluded"]["total"] == 640800
+    text = le.format_summary(ex, {}, NOW)
+    assert "Разовые крупные траты" in text and "640 800" in text
+
+
+def test_loans_and_regular_payments_are_never_treated_as_one_off():
+    txs = FULL + [
+        {**tx("2026-09-08 10:00:00", 151304, "Электроника и техника"), "merchant": "Погашение кредита Forte",
+         "comm": "Погашение основного кредита"},                           # кредит: регулярный платёж
+        tx("2026-09-09 10:00:00", 150000, "Жильё и коммунальные услуги"),    # коммуналка
+        tx("2026-09-09 11:00:00", 200000, "Финансовые расходы и переводы"),
+    ]
+    r = le.compute_limits(txs, NOW)
+    assert r["excluded"]["count"] == 0
+    assert r["details"]["Электроника и техника"]["own"] == round(151304 * 3 / 5)          # вес сентября 3 из 5
+    assert r["details"]["Жильё и коммунальные услуги"]["own"] == 90000
+
+
+def test_one_off_threshold_is_per_transaction():
+    txs = FULL + [tx(f"2026-09-{d:02d} 10:00:00", 60000, "Дом и быт") for d in (3, 4, 5)]    # три по 60 000 = 180 000
+    r = le.compute_limits(txs, NOW)
+    assert r["excluded"]["count"] == 0 and r["details"]["Дом и быт"]["own"] == 108000      # 180 000 × 3 / 5
