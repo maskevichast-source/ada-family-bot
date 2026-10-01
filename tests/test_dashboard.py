@@ -359,3 +359,41 @@ def test_expense_rows_carry_user_comment_as_note():
     assert by_amount[5000]["note"] == ""                       # комментарий = название, не дублируем
     assert by_amount[4000]["text"] == "Уборка" and by_amount[4000]["note"] == "Клининг"
     assert len(by_amount[3000]["note"]) == dashboard.NOTE_MAX_CHARS and by_amount[3000]["note"].endswith("…")
+
+
+# ---------- последние 7 календарных дней ----------
+
+def test_last_seven_calendar_days_window_and_comparison():
+    # NOW = 2026-09-15 12:00 (вторник): окно — с 9 по 15 сентября, предыдущее — со 2 по 8
+    txs = [
+        txu("2026-09-15 09:00:00", 100, "Влад"), txu("2026-09-15 20:00:00", 50, "Диана"),    # сегодня
+        txu("2026-09-09 00:00:00", 30, "Влад"),                                              # первый день окна
+        txu("2026-09-08 23:59:59", 999, "Влад"),                                             # вне окна, в предыдущих 7
+        txu("2026-09-02 00:00:00", 1, "Влад"),                                               # первый день предыдущего окна
+        txu("2026-09-01 23:59:59", 5000, "Влад"),                                            # вне обоих окон
+        txu("2026-09-16 00:00:00", 7000, "Влад"),                                            # завтра — не считаем
+        txu("2026-09-12 10:00:00", 4000, "Влад", "Зарплата", typ="ДОХОД"),                   # доход не участвует
+    ]
+    w = dashboard.compute_dashboard(txs, {}, NOW, months=1)["week"]
+    assert [d["date"] for d in w["days"]] == ["09.09", "10.09", "11.09", "12.09", "13.09", "14.09", "15.09"]
+    assert [d["label"] for d in w["days"]] == ["ср 9", "чт 10", "пт 11", "сб 12", "вс 13", "пн 14", "вт 15"]
+    assert [d["value"] for d in w["days"]] == [30, 0, 0, 0, 0, 0, 150]
+    assert w["total"] == 180 and w["avg"] == round(180 / 7, 2)
+    assert w["prev_total"] == 1000 and w["delta_pct"] == -82
+
+
+def test_week_ignores_selected_period_but_respects_person_and_category():
+    txs = [txu("2026-09-14 10:00:00", 100, "Влад", "Еда и продукты"), txu("2026-09-14 11:00:00", 40, "Диана", "Питомцы"),
+           txu("2026-07-01 10:00:00", 9999, "Влад")]
+    for months in (1, 3, 12):
+        assert dashboard.compute_dashboard(txs, {}, NOW, months=months)["week"]["total"] == 140
+    assert dashboard.compute_dashboard(txs, {}, NOW, person="Диана")["week"]["total"] == 40
+    assert dashboard.compute_dashboard(txs, {}, NOW, category="Еда и продукты")["week"]["total"] == 100
+
+
+def test_week_crosses_month_and_year_boundaries():
+    jan = datetime.datetime(2026, 1, 3, 12, tzinfo=ASTANA_TZ)
+    w = dashboard.compute_dashboard([txu("2025-12-30 10:00:00", 10, "Влад"), txu("2026-01-02 10:00:00", 5, "Влад")],
+                                    {}, jan, months=1)["week"]
+    assert [d["date"] for d in w["days"]][0] == "28.12" and w["total"] == 15
+    assert dashboard.compute_dashboard([], {}, NOW)["week"]["delta_pct"] is None

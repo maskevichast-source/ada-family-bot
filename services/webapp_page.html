@@ -348,6 +348,12 @@
     var dy = d.dynamics, wrap = el("div");
     if (!dy) return wrap;
     wrap.appendChild(el("h2", "", "Динамика"));
+    if (d.week) {
+      var w = d.week, wl = el("div", "legend");
+      var cmpText = w.delta_pct === null ? "" : " · к предыдущим 7 дням " + (w.delta_pct > 0 ? "+" : "") + w.delta_pct + "%";
+      wl.appendChild(el("span", "", "всего " + money(w.total) + " · в среднем " + money(w.avg) + " в день" + cmpText));
+      wrap.appendChild(chartCard("Последние 7 дней", barChart(w.days), wl));
+    }
     if (dy.kind === "daily") {
       var legend = el("div", "legend");
       var a = el("span"); a.appendChild(el("i")); a.appendChild(document.createTextNode("этот месяц"));

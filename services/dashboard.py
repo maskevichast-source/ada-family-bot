@@ -38,6 +38,7 @@ _MONTHS_PREP = [  # «в …»
     "январе", "феврале", "марте", "апреле", "мае", "июне",
     "июле", "августе", "сентябре", "октябре", "ноябре", "декабре",
 ]
+_WEEKDAYS_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
 _MONTHS_SHORT = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
 
 
@@ -205,6 +206,13 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     people_exp = {n: 0.0 for n in FAMILY}; people_inc = {n: 0.0 for n in FAMILY}
     people_cat: dict[str, dict[str, float]] = {n: {} for n in FAMILY}
     matched_count = 0; matched_sum = 0.0
+    # последние 7 календарных дней (сегодня и 6 предыдущих) и предыдущие 7 — для сравнения
+    today0 = datetime.datetime(now.year, now.month, now.day, tzinfo=ASTANA_TZ)
+    week_start = today0 - datetime.timedelta(days=6)
+    week_prev_start = week_start - datetime.timedelta(days=7)
+    week_end = today0 + datetime.timedelta(days=1)
+    week_days: dict[datetime.date, float] = {}
+    week_prev_total = 0.0
 
     for t in transactions:
         if person and _user_of(t) != person:
@@ -217,6 +225,11 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
         cat = str(t.get("cat") or "").strip() or "Без категории"
         if category and (income or cat != category):
             continue          # детализация категории: только расходы этой категории
+        if not income:
+            if week_start <= dt < week_end:
+                week_days[dt.date()] = week_days.get(dt.date(), 0.0) + amount
+            elif week_prev_start <= dt < week_start:
+                week_prev_total += amount
         if months == 1 and not income and prev_start <= dt < start:
             day_prev[dt.day] = day_prev.get(dt.day, 0.0) + amount   # весь прошлый месяц, для пунктира
         if start <= dt < end:
@@ -305,6 +318,14 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
                 "share_pct": round(people_exp[name] / cur_expense * 100) if cur_expense > 0 else 0,
                 "top": [{"category": c, "spent": round(v, 2)} for c, v in top_cats],
             })
+    week_list = []
+    for i in range(7):
+        day = (week_start + datetime.timedelta(days=i)).date()
+        week_list.append({"label": f"{_WEEKDAYS_SHORT[day.weekday()]} {day.day}", "date": day.strftime("%d.%m"),
+                          "value": round(week_days.get(day, 0.0), 2)})
+    week_total = round(sum(d["value"] for d in week_list), 2)
+    week = {"days": week_list, "total": week_total, "avg": round(week_total / 7, 2),
+            "prev_total": round(week_prev_total, 2), "delta_pct": _delta_pct(week_total, week_prev_total)}
     category_limit = None
     if category and not person:
         lim = float(limits.get(category) or 0) * months or None
@@ -340,6 +361,7 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
         },
         "categories": categories,
         "dynamics": dynamics,
+        "week": week,
         "expenses": top,
         "expenses_total": len(expenses),
         "banks": banks,
