@@ -135,19 +135,32 @@ async def _apply_hints(result: dict, transactions: list[dict]) -> str:
     return "\n".join(notes)
 
 
+def _card_label(bank, source) -> str:
+    """Чем заплачено: карта с чека («Home Credit Ozen», «Kaspi Gold»), иначе банк. Тип «рассрочка»
+    в чате не показываем: по названию карты и так понятно, а в таблице он ставится кодом по карте."""
+    bank = str(bank or "").strip() or "Не указан"
+    source = str(source or "").strip()
+    if not source:
+        return bank
+    if bank == "Не указан":
+        return source
+    b, s = bank.lower(), source.lower()
+    if b in s or s in b:
+        return source if len(source) >= len(bank) else bank
+    return f"{bank} {source}"
+
+
 def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> str:
     lines = ["📸 **Записано по чеку:**"]
     for tx in transactions:
         amt = _format_currency(tx.get("amount", 0))
         curr = tx.get("currency", "KZT")
-        bank = tx.get("bank", "Не указан")
+        bank = _card_label(tx.get("bank"), tx.get("source"))
         cat = tx.get("category", "")
         comm = str(tx.get("user_comment") or "").strip()
         comm_str = f" ({comm})" if comm else ""
         sign = "+ " if is_income_type(tx.get("type")) else ""
         extras = []
-        if tx.get("funds_type") and tx.get("funds_type") != "Собственные":
-            extras.append(str(tx["funds_type"]).lower())
         when = parse_flexible_datetime(tx.get("occurred_at")) if tx.get("occurred_at") else None
         if when and when.date() != now_astana().date():
             extras.append(f"чек от {when.strftime('%d.%m.%Y %H:%M')}")      # поздняя загрузка: показываем настоящую дату

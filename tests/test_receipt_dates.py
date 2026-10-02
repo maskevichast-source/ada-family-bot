@@ -138,7 +138,8 @@ def test_late_receipt_with_items_is_saved_instantly_with_real_date(handler, db, 
     assert row[1] == when.strftime("%Y-%m-%d %H:%M:00")                     # дата чека, а не отправки
     assert row[14] == "кабель Ugreen USB-C — HDMI 1,5 м"                    # что куплено — из чека, без вопроса
     assert row[7] == "Kaspi Red" and row[8] == "Рассрочка"
-    assert "чек от " + when.strftime("%d.%m.%Y 20:15") in said and "рассрочка" in said
+    assert "чек от " + when.strftime("%d.%m.%Y 20:15") in said
+    assert "Kaspi Red" in said and "рассрочка" not in said                    # видна карта, а не отдельная пометка
 
 
 def test_receipt_without_items_still_asks_for_comment_and_keeps_time(handler, db, monkeypatch):
@@ -184,3 +185,17 @@ def test_transfer_commission_becomes_its_own_expense(handler, db, monkeypatch):
     assert [r[4] for r in rows] == [1700, 119]
     assert rows[1][10] == "Финансовые расходы и переводы" and rows[1][11] == "Банковские комиссии"
     assert all(r[1] == when.strftime("%Y-%m-%d %H:%M:00") for r in rows)
+
+
+@pytest.mark.parametrize("bank,source,expected", [
+    ("Home Credit", "Ozen", "Home Credit Ozen"),
+    ("Kaspi", "Kaspi Gold", "Kaspi Gold"),
+    ("BCC", "BCC Pay", "BCC Pay"),
+    ("Forte", "Forte Card", "Forte Card"),
+    ("Kaspi", "", "Kaspi"),
+    ("Не указан", "Ozen", "Ozen"),
+    (None, None, "Не указан"),
+])
+def test_receipt_report_names_the_card(bank, source, expected):
+    from handlers.media_handler import _card_label
+    assert _card_label(bank, source) == expected
