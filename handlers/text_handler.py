@@ -555,7 +555,13 @@ async def _process_text_message(message: Message, text: str):
                     "image_url": info.get("image_url") or "", "price": info.get("price"),
                     "target_price": target_price,
                 })
-                if saved:
+                if saved and saved.get("already_tracking"):
+                    res = (
+                        f"Уже слежу за этим товаром:\n{info.get('title')}\nСейчас: {price} ₸\n"
+                        + (f"Цель обновила: сообщу в личку, когда цена станет {_format_currency(target_price)} ₸ или ниже."
+                           if target_price else "Второй раз не добавляю: о заметном падении цены напишу в личку один раз.")
+                    )
+                elif saved:
                     res = (
                         f"🛒 Буду следить за ценой:\n{info.get('title')}\nСейчас: {price} тг\n"
                         + (f"Напишу, если упадёт до {_format_currency(target_price)} тг или ниже."

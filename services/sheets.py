@@ -1353,13 +1353,20 @@ def get_pending_reminders():
 
 PRICE_TRACKING_HEADERS = ["id", "user", "url", "product_name", "image_url", "target_price",
                           "first_price", "last_price", "last_checked_at", "fail_count",
-                          "status", "created_at"]
+                          "status", "created_at", "notified_price", "notified_at"]
 
 
 def _get_or_create_price_tracking_sheet():
     ws = _get_or_create_worksheet("PriceTracking", PRICE_TRACKING_HEADERS, rows=100, cols=len(PRICE_TRACKING_HEADERS))
     headers = ws.row_values(1)
     if len(headers) < len(PRICE_TRACKING_HEADERS):
+        # У листа, созданного раньше, колонок меньше: сетку нужно расширить до записи заголовков.
+        needed = len(PRICE_TRACKING_HEADERS)
+        if getattr(ws, "col_count", needed) < needed:
+            try:
+                ws.add_cols(needed - ws.col_count)
+            except AttributeError:
+                ws.resize(cols=needed)
         for col_idx, header in enumerate(PRICE_TRACKING_HEADERS, start=1):
             if col_idx > len(headers) or not headers[col_idx - 1]:
                 ws.update_cell(1, col_idx, header)
@@ -1374,6 +1381,22 @@ def add_price_tracking(payload: dict) -> Optional[dict]:
         now = datetime.datetime.now()
         ws = _get_or_create_price_tracking_sheet()
         price = parse_amount(payload.get("price", 0))
+        # Тот же товар у того же человека уже отслеживается — не заводим вторую запись (раньше
+        # из-за этого одно и то же сообщение о цене приходило дважды); только обновляем цель.
+        from services.price_alerts import normalize_url
+        wanted = normalize_url(payload.get("url"))
+        for idx, r in enumerate(_get_all_records_safe(ws), start=2):
+            if (str(r.get("status") or "").strip().lower() == "active"
+                    and str(r.get("user") or "").strip() == str(payload.get("user") or "").strip()
+                    and wanted and normalize_url(r.get("url")) == wanted):
+                if payload.get("target_price"):
+                    col = {name: i + 1 for i, name in enumerate(PRICE_TRACKING_HEADERS)}
+                    ws.update_cell(idx, col["target_price"], parse_amount(payload.get("target_price")))
+                existing = dict(r)
+                existing["already_tracking"] = True
+                if payload.get("target_price"):
+                    existing["target_price"] = parse_amount(payload.get("target_price"))
+                return existing
         values = {
             "id": payload.get("id") or f"PRICE_{now.strftime('%Y%m%d_%H%M%S')}",
             "user": payload.get("user") or "Влад",
@@ -1387,9 +1410,12 @@ def add_price_tracking(payload: dict) -> Optional[dict]:
             "fail_count": 0,
             "status": "active",
             "created_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "notified_price": price,          # базовая цена: от неё считается первое заметное падение
+            "notified_at": "",
         }
         ws.append_row(
-            _typed_row(values, PRICE_TRACKING_HEADERS, numeric_cols={"target_price", "first_price", "last_price", "fail_count"}),
+            _typed_row(values, PRICE_TRACKING_HEADERS,
+                       numeric_cols={"target_price", "first_price", "last_price", "fail_count", "notified_price"}),
             table_range=_table_range(len(PRICE_TRACKING_HEADERS)),
         )
         return values
@@ -1427,10 +1453,17 @@ def get_user_price_trackings(user_name: str) -> list[dict]:
         return []
 
 
-def record_price_check_success(row_idx: int, price: float, image_url: str = "") -> None:
+def record_price_check_success(row_idx: int, price: float, image_url: str = "",
+                               notified_price: float | None = None, notified_at: str | None = None) -> None:
+    """notified_price — базовая цена, от которой считается следующее падение (см. price_alerts);
+    notified_at — когда по этому товару последний раз писали человеку."""
     try:
         ws = _get_or_create_price_tracking_sheet()
         col = {name: i + 1 for i, name in enumerate(PRICE_TRACKING_HEADERS)}
+        if notified_price is not None:
+            ws.update_cell(row_idx, col["notified_price"], notified_price)
+        if notified_at:
+            ws.update_cell(row_idx, col["notified_at"], notified_at)
         ws.update_cell(row_idx, col["last_price"], price)
         ws.update_cell(row_idx, col["last_checked_at"], datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         ws.update_cell(row_idx, col["fail_count"], 0)

@@ -6,7 +6,7 @@ import os
 
 from aiogram import Bot, Dispatcher, types, F, BaseMiddleware
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, WebAppInfo
+from aiogram.types import BufferedInputFile, InlineKeyboardButton, InlineKeyboardMarkup, MenuButtonWebApp, WebAppInfo, LinkPreviewOptions
 try:
     from aiogram.client.default import DefaultBotProperties
 except Exception:
@@ -501,14 +501,57 @@ async def check_limit_warnings():
         await asyncio.sleep(60)
 
 
+async def _send_price_dm(owner: str, text: str, image_url: str = "") -> bool:
+    """Сообщение о цене — в ЛИЧКУ тому, кто следит (не в общий чат). True, если доставлено.
+
+    Если боту нельзя написать человеку первым (он ни разу не нажимал Start в личке с ботом),
+    в общий чат уходит одна короткая подсказка в сутки без названия товара и цен.
+    """
+    from config import get_user_telegram_id
+
+    uid = get_user_telegram_id(owner)
+    if uid:
+        try:
+            if image_url:
+                try:
+                    await bot.send_photo(chat_id=uid, photo=image_url, caption=text, parse_mode=None)
+                    return True
+                except Exception as photo_error:
+                    print(f"[Цены] Фото не ушло, шлю текстом: {photo_error}")
+            await bot.send_message(chat_id=uid, text=text, parse_mode=None,
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return True
+        except Exception as send_error:
+            print(f"[Цены] Не получилось написать {owner} в личку: {send_error}")
+    marker = f"price_dm_hint:{owner}:{datetime.datetime.now(ASTANA_TZ).strftime('%Y-%m-%d')}"
+    if not state.get("scheduler", marker):
+        state.put("scheduler", marker, {"at": datetime.datetime.now(ASTANA_TZ).isoformat()})
+        try:
+            await safe_send_message(
+                bot, chat_id=FAMILY_CHAT_ID,
+                text=f"{owner}, я не могу написать тебе в личку про цену на товар. Открой личный чат со мной "
+                     f"и нажми Start, и такие уведомления будут приходить только туда.",
+            )
+        except Exception as hint_error:
+            print(f"[Цены] Не удалось отправить подсказку: {hint_error}")
+    return False
+
+
 async def check_price_tracking():
-    """Каждую активную позицию перепроверяем раз в ~3 часа (не глобально по
-    времени суток, а по last_checked_at конкретной строки — так после
-    перезапуска процесса ничего не "проспится" до следующего дня)."""
+    """Раз в час: каждую активную позицию перепроверяем, если с её last_checked_at прошло >= 3 часов.
+
+    Уведомления — только в личку владельцу и только при заметном падении (см. services/price_alerts):
+    не меньше 5% и 500 ₸ от последней цены, о которой уже писали, и не чаще раза в сутки на товар."""
+    from services import price_alerts
+
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
             items = await asyncio.to_thread(get_active_price_trackings)
+            items, duplicates = price_alerts.split_duplicates(items)
+            for dup in duplicates:                      # лишние записи об одном товаре у одного человека
+                print(f"[Цены] Дубль отслеживания, останавливаю строку {dup.get('row_idx')}")
+                await asyncio.to_thread(set_price_tracking_status, dup.get("row_idx"), "stopped")
             for item in items:
                 last_checked_str = str(item.get("last_checked_at") or "")
                 try:
@@ -519,55 +562,43 @@ async def check_price_tracking():
                     continue
 
                 row_idx = item.get("row_idx")
+                owner = str(item.get("user") or "").strip()
                 info = await fetch_product_info(item.get("url"))
                 if not info or not info.get("price"):
                     fail_count = await asyncio.to_thread(record_price_check_failure, row_idx)
                     if fail_count >= 3:
                         await asyncio.to_thread(set_price_tracking_status, row_idx, "broken")
-                        await safe_send_message(
-                            bot, chat_id=FAMILY_CHAT_ID,
-                            text=(
-                                f"⚠️ Не могу больше проверять цену на «{item.get('product_name')}» — "
-                                f"похоже, страница на Kaspi изменилась. Отслеживание остановлено, "
-                                f"пришли ссылку заново, если товар всё ещё актуален."
-                            ),
+                        await _send_price_dm(
+                            owner,
+                            f"Не получается проверить цену: {price_alerts.short_title(item.get('product_name'))}. "
+                            f"Возможно, товар убрали или Kaspi изменил страницу. Отслеживание остановлено. "
+                            f"Пришли ссылку заново, если нужно продолжить.",
                         )
                     continue
 
                 new_price = info.get("price")
                 image_url = info.get("image_url") or item.get("image_url") or ""
-                first_price = float(item.get("first_price") or 0)
-                try:
-                    target_price = float(item.get("target_price")) if item.get("target_price") not in ("", None) else None
-                except (TypeError, ValueError):
-                    target_price = None
-
-                dropped = first_price > 0 and new_price < first_price
-                reached_target = target_price is not None and new_price <= target_price
-
-                if dropped or reached_target:
-                    caption = (
-                        f"📉 Цена упала: **{item.get('product_name')}**\n"
-                        f"Было: {_format_currency(first_price)} тг → Сейчас: {_format_currency(new_price)} тг\n"
-                        f"{info.get('url')}"
-                    )
-                    if reached_target:
-                        caption += f"\n\n🎯 Достигнута нужная цена ({_format_currency(target_price)} тг)!"
-                    try:
-                        if image_url:
-                            await bot.send_photo(chat_id=FAMILY_CHAT_ID, photo=image_url, caption=caption)
-                        else:
-                            await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=caption)
-                    except Exception as send_error:
-                        print(f"[Цены] Не удалось отправить фото, отправляю текстом: {send_error}")
-                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=caption)
-                    await asyncio.to_thread(record_price_check_success, row_idx, new_price, image_url)
-                    if reached_target:
-                        await asyncio.to_thread(set_price_tracking_status, row_idx, "reached")
-                else:
-                    await asyncio.to_thread(record_price_check_success, row_idx, new_price, image_url)
+                decision = price_alerts.decide(item, new_price, now)
+                notified_price, notified_at = None, None
+                if decision["reason"]:
+                    text = price_alerts.build_message(item, decision, new_price, info.get("url") or item.get("url"))
+                    delivered = await _send_price_dm(owner, text, image_url)
+                    if delivered:
+                        notified_price, notified_at = decision["new_baseline"], now.strftime("%Y-%m-%d %H:%M:%S")
+                        if decision["reason"] == "target":
+                            await asyncio.to_thread(set_price_tracking_status, row_idx, "reached")
+                    elif not item.get("notified_price"):
+                        # не доставлено: базу не двигаем (сообщение придёт, когда личка заработает), но если у
+                        # старой записи базы ещё нет — фиксируем прежнюю, иначе она уехала бы за последней ценой
+                        notified_price = decision["baseline"]
+                elif decision["new_baseline"] != decision["baseline"] or not item.get("notified_price"):
+                    # цена выросла (падение считаем от нового уровня) ИЛИ у старой записи базы ещё нет:
+                    # фиксируем её сразу, иначе она «ползла» бы вслед за последней ценой
+                    notified_price = decision["new_baseline"]
+                await asyncio.to_thread(record_price_check_success, row_idx, new_price, image_url,
+                                        notified_price, notified_at)
         except Exception as e:
-            print(f"[Цены] Ошибка цикла отслеживания: {e}")
+            print(f"[Цены] Ошибка проверки: {e}")
         await asyncio.sleep(3600)
 
 

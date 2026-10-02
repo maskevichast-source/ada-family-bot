@@ -114,3 +114,15 @@ def get_authorized_user_name(user_id, fallback_name: str | None = None):
         return "Диана"
 
     return None
+
+
+def get_user_telegram_id(user_name) -> int | None:
+    """Обратное к get_authorized_user_name: Telegram ID члена семьи по имени (для личных сообщений).
+    В личном чате бота chat_id равен ID пользователя, но написать первым бот может, только
+    если человек уже нажимал Start в личке с ботом."""
+    name = str(user_name or "").strip()
+    raw = {"Влад": VLAD_TELEGRAM_ID, "Диана": DIANA_TELEGRAM_ID}.get(name)
+    try:
+        return int(raw) if raw else None
+    except (TypeError, ValueError):
+        return None
