@@ -319,6 +319,74 @@ def delete_transactions_by_ids(transaction_ids) -> list[dict]:
     return [record for _, record in found]
 
 
+def _column_letter(number: int) -> str:
+    letters = ""
+    while number:
+        number, rem = divmod(number - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+@_serialized
+def get_transactions_by_ids(transaction_ids) -> dict:
+    """{transaction_id: запись (словарь по заголовкам)} для точных ID. Для кнопки «Изменить»."""
+    wanted = {str(i).strip() for i in (transaction_ids or []) if str(i or "").strip()}
+    if not wanted:
+        return {}
+    values = get_db().worksheet("Transactions").get_all_values()
+    if not values:
+        return {}
+    headers = values[0]
+    try:
+        id_col = headers.index("transaction_id")
+    except ValueError:
+        id_col = 0
+    found = {}
+    for row in values[1:]:
+        row_id = str(row[id_col]).strip() if len(row) > id_col else ""
+        if row_id in wanted:
+            found[row_id] = dict(zip(headers, list(row) + [""] * (len(headers) - len(row))))
+    return found
+
+
+@_serialized
+def update_transaction_fields(transaction_id, changes: dict):
+    """Меняет поля одной записи (по точному transaction_id) одним batch_update.
+
+    changes — {заголовок_колонки: новое значение}. Возвращает (было, стало) — два словаря,
+    или None, если записи с таким ID нет. Неизвестный заголовок — ValueError (ничего не пишется).
+    Ошибки Google пробрасываются: вызывающий код не должен говорить «изменила», если не вышло."""
+    tid = str(transaction_id or "").strip()
+    if not tid or not changes:
+        return None
+    ws = get_db().worksheet("Transactions")
+    values = ws.get_all_values()
+    if not values:
+        return None
+    headers = values[0]
+    unknown = [name for name in changes if name not in headers]
+    if unknown:
+        raise ValueError(f"Нет колонки в таблице: {', '.join(unknown)}")
+    id_col = headers.index("transaction_id") if "transaction_id" in headers else 0
+    row_number = None
+    for number, row in enumerate(values[1:], start=2):
+        if len(row) > id_col and str(row[id_col]).strip() == tid:
+            row_number = number
+            break
+    if row_number is None:
+        return None
+    raw = values[row_number - 1]
+    old = dict(zip(headers, list(raw) + [""] * (len(headers) - len(raw))))
+    updates = [
+        {"range": f"{_column_letter(headers.index(name) + 1)}{row_number}", "values": [[value]]}
+        for name, value in changes.items()
+    ]
+    _retry_write(ws.batch_update, updates, value_input_option="RAW")
+    new = dict(old)
+    new.update({name: value for name, value in changes.items()})
+    return old, new
+
+
 def update_last_transaction_bank_and_source(new_bank: str) -> Optional[dict]:
     """Мгновенно обновляет банк и источник в последней записи таблицы."""
     try:

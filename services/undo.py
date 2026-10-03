@@ -18,6 +18,8 @@ NS = "undo"
 UNDO_TTL_SECONDS = 7 * 24 * 3600   # через неделю кнопка «устаревает» и запись чистится
 CALLBACK_PREFIX = "undo:"
 BUTTON_TEXT = "↩️ Отменить"
+EDIT_PREFIX = "edt:"
+EDIT_BUTTON_TEXT = "✏️ Изменить"
 
 _lock = threading.Lock()
 
@@ -69,20 +71,35 @@ def register(transactions: list[dict]) -> str | None:
     return token
 
 
+def keyboard_for_token(token: str):
+    """Две кнопки под ответом о записи: «Отменить» и «Изменить» (см. handlers/edit_buttons.py)."""
+    from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=BUTTON_TEXT, callback_data=f"{CALLBACK_PREFIX}{token}"),
+        InlineKeyboardButton(text=EDIT_BUTTON_TEXT, callback_data=f"{EDIT_PREFIX}o:{token}"),
+    ]])
+
+
 def build_keyboard(transactions: list[dict]):
-    """InlineKeyboardMarkup с одной кнопкой «Отменить» или None, если кнопку поставить не удалось.
-    Сбой кнопки не должен ронять ответ о записи."""
+    """InlineKeyboardMarkup с кнопками «Отменить»/«Изменить» или None, если кнопки поставить не удалось.
+    Сбой кнопок не должен ронять ответ о записи."""
     try:
         token = register(transactions)
         if not token:
             return None
-        from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-        return InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text=BUTTON_TEXT, callback_data=f"{CALLBACK_PREFIX}{token}")
-        ]])
+        return keyboard_for_token(token)
     except Exception as error:
-        print(f"[Undo] Не удалось поставить кнопку: {error}")
+        print(f"[Undo] Не удалось поставить кнопки: {error}")
         return None
+
+
+def refresh_summary(token: str, summary: str) -> None:
+    """После правки записи обновляет текст, который покажет «Отменено: …»."""
+    with _lock:
+        entry = state.get(NS, token)
+        if entry and summary:
+            entry["summary"] = summary
+            state.put(NS, token, entry)
 
 
 def get_entry(token: str) -> dict | None:

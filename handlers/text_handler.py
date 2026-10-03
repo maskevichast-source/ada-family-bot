@@ -39,6 +39,7 @@ from services.weather import get_weather_forecast
 from services.telegram_safe import safe_answer
 from services.pending_receipts import has_pending, pop_pending, ack_pending
 from services import undo as undo_service
+from handlers.edit_buttons import handle_edit_input
 from services.pending_clarifications import (
     set_clarification, get_clarification, pop_clarification,
 )
@@ -335,6 +336,11 @@ async def _process_text_message(message: Message, text: str):
     chat_id = message.chat.id
     add_chat_message(chat_id, user_name, text)
     t_clean = text.strip().lower()
+
+    # Человек сейчас вводит значение для правки записи кнопкой «✏️ Изменить» (сумма, дата, текст) —
+    # это сообщение относится к правке, а не к новой трате.
+    if await handle_edit_input(message, text):
+        return
 
     # Явные команды (напоминания/долги/подтверждение правки) проверяются
     # РАНЬШЕ, чем текст решат считать комментарием к ожидающему чеку —

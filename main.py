@@ -389,6 +389,12 @@ async def process_undo(callback: types.CallbackQuery):
     await handle_undo_callback(callback)
 
 
+@dp.callback_query(F.data.startswith("edt:"))
+async def process_edit_buttons(callback: types.CallbackQuery):
+    from handlers.edit_buttons import handle_edit_callback
+    await handle_edit_callback(callback)
+
+
 @dp.message()
 async def handle_all_messages(message: types.Message):
     if message.photo or message.document:
