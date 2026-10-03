@@ -10,6 +10,7 @@
 import datetime
 
 from services import state
+from services.timezone import ASTANA_TZ
 from services.loan_rules import LOAN_CATEGORY, LOAN_SUBCATEGORY, looks_like_repayment
 from services.money import parse_amount
 
@@ -82,7 +83,7 @@ def apply_changes(changes: list[dict]) -> int:
     ws, values = _rows()
     position = {str(r[0]).strip(): n for n, r in enumerate(values, start=1) if r}   # id -> номер строки на момент записи
     state.put(NAMESPACE, "last", {
-        "at": datetime.datetime.now().isoformat(),
+        "at": datetime.datetime.now(ASTANA_TZ).isoformat(),
         "changes": [{k: c[k] for k in ("id", "old_category", "old_subcategory", "old_ai_comment")} for c in changes],
     })
     done = 0

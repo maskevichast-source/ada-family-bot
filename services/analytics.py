@@ -71,7 +71,7 @@ def detect_amount_anomaly(
     from services.sheets import get_last_200_transactions
     if not user or not category or not amount or amount <= 0:
         return None
-    cutoff = datetime.datetime.now() - datetime.timedelta(days=lookback_days)
+    cutoff = now_astana().replace(tzinfo=None) - datetime.timedelta(days=lookback_days)
     amounts = []
     for t in get_last_200_transactions():
         if t.get("cat") != category or str(t.get("user") or "").strip() != user:

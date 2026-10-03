@@ -612,9 +612,10 @@ async def check_subscriptions():
             # так обеспечена внутри process_due_subscriptions/get_subscription_warnings
             # (по last_paid/дате предупреждения), так что здесь достаточно
             # widen-окна — двойной записи не будет.
-            if now.minute >= 5:
-                hour_key = f"subscriptions:{now.strftime('%Y-%m-%dT%H')}"
-                state.put("scheduler", hour_key, {"checked_at": now.isoformat()})
+            hour_key = f"subscriptions:{now.strftime('%Y-%m-%dT%H')}"
+            # Раз в час, а не каждую минуту: маркер часа раньше писался, но не читался,
+            # и цикл гонял Google Sheets по 2–3 запроса в минуту.
+            if now.minute >= 5 and not state.get("scheduler", hour_key):
                 warnings = await asyncio.to_thread(get_subscription_warnings, now, 2)
                 for item in warnings:
                     await safe_send_message(
@@ -629,6 +630,8 @@ async def check_subscriptions():
                 due = await asyncio.to_thread(process_due_subscriptions, now)
                 if due:
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=f"💳 Автосписание подписок: {', '.join(due)}.")
+                # Маркер — только после успешного прохода: при сбое следующая минута повторит.
+                state.put("scheduler", hour_key, {"checked_at": now.isoformat()})
         except Exception as e:
             print(f"[Подписки] Ошибка цикла: {e}")
         await asyncio.sleep(60)
