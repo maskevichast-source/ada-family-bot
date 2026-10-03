@@ -169,6 +169,7 @@ async def cmd_help(message: types.Message):
         "/limits_apply — пересчитать лимиты сейчас и записать\n"
         "/limits_undo — вернуть лимиты, что были до последнего пересчёта\n"
         "/backup — сделать резервную копию таблицы сейчас\n"
+        "/status — статус бота и баланс ИИ (только для Влада, приходит в личку)\n"
         "/fix_loans — привести погашения кредитов и рассрочек к «Кредиты и рассрочки»\n"
         "/debug — диагностика таблицы\n\n"
         "💡 Примеры сообщений:\n"
@@ -266,6 +267,62 @@ async def cmd_backup(message: types.Message):
     now = datetime.datetime.now(ASTANA_TZ)
     result = await asyncio.to_thread(backup_module.make_backup, now)
     await safe_answer(message, _backup_result_text(result))
+
+
+async def _send_status_dm(text: str) -> bool:
+    """Статус — в ЛИЧКУ Владу, не в общий чат. True, если доставлено. Если боту нельзя написать первым
+    (Влад не нажимал Start в личке), в общий чат уходит одна подсказка в сутки без цифр."""
+    from config import get_user_telegram_id
+
+    uid = get_user_telegram_id("Влад")
+    if uid:
+        try:
+            await bot.send_message(chat_id=uid, text=text, parse_mode=None,
+                                   link_preview_options=LinkPreviewOptions(is_disabled=True))
+            return True
+        except Exception as send_error:
+            print(f"[Статус] Не получилось написать Владу в личку: {send_error}")
+    marker = f"status_dm_hint:{datetime.datetime.now(ASTANA_TZ).strftime('%Y-%m-%d')}"
+    if not state.get("scheduler", marker):
+        state.put("scheduler", marker, {"at": datetime.datetime.now(ASTANA_TZ).isoformat()})
+        try:
+            await safe_send_message(
+                bot, chat_id=FAMILY_CHAT_ID,
+                text="Влад, я не могу написать тебе в личку утренний статус. Открой личный чат со мной "
+                     "и нажми Start, и он будет приходить туда.")
+        except Exception as hint_error:
+            print(f"[Статус] Не удалось отправить подсказку: {hint_error}")
+    return False
+
+
+@dp.message(Command("status"))
+async def cmd_status(message: types.Message, command: CommandObject = None):
+    """/status — статус бота и баланс ИИ (только Влад; из группы ответ уходит в личку).
+    /status настройка — как включить расчёт остатка OpenAI."""
+    from config import get_authorized_user_name
+    from services import status_report
+
+    if get_authorized_user_name(message.from_user.id, message.from_user.first_name) != "Влад":
+        await safe_answer(message, "Эта команда только для Влада.")
+        return
+    arg = ((command.args if command else "") or "").strip().lower()
+    private = getattr(message.chat, "type", "") == "private"
+    if arg in {"настройка", "help", "помощь"}:
+        if private:
+            await message.answer(status_report.SETUP_HELP, parse_mode=None)
+        elif await _send_status_dm(status_report.SETUP_HELP):
+            await safe_answer(message, "Инструкцию отправила в личку.")
+        else:
+            await safe_answer(message, "Не могу написать в личку: открой чат со мной и нажми Start.")
+        return
+    now = datetime.datetime.now(ASTANA_TZ)
+    text = await status_report.build_report(now)
+    if private:
+        await message.answer(text, parse_mode=None)
+    elif await _send_status_dm(text):
+        await safe_answer(message, "Статус отправила в личку.")
+    else:
+        await safe_answer(message, "Не могу написать в личку: открой чат со мной и нажми Start.")
 
 
 @dp.message(Command("fix_loans"))
@@ -919,6 +976,31 @@ async def backup_scheduler():
         await asyncio.sleep(60)
 
 
+async def daily_status_scheduler():
+    """Раз в сутки утром (с DAILY_STATUS_HOUR, по умолчанию 9:00 по Астане) — статус в личку Владу.
+
+    Окно до 12:00: если бот перезапустили позже девяти, статус всё равно придёт в этот день.
+    Маркер дня — в state.py (переживает перезапуск); ставится до отправки, чтобы не задвоить."""
+    from services import status_report
+
+    try:
+        start_hour = int(os.environ.get("DAILY_STATUS_HOUR", "9"))
+    except ValueError:
+        start_hour = 9
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            marker = f"daily_status:{now.date().isoformat()}"
+            if status_report.status_due(now, start_hour) and not state.get("scheduler", marker):
+                state.put("scheduler", marker, {"at": now.isoformat()})
+                text = await status_report.build_report(now)
+                delivered = await _send_status_dm(text)
+                state.put("scheduler", marker, {"at": now.isoformat(), "delivered": delivered})
+        except Exception as e:
+            print(f"[Статус] Ошибка планировщика: {e}")
+        await asyncio.sleep(60)
+
+
 async def fix_foreign_currency_rows():
     """Разовая починка старых записей в валюте (до автоконвертации 13.09.2026).
 
@@ -964,6 +1046,7 @@ async def main():
     asyncio.create_task(sweep_pending_receipts())
     asyncio.create_task(sweep_clarifications())
     asyncio.create_task(backup_scheduler())
+    asyncio.create_task(daily_status_scheduler())
 
     # Мини-апп (только чтение). Любой сбой здесь не должен мешать боту.
     web_runner = await start_webapp()
