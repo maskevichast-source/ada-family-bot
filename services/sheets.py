@@ -282,24 +282,51 @@ def append_transaction(data: dict):
         raise
 
 
-def update_last_transaction_bank_and_source(new_bank: str) -> Optional[dict]:
-    """Мгновенно обновляет банк и источник в последней записи таблицы."""
+def update_last_transaction_bank_and_source(new_bank: str, user_name: Optional[str] = None) -> Optional[dict]:
+    """Мгновенно обновляет банк, источник и тип средств в последней записи.
+
+    Если передан user_name — берётся последняя запись ЭТОГО человека (а не просто последняя
+    строка листа, которую мог добавить второй член семьи). Тип средств пересчитывается по новой
+    карте (Kaspi Red → «Рассрочка»), кроме погашений кредита, как и при обычной записи."""
     try:
         ws = get_db().worksheet("Transactions")
-        records = _get_all_records_safe(ws)
-        if not records:
+        values = ws.get_all_values()
+        if len(values) < 2:
+            return None
+        headers = values[0]
+        col = {name: i for i, name in enumerate(headers)}
+        if any(name not in col for name in ("bank", "source", "funds_type", "user", "type", "subcategory")):
             return None
 
-        last_row_idx = len(records) + 1
+        row_idx = None
+        for i in range(len(values) - 1, 0, -1):
+            row = values[i] + [""] * (len(headers) - len(values[i]))
+            if not any(str(c).strip() for c in row):
+                continue
+            if user_name and str(row[col["user"]]).strip() != user_name:
+                continue
+            row_idx = i + 1
+            break
+        if row_idx is None:
+            return None
+
         bank_norm = new_bank.strip()
         source_norm = normalize_bank_source(bank_norm, "")
+        row = values[row_idx - 1] + [""] * (len(headers) - len(values[row_idx - 1]))
+        last_rec = dict(zip(headers, row))
 
-        ws.update_cell(last_row_idx, 7, bank_norm)
-        ws.update_cell(last_row_idx, 8, source_norm)
+        from services.banks import funds_type_for_source
+        from services.loan_rules import LOAN_SUBCATEGORY
+        funds = last_rec.get("funds_type", "")
+        if str(last_rec.get("type", "")).strip() == TYPE_EXPENSE and str(last_rec.get("subcategory", "")).strip() != LOAN_SUBCATEGORY:
+            # «Kaspi Red» нормализуется в источник «Основная карта», поэтому смотрим и на сам банк.
+            funds = funds_type_for_source(source_norm) or funds_type_for_source(bank_norm) or "Собственные"
 
-        last_rec = records[-1]
-        last_rec["bank"] = bank_norm
-        last_rec["source"] = source_norm
+        ws.batch_update([
+            {"range": gspread.utils.rowcol_to_a1(row_idx, col[name] + 1), "values": [[value]]}
+            for name, value in (("bank", bank_norm), ("source", source_norm), ("funds_type", funds))
+        ])
+        last_rec.update({"bank": bank_norm, "source": source_norm, "funds_type": funds})
         return last_rec
     except Exception as e:
         print(f"[Таблицы] Ошибка обновления банка: {e}")
@@ -376,7 +403,7 @@ def count_recent_category_purchases(user_name: str, category: str, days: int = 7
     if not user_name or not category:
         return 0
     count = 0
-    cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+    cutoff = datetime.datetime.now(ASTANA_TZ).replace(tzinfo=None) - datetime.timedelta(days=days)
     try:
         for t in get_last_200_transactions():
             if t.get("cat") != category:
@@ -856,7 +883,12 @@ def process_due_subscriptions(now: datetime.datetime) -> list:
                     name = str(r.get("name", "Подписка"))
                     bank = str(r.get("bank", "Не указан"))
 
+                    # Стабильный ID «подписка + месяц»: если отметка last_paid не записалась
+                    # (квота/сеть), повторный цикл не создаст вторую трату — append_transaction
+                    # пропускает уже существующий transaction_id.
+                    sub_key = str(r.get("id") or "").strip() or f"ROW{idx}"
                     append_transaction({
+                        "transaction_id": f"SUBPAY_{sub_key}_{now.strftime('%Y%m')}",
                         "type": "РАСХОД",
                         "amount": amt,
                         "currency": "KZT",
@@ -1080,7 +1112,11 @@ def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month
             ws.update_cell(idx, 7, "active")
             return {"id": r.get("id"), "name": clean_name, "amount": amt, "bank": bank or "Не указан", "day_of_month": day, "status": "active"}
     sub_id = f"SUB_{now.strftime('%Y%m%d_%H%M%S')}"
-    row = [sub_id, clean_name, amt, bank or "Не указан", day, "", "active", ""]
+    # День списания в этом месяце уже прошёл — считаем месяц закрытым (человек мог оплатить сам),
+    # иначе первый же цикл записал бы трату задним числом. Сегодняшний день ещё спишется.
+    last_day = calendar.monthrange(now.year, now.month)[1]
+    initial_last_paid = now.strftime("%Y-%m-%d") if now.day > min(day, last_day) else ""
+    row = [sub_id, clean_name, amt, bank or "Не указан", day, initial_last_paid, "active", ""]
     ws.append_row(row, table_range=_table_range(len(SUBSCRIPTION_HEADERS)), value_input_option="USER_ENTERED")
     return {"id": sub_id, "name": clean_name, "amount": amt, "bank": bank or "Не указан", "day_of_month": day, "status": "active"}
 
@@ -1378,7 +1414,7 @@ def add_price_tracking(payload: dict) -> Optional[dict]:
     вызывающий код (handlers/text_handler.py) сам решает, звать ли эту
     функцию, в зависимости от того, что вернул detect_marketplace()."""
     try:
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(ASTANA_TZ)
         ws = _get_or_create_price_tracking_sheet()
         price = parse_amount(payload.get("price", 0))
         # Тот же товар у того же человека уже отслеживается — не заводим вторую запись (раньше
@@ -1460,15 +1496,22 @@ def record_price_check_success(row_idx: int, price: float, image_url: str = "",
     try:
         ws = _get_or_create_price_tracking_sheet()
         col = {name: i + 1 for i, name in enumerate(PRICE_TRACKING_HEADERS)}
+        updates = {
+            "last_price": price,
+            "last_checked_at": datetime.datetime.now(ASTANA_TZ).strftime("%Y-%m-%d %H:%M:%S"),
+            "fail_count": 0,
+        }
         if notified_price is not None:
-            ws.update_cell(row_idx, col["notified_price"], notified_price)
+            updates["notified_price"] = notified_price
         if notified_at:
-            ws.update_cell(row_idx, col["notified_at"], notified_at)
-        ws.update_cell(row_idx, col["last_price"], price)
-        ws.update_cell(row_idx, col["last_checked_at"], datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
-        ws.update_cell(row_idx, col["fail_count"], 0)
+            updates["notified_at"] = notified_at
         if image_url:
-            ws.update_cell(row_idx, col["image_url"], image_url)
+            updates["image_url"] = image_url
+        # Одним запросом: сбой посреди записи не оставит позицию в «рваном» состоянии.
+        ws.batch_update([
+            {"range": gspread.utils.rowcol_to_a1(row_idx, col[name]), "values": [[value]]}
+            for name, value in updates.items()
+        ])
     except Exception as error:
         print(f"[Отслеживание цен] Ошибка записи успешной проверки {row_idx}: {error}")
 

@@ -431,7 +431,7 @@ async def _process_text_message(message: Message, text: str):
     if bank_match:
         target_bank = canonical_bank_name(bank_match.group(1))
         if target_bank:
-            updated_rec = await asyncio.to_thread(update_last_transaction_bank_and_source, target_bank)
+            updated_rec = await asyncio.to_thread(update_last_transaction_bank_and_source, target_bank, user_name)
             if updated_rec:
                 res = f"✅ Исправила в последней записи ({updated_rec.get('user_comment')}, {_format_currency(updated_rec.get('amount'))} KZT): банк изменён на **{updated_rec.get('bank')}** ({updated_rec.get('source')})."
             else:
