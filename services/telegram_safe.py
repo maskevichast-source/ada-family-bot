@@ -48,13 +48,16 @@ async def safe_answer(message, text: str, **kwargs):
     и с разбивкой на части, если сообщение длиннее лимита Telegram."""
     parts = list(chunks(text))
     result = None
-    for part in parts:
+    for i, part in enumerate(parts):
         text_to_send = _telegram_markdown(part)
+        kwargs_part = dict(kwargs)
+        if i < len(parts) - 1:
+            kwargs_part.pop("reply_markup", None)     # кнопки — только под последней частью длинного текста
         try:
-            result = await message.answer(text_to_send, **kwargs)
+            result = await message.answer(text_to_send, **kwargs_part)
         except TelegramBadRequest as error:
             if _looks_like_markdown_error(error):
-                kw = dict(kwargs)
+                kw = dict(kwargs_part)
                 kw.pop("parse_mode", None)
                 result = await message.answer(part, parse_mode=None, **kw)
             else:

@@ -282,6 +282,43 @@ def append_transaction(data: dict):
         raise
 
 
+@_serialized
+def delete_transactions_by_ids(transaction_ids) -> list[dict]:
+    """Удаляет из листа Transactions строки по transaction_id (кнопка «Отменить»).
+
+    Ищет по ID, а не по номеру строки: номера сдвигаются, когда в таблицу пишут
+    другие. Строки, на которые после записи разбили трату (<ID>_1, <ID>_2), тоже
+    считаются той же записью. Удаляет снизу вверх, чтобы номера не съезжали.
+    Возвращает копии удалённых строк (словари); пустой список — ничего не нашлось.
+    Ошибки Google пробрасывает наверх — вызывающий код не должен говорить «отменила»,
+    если не удалось."""
+    ids = [str(i).strip() for i in (transaction_ids or []) if str(i or "").strip()]
+    if not ids:
+        return []
+    ws = get_db().worksheet("Transactions")
+    values = ws.get_all_values()
+    if not values:
+        return []
+    headers = values[0]
+    try:
+        id_col = headers.index("transaction_id")
+    except ValueError:
+        id_col = 0
+
+    def _matches(row_id: str) -> bool:
+        return any(row_id == i or row_id.startswith(i + "_") for i in ids)
+
+    found = []
+    for row_number, row in enumerate(values[1:], start=2):
+        row_id = str(row[id_col]).strip() if len(row) > id_col else ""
+        if row_id and _matches(row_id):
+            padded = list(row) + [""] * (len(headers) - len(row))
+            found.append((row_number, dict(zip(headers, padded))))
+    for row_number, _ in sorted(found, key=lambda item: item[0], reverse=True):
+        _retry_write(ws.delete_rows, row_number)
+    return [record for _, record in found]
+
+
 def update_last_transaction_bank_and_source(new_bank: str) -> Optional[dict]:
     """Мгновенно обновляет банк и источник в последней записи таблицы."""
     try:

@@ -38,6 +38,7 @@ from services.limits_ai import generate_limits_from_history
 from services.weather import get_weather_forecast
 from services.telegram_safe import safe_answer
 from services.pending_receipts import has_pending, pop_pending, ack_pending
+from services import undo as undo_service
 from services.pending_clarifications import (
     set_clarification, get_clarification, pop_clarification,
 )
@@ -287,12 +288,13 @@ async def handle_category_clarification_callback(callback: types.CallbackQuery):
     await asyncio.to_thread(append_transaction, tx)
     report = _format_confirmation_report(tx, f"Категория выбрана: {chosen['label']}.")
     add_chat_message(chat_id, "Ада", report)
+    undo_kb = undo_service.build_keyboard([tx])
 
     try:
-        await callback.message.edit_text(report)
+        await callback.message.edit_text(report, reply_markup=undo_kb)
     except Exception:
         try:
-            await callback.message.edit_text(report, parse_mode=None)
+            await callback.message.edit_text(report, parse_mode=None, reply_markup=undo_kb)
         except Exception:
             pass
 
@@ -387,7 +389,7 @@ async def _process_text_message(message: Message, text: str):
             ack_pending(pending_key)
             rep = "\n".join(lines)
             add_chat_message(chat_id, "Ада", rep)
-            await safe_answer(message, rep)
+            await safe_answer(message, rep, reply_markup=undo_service.build_keyboard(transactions))
             return
 
     # 2. Перехват ответа на уточнение
@@ -417,7 +419,7 @@ async def _process_text_message(message: Message, text: str):
             await asyncio.to_thread(append_transaction, tx)
             report = _format_confirmation_report(tx, f"Поняла, это {matched_opt['label']}!")
             add_chat_message(chat_id, "Ада", report)
-            await safe_answer(message, report)
+            await safe_answer(message, report, reply_markup=undo_service.build_keyboard([tx]))
             return
 
     # ── ПРЯМОЙ ПЕРЕХВАТ 0: МГНОВЕННАЯ СМЕНА БАНКА ПОСЛЕДНЕЙ ТРАТЫ ──
@@ -868,7 +870,7 @@ async def _process_text_message(message: Message, text: str):
                 print(f"[Аномалия суммы] Пропущено: {anomaly_error}")
 
         add_chat_message(chat_id, "Ада", report)
-        await safe_answer(message, report)
+        await safe_answer(message, report, reply_markup=undo_service.build_keyboard([tx]))
         return
 
     # РАССРОЧКИ

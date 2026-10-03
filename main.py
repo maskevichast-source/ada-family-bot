@@ -43,6 +43,7 @@ from services.limits_ai import (
 from services import fx
 from services import backup as backup_module
 from services import loan_fix
+from services import undo as undo_service
 from services import sheets as sheets_module
 from services.timezone import now_astana
 from services.reminders import deliver_due
@@ -382,6 +383,12 @@ async def process_category_clarification(callback: types.CallbackQuery):
     await handle_category_clarification_callback(callback)
 
 
+@dp.callback_query(F.data.startswith("undo:"))
+async def process_undo(callback: types.CallbackQuery):
+    from handlers.undo_handler import handle_undo_callback
+    await handle_undo_callback(callback)
+
+
 @dp.message()
 async def handle_all_messages(message: types.Message):
     if message.photo or message.document:
@@ -681,7 +688,8 @@ async def sweep_pending_receipts():
                 try:
                     await safe_send_message(
                         bot, chat_id=chat_id,
-                        text=f"⏰ Автоматически сохранила {len(transactions)} чек(ов) без комментария."
+                        text=f"⏰ Автоматически сохранила {len(transactions)} чек(ов) без комментария.",
+                        reply_markup=undo_service.build_keyboard(transactions),
                     )
                 except Exception:
                     pass
@@ -705,7 +713,8 @@ async def sweep_clarifications():
                 try:
                     await safe_send_message(
                         bot, chat_id=chat_id,
-                        text=f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category')} (не дождалась ответа)"
+                        text=f"⏰ Автосохранение: {_format_currency(tx.get('amount', 0))} тг → {tx.get('category')} (не дождалась ответа)",
+                        reply_markup=undo_service.build_keyboard([tx]),
                     )
                 except Exception:
                     pass

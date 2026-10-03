@@ -14,6 +14,7 @@ from services.state import dialogue_key
 from services import state
 from services.memory import get_chat_history, add_chat_message
 from services import fx, goals
+from services import undo as undo_service
 from services.money import normalize_currency_code
 from config import get_authorized_user_name
 from services.categories import (
@@ -405,7 +406,7 @@ async def handle_media(message: Message):
         except Exception as anomaly_error:
             print(f"[Аномалия суммы] Пропущено: {anomaly_error}")
 
-        await safe_answer(message, report)
+        await safe_answer(message, report, reply_markup=undo_service.build_keyboard(validated_transactions))
         return
 
     # Проверяем транзакции с низкой уверенностью для обычных чеков без подписи
