@@ -43,6 +43,7 @@ from services.limits_ai import (
 from services import fx
 from services import backup as backup_module
 from services import loan_fix
+from services import data_fix
 from services import undo as undo_service
 from services import sheets as sheets_module
 from services.timezone import now_astana
@@ -171,6 +172,7 @@ async def cmd_help(message: types.Message):
         "/backup — сделать резервную копию таблицы сейчас\n"
         "/status — статус бота и баланс ИИ (только для Влада, приходит в личку)\n"
         "/fix_loans — привести погашения кредитов и рассрочек к «Кредиты и рассрочки»\n"
+        "/fix_data — почистить таблицу: рассрочка, источник карты, доходы, даты (сначала покажет)\n"
         "/debug — диагностика таблицы\n\n"
         "💡 Примеры сообщений:\n"
         "• 'Купил колу за 500 тг'\n"
@@ -352,6 +354,42 @@ async def cmd_fix_loans(message: types.Message, command: CommandObject = None):
             text = loan_fix.preview_text(await asyncio.to_thread(loan_fix.find_changes))
     except Exception as e:
         print(f"[Кредиты] /fix_loans: {e}")
+        text = "Не получилось выполнить команду. Ничего не изменено."
+    await safe_answer(message, text)
+
+
+@dp.message(Command("fix_data"))
+async def cmd_fix_data(message: types.Message, command: CommandObject = None):
+    """/fix_data — показать, /fix_data да — применить, /fix_data откат — вернуть,
+    /fix_data удалить <ID> — удалить одну запись по точному ID."""
+    raw_arg = ((command.args if command else "") or "").strip()
+    arg = raw_arg.lower()
+    try:
+        if arg in ("откат", "undo"):
+            text = await asyncio.to_thread(data_fix.undo_last)
+        elif arg in ("да", "yes", "применить") or arg.startswith(("удалить ", "delete ")):
+            note = ""
+            if backup_module.backup_folder_id():
+                result = await asyncio.to_thread(backup_module.make_backup, datetime.datetime.now(ASTANA_TZ))
+                if not result.get("ok"):
+                    await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
+                                               f"({result.get('reason')}). Ничего не изменено.")
+                    return
+                note = " Резервная копия таблицы сделана."
+            if arg.startswith(("удалить ", "delete ")):
+                text = await asyncio.to_thread(data_fix.delete_one, raw_arg.split(None, 1)[1]) + note
+            else:
+                found = await asyncio.to_thread(data_fix.find_changes)
+                done = await asyncio.to_thread(data_fix.apply_changes, found)
+                if not (done["fields"] or done["dates"]):
+                    text = data_fix.preview_text(found)
+                else:
+                    text = (f"Исправила: записей — {done['fields']}, дат — {done['dates']}.{note} "
+                            f"Вернуть как было: /fix_data откат.")
+        else:
+            text = data_fix.preview_text(await asyncio.to_thread(data_fix.find_changes))
+    except Exception as e:
+        print(f"[fix_data] {e}")
         text = "Не получилось выполнить команду. Ничего не изменено."
     await safe_answer(message, text)
 

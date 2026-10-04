@@ -256,6 +256,11 @@ def append_transaction(data: dict):
         data["funds_type"] = installment
     if not data.get("resource"):
         data["resource"] = "Карта"
+    if data["type"] == TYPE_INCOME:
+        # Нужность (Need/Want) — только про расходы; у дохода подкатегория = категория дохода.
+        data["necessity"] = ""
+        if not str(data.get("subcategory") or "").strip():
+            data["subcategory"] = data.get("category", "")
 
     columns = [
         "transaction_id", "date", "user", "type", "amount", "currency", 
@@ -276,10 +281,25 @@ def append_transaction(data: dict):
             existing = _get_all_records_safe(ws)
             if any(str(r.get("transaction_id")) == str(data["transaction_id"]) for r in existing):
                 return
-        _retry_write(ws.append_row, row, table_range=_table_range(len(columns)))
+        result = _retry_write(ws.append_row, row, table_range=_table_range(len(columns)))
+        _store_date_as_datetime(ws, result, data["date"])
     except Exception as e:
         print(f"[Транзакции] Не удалось добавить запись: {e}")
         raise
+
+
+def _store_date_as_datetime(ws, append_result, date_text: str) -> None:
+    """append_row пишет всё как текст (RAW) — безопасно для комментариев вида «=…», но дата
+    становится строкой. Переписываем только ячейку даты как настоящую дату-время. Если не вышло,
+    запись уже сохранена: остаётся текст, его приведёт в порядок /fix_data."""
+    try:
+        updated_range = str(((append_result or {}).get("updates") or {}).get("updatedRange") or "")
+        match = re.search(r"[A-Za-z]+(\d+):", updated_range)
+        if not match:
+            return
+        ws.update(values=[[date_text]], range_name=f"B{match.group(1)}", value_input_option="USER_ENTERED")
+    except Exception as e:
+        print(f"[Транзакции] Дата записана текстом (не критично): {e}")
 
 
 @_serialized
@@ -935,6 +955,38 @@ def split_last_transaction(user: str, target_amount, parts: list) -> dict:
             "parts": [{k: v for k, v in r.items() if k != "subcategory"} for r in resolved]}
 
 
+_TELECOM_WORDS = ("tele2", "теле2", "beeline", "билайн", "altel", "алтел", "activ", "актив", "kcell", "кселл",
+                  "интернет", "связь", "казахтелеком", "мобильн")
+
+
+def _subscription_subcategory(name: str) -> str:
+    low = str(name or "").lower()
+    if any(w in low for w in _TELECOM_WORDS):
+        return "Мобильная связь и интернет"
+    return "Цифровые подписки и сервисы"
+
+
+def _subscription_already_recorded(name: str, amount: float, month_prefix: str) -> bool:
+    """Есть ли в Transactions за этот месяц расход на ту же сумму с таким названием."""
+    try:
+        records = _get_all_records_safe(get_db().worksheet("Transactions"))
+    except Exception as e:
+        print(f"[Подписки] Не смогла проверить дубль: {e}")
+        return False
+    needle = str(name or "").strip().lower()
+    if not needle:
+        return False
+    for rec in records:
+        if not str(rec.get("date", "")).startswith(month_prefix) or is_income_type(rec.get("type")):
+            continue
+        if abs(parse_amount(rec.get("amount", 0)) - float(amount or 0)) > 0.5:
+            continue
+        text = f'{rec.get("merchant", "")} {rec.get("user_comment", "")}'.lower()
+        if needle in text:
+            return True
+    return False
+
+
 def process_due_subscriptions(now: datetime.datetime) -> list:
     due_processed = []
     try:
@@ -961,16 +1013,22 @@ def process_due_subscriptions(now: datetime.datetime) -> list:
                     name = str(r.get("name", "Подписка"))
                     bank = str(r.get("bank", "Не указан"))
 
+                    # Уже записали эту оплату вручную в этом месяце — второй раз не пишем.
+                    if _subscription_already_recorded(name, amt, current_month_prefix):
+                        ws.update_cell(idx, 6, today_str)
+                        continue
+
+                    from services.banks import KNOWN_SOURCES_BY_BANK
                     append_transaction({
                         "type": "РАСХОД",
                         "amount": amt,
                         "currency": "KZT",
                         "bank": bank,
-                        "source": "Основная карта",
+                        "source": KNOWN_SOURCES_BY_BANK.get(bank.strip().lower(), "Основная карта"),
                         "funds_type": "Собственные",
                         "resource": "Карта",
                         "category": "Связь и подписки",
-                        "subcategory": "Цифровые подписки и сервисы",
+                        "subcategory": _subscription_subcategory(name),
                         "merchant": name,
                         "necessity": "Want",
                         "user_comment": f"Автосписание: {name}",
