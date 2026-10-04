@@ -386,6 +386,10 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
             }
         response = await client.chat.completions.create(**create_kwargs)
         result = _clean_json_content(response.choices[0].message.content)
+        if isinstance(result, dict):
+            # Тот же контекст (200 операций, 50 сообщений, лимиты…) нужен «голосу» Ады
+            # для живого ответа в разговоре — см. services/ada_voice.chat_reply.
+            result["_ctx"] = system_sections[1:]
 
         ambig_options = get_ambiguous_options(text_to_parse)
         if ambig_options:

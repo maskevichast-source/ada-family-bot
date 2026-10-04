@@ -127,6 +127,7 @@ def test_link_ozon_track_request_is_honest_about_limitation(handler, db, monkeyp
 
 def test_anomaly_reflection_failure_does_not_break_normal_transaction_reply(handler, db, monkeypatch):
     import handlers.text_handler as th
+    monkeypatch.setenv("ADA_VOICE", "off")      # проверяем прежний путь (живой голос — в test_ada_voice.py)
     model(monkeypatch, handler, {
         "intent": "transaction", "reply": "Записала.",
         "transaction": {"amount": 99999, "category": "Кафе, рестораны и доставка еды",

@@ -38,6 +38,7 @@ from services.limits_ai import generate_limits_from_history
 from services.weather import get_weather_forecast
 from services.telegram_safe import safe_answer
 from services.pending_receipts import has_pending, pop_pending, ack_pending
+from services import ada_voice
 from services import undo as undo_service
 from handlers.edit_buttons import handle_edit_input
 from services.pending_clarifications import (
@@ -639,6 +640,7 @@ async def _process_text_message(message: Message, text: str):
         **pending_receipt_kwarg,
     )
 
+    voice_ctx = parsed.pop("_ctx", None)   # контекст разбора — для живого ответа в разговоре
     intent = parsed.get("intent", "chat")
     reply = parsed.get("reply", "")
 
@@ -852,28 +854,37 @@ async def _process_text_message(message: Message, text: str):
 
         amount = parse_amount(tx.get("amount", 0))
         duplicate = await asyncio.to_thread(find_recent_duplicate_transaction, amount, text)
+        dup_warning = ""
         if duplicate:
             dup_warning = f"⚠️ _Записала, но похоже на недавний дубль ({_format_currency(amount)} тг в {str(duplicate.get('date', ''))[-8:]})._"
-            reply = f"{reply}\n\n{dup_warning}" if reply else dup_warning
+            if not ada_voice.enabled():
+                reply = f"{reply}\n\n{dup_warning}" if reply else dup_warning
 
         try:
             await asyncio.to_thread(append_transaction, tx)
         except Exception:
             await safe_answer(message, "Не смогла записать трату в таблицу. Не буду делать вид, что записала — проверь Google Sheets.")
             return
-        report = _format_confirmation_report(tx, reply)
 
-        # Та же опциональная живая реплика на аномально крупную покупку,
-        # что и на фото-пути в media_handler.py (см. detect_amount_anomaly).
-        if tx_type == TYPE_EXPENSE:
-            try:
-                fact = detect_amount_anomaly(tx.get("user"), tx.get("category"), amount)
-                if fact:
-                    reflection = await generate_budget_reflection("anomaly", fact)
-                    if reflection:
-                        report += f"\n\n{reflection}"
-            except Exception as anomaly_error:
-                print(f"[Аномалия суммы] Пропущено: {anomaly_error}")
+        if ada_voice.enabled():
+            # Живая реплика — только когда у кода есть повод (см. services/ada_voice.py);
+            # нет повода — под записью тишина, а не дежурная фраза.
+            voice = await ada_voice.comment_for_transaction(tx, user_name, history, limits, chat_history)
+            report = _format_confirmation_report(tx, voice)
+            if dup_warning:
+                report += f"\n\n{dup_warning}"
+        else:
+            report = _format_confirmation_report(tx, reply)
+            # Прежний режим: реплика только на аномально крупную покупку.
+            if tx_type == TYPE_EXPENSE:
+                try:
+                    fact = detect_amount_anomaly(tx.get("user"), tx.get("category"), amount)
+                    if fact:
+                        reflection = await generate_budget_reflection("anomaly", fact)
+                        if reflection:
+                            report += f"\n\n{reflection}"
+                except Exception as anomaly_error:
+                    print(f"[Аномалия суммы] Пропущено: {anomaly_error}")
 
         add_chat_message(chat_id, "Ада", report)
         await safe_answer(message, report, reply_markup=undo_service.build_keyboard([tx]))
@@ -1149,7 +1160,7 @@ async def _process_text_message(message: Message, text: str):
         await safe_answer(message, res)
         return
 
-    # ОБЫЧНЫЙ ЧАТ
-    res = reply or "Чем могу помочь?"
+    # ОБЫЧНЫЙ ЧАТ — живой ответ «голосом» Ады с полным контекстом (если выключен — ответ разбора)
+    res = await ada_voice.chat_reply(user_name, text, voice_ctx, fallback=reply) or "Чем могу помочь?"
     add_chat_message(chat_id, "Ада", res)
     await safe_answer(message, res)

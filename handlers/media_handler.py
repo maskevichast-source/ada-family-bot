@@ -6,7 +6,7 @@ from aiogram.types import Message
 from services.vision import parse_receipt
 from services.sheets import (
     append_transaction, normalize_necessity, get_last_200_transactions, find_duplicate_receipt,
-    add_trip_plan, get_planned_trips, add_or_update_subscription,
+    add_trip_plan, get_planned_trips, add_or_update_subscription, get_category_limits,
 )
 from services.telegram_safe import safe_answer
 from services.pending_receipts import set_pending, ack_pending
@@ -14,6 +14,7 @@ from services.state import dialogue_key
 from services import state
 from services.memory import get_chat_history, add_chat_message
 from services import fx, goals
+from services import ada_voice
 from services import undo as undo_service
 from services.money import normalize_currency_code
 from config import get_authorized_user_name
@@ -396,15 +397,26 @@ async def handle_media(message: Message):
         # сравнить (см. min_history в detect_amount_anomaly) и разница
         # заметная.
         try:
-            for tx in validated_transactions:
-                fact = detect_amount_anomaly(tx.get("user") or user_name, tx.get("category"), tx.get("amount"))
-                if fact:
-                    reflection = await generate_budget_reflection("anomaly", fact)
-                    if reflection:
-                        report += f"\n\n{reflection}"
-                    break  # одной реплики на чек достаточно, даже если позиций несколько
+            if ada_voice.enabled():
+                # Живая реплика по поводу (повод считает код, см. services/ada_voice.py).
+                # История читается уже после записи, поэтому только что записанные строки отбрасываем.
+                history = await asyncio.to_thread(get_last_200_transactions)
+                history = history[:-len(validated_transactions)] if history else history
+                limits = await asyncio.to_thread(get_category_limits)
+                voice = await ada_voice.comment_for_transactions(
+                    validated_transactions, user_name, history, limits, get_chat_history(chat_id))
+                if voice:
+                    report += f"\n\n💬 {voice}"
+            else:
+                for tx in validated_transactions:
+                    fact = detect_amount_anomaly(tx.get("user") or user_name, tx.get("category"), tx.get("amount"))
+                    if fact:
+                        reflection = await generate_budget_reflection("anomaly", fact)
+                        if reflection:
+                            report += f"\n\n{reflection}"
+                        break  # одной реплики на чек достаточно, даже если позиций несколько
         except Exception as anomaly_error:
-            print(f"[Аномалия суммы] Пропущено: {anomaly_error}")
+            print(f"[Голос/аномалия] Пропущено: {anomaly_error}")
 
         await safe_answer(message, report, reply_markup=undo_service.build_keyboard(validated_transactions))
         return
