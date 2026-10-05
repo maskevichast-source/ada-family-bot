@@ -546,13 +546,20 @@ def _request_openweathermap_forecast(lat: float, lon: float, api_key: str) -> di
         return json.loads(response.read().decode("utf-8"))
 
 
+def _owm_local_dt(dt_txt) -> datetime.datetime:
+    """dt_txt у OpenWeatherMap — всегда UTC; переводим в астанинское время (naive),
+    иначе блок «18:00» оказывался бы 23:00 по Астане."""
+    utc = datetime.datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S").replace(tzinfo=datetime.timezone.utc)
+    return utc.astimezone(ASTANA_TZ).replace(tzinfo=None)
+
+
 def _nearest_owm_block(blocks: list, target_dt: datetime.datetime) -> dict | None:
     best = None
     best_diff = None
     for block in blocks:
         dt_txt = block.get("dt_txt")
         try:
-            block_dt = datetime.datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S")
+            block_dt = _owm_local_dt(dt_txt)
         except (TypeError, ValueError):
             continue
         diff = abs((block_dt - target_dt).total_seconds())
@@ -581,7 +588,7 @@ def format_owm_forecast(
         for block in blocks:
             dt_txt = block.get("dt_txt")
             try:
-                block_dt = datetime.datetime.strptime(dt_txt, "%Y-%m-%d %H:%M:%S")
+                block_dt = _owm_local_dt(dt_txt)
             except (TypeError, ValueError):
                 continue
             by_day.setdefault(block_dt.date(), []).append(block)

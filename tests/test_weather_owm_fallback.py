@@ -72,7 +72,9 @@ def test_owm_fallback_week_groups_by_day():
     for day_offset in range(3):
         d = base + datetime.timedelta(days=day_offset)
         for h in (0, 3, 6, 9, 12, 15, 18, 21):
-            blocks.append(_owm_block(f"{d.isoformat()} {h:02d}:00:00", temp=10 + day_offset, owm_id=800))
+            # у OWM dt_txt — UTC; строим блоки так, чтобы по Астане (UTC+5) они легли ровно в 3 дня
+            utc = datetime.datetime.combine(d, datetime.time(h, 0)) - datetime.timedelta(hours=5)
+            blocks.append(_owm_block(utc.strftime("%Y-%m-%d %H:%M:%S"), temp=10 + day_offset, owm_id=800))
     text = format_owm_forecast(_owm_current(), _owm_forecast(blocks), "week", NOW, days=7)
     assert "резервный источник" in text
     assert text.count("•") == 3

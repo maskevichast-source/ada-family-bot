@@ -55,3 +55,9 @@ def test_excel_export_text_starting_with_equals_stays_text(monkeypatch):
     ws = openpyxl.load_workbook(io.BytesIO(data))["Выписка"]
     assert ws.cell(row=2, column=13).data_type == "s"
     assert ws.cell(row=2, column=15).data_type == "s"
+
+
+def test_owm_blocks_are_converted_from_utc_to_astana():
+    from services.weather import _owm_local_dt
+    import datetime
+    assert _owm_local_dt("2026-10-05 15:00:00") == datetime.datetime(2026, 10, 5, 20, 0)
