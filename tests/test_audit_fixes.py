@@ -32,3 +32,14 @@ def test_chart_now_is_astana_not_server_utc():
     from services.timezone import now_astana
     delta = abs((charts._now() - now_astana().replace(tzinfo=None)).total_seconds())
     assert delta < 5
+
+
+def test_monthly_reminder_catches_up_after_long_downtime():
+    import datetime as dt
+    from services.reminders import next_occurrence
+    prev = dt.datetime(2026, 1, 31, 9, 0)
+    now = dt.datetime(2026, 5, 10, 12, 0)
+    nxt = next_occurrence(prev, "monthly", now, anchor_day=31)
+    assert nxt == dt.datetime(2026, 5, 31, 9, 0)
+    # без простоя — следующий месяц, с укорочением до последнего дня
+    assert next_occurrence(prev, "monthly", prev, anchor_day=31) == dt.datetime(2026, 2, 28, 9, 0)

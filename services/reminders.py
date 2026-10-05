@@ -144,7 +144,14 @@ def next_occurrence(prev_dt, recurrence, now=None, anchor_day=None):
             month = 1
             year += 1
         last_day = calendar.monthrange(year, month)[1]
-        return prev_dt.replace(year=year, month=month, day=min(day, last_day))
+        candidate = prev_dt.replace(year=year, month=month, day=min(day, last_day))
+        # бот долго был выключен — не шлём по одному напоминанию за каждый пропущенный месяц
+        while candidate <= now:
+            year, month = candidate.year, candidate.month + 1
+            if month > 12:
+                year, month = year + 1, 1
+            candidate = candidate.replace(year=year, month=month, day=min(day, calendar.monthrange(year, month)[1]))
+        return candidate
 
     return None
 
@@ -520,7 +527,7 @@ async def handle_model(message, parsed, author):
     saved_list = []
     for t_str in times:
         try:
-            saved = await asyncio.to_thread(add, target_raw, t_str, text, rec, author)
+            saved = await asyncio.to_thread(add, target_raw, t_str, text, rec, author, None, until)
             saved_list.append(saved)
         except Exception as e:
             logging.error(f"[Add Reminder Model Error]: {e}")
