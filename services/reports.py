@@ -14,7 +14,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 from services.sheets import get_transactions_for_period, get_category_limits
-from services.categories import TYPE_EXPENSE, TYPE_INCOME
+from services.categories import TYPE_EXPENSE, TYPE_INCOME, is_income_type
 from services.timezone import now_astana
 from services.money import parse_amount
 from services.analytics import analyze_budget_leaks
@@ -50,6 +50,10 @@ def _wrap_pdf(text: str, width: int = 80) -> str:
     return "\n".join(out_lines)
 
 
+_MONTHS_RU = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август",
+              "сентябрь", "октябрь", "ноябрь", "декабрь"]
+
+
 def _format_currency(value):
     try:
         return f"{float(value):,.0f}".replace(",", " ")
@@ -71,10 +75,10 @@ def generate_pdf_report(year: int = None, month: int = None) -> bytes:
         end_date = datetime.date(y, m + 1, 1).strftime("%Y-%m-%d")
 
     transactions = get_transactions_for_period(start_date, end_date)
-    month_name = datetime.date(y, m, 1).strftime("%B %Y").capitalize()
+    month_name = f"{_MONTHS_RU[m - 1]} {y}".capitalize()      # strftime("%B") зависит от локали сервера (английский)
 
-    expenses = [t for t in transactions if str(t.get("type", "")).strip() != TYPE_INCOME]
-    incomes = [t for t in transactions if str(t.get("type", "")).strip() == TYPE_INCOME]
+    expenses = [t for t in transactions if not is_income_type(t.get("type"))]
+    incomes = [t for t in transactions if is_income_type(t.get("type"))]
 
     total_exp = sum(parse_amount(t.get("amt", 0)) for t in expenses)
     total_inc = sum(parse_amount(t.get("amt", 0)) for t in incomes)
@@ -229,15 +233,12 @@ def generate_excel_export(year: int = None, month: int = None) -> bytes:
             str(t.get("comm", "")),
             str(t.get("ai_comm", "")),
         ])
-        if merchant_val.startswith("="):
-            # Название продавца — это ДАННЫЕ, а не формула, даже если
-            # начинается с "=" (например, кто-то назвал товар с таким
-            # символом). Без этого Excel попытается это вычислить.
-            # ВАЖНО: сначала meняем data_type, потом НЕ трогаем .value —
-            # повторное присвоение .value заново запускает автоопределение
-            # типа и откатывает обратно на "формулу".
-            cell = ws1.cell(row=row_idx, column=13)
-            cell.data_type = "s"
+        # Текстовые поля — ДАННЫЕ, а не формулы, даже если начинаются с "=" (Excel иначе
+        # попытается их вычислить). Сначала data_type, потом .value не трогаем — повторное
+        # присвоение заново запускает автоопределение типа и откатывает на «формулу».
+        for cell in ws1[row_idx]:
+            if isinstance(cell.value, str) and cell.value.startswith("="):
+                cell.data_type = "s"
 
     # Автоподбор ширины столбцов
     for col in ws1.columns:

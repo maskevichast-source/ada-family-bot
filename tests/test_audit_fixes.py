@@ -43,3 +43,15 @@ def test_monthly_reminder_catches_up_after_long_downtime():
     assert nxt == dt.datetime(2026, 5, 31, 9, 0)
     # без простоя — следующий месяц, с укорочением до последнего дня
     assert next_occurrence(prev, "monthly", prev, anchor_day=31) == dt.datetime(2026, 2, 28, 9, 0)
+
+
+def test_excel_export_text_starting_with_equals_stays_text(monkeypatch):
+    import io, openpyxl
+    from services import reports
+    tx = [{"transaction_id": "T1", "date": "2026-10-01 10:00:00", "user": "Влад", "type": "Расход",
+           "amt": 100, "merchant": "=1+1", "comm": "=SUM(A1)", "cat": "Еда и продукты"}]
+    monkeypatch.setattr(reports, "get_transactions_for_period", lambda a, b: tx)
+    data = reports.generate_excel_export(2026, 10)
+    ws = openpyxl.load_workbook(io.BytesIO(data))["Выписка"]
+    assert ws.cell(row=2, column=13).data_type == "s"
+    assert ws.cell(row=2, column=15).data_type == "s"
