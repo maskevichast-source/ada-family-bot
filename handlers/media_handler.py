@@ -179,23 +179,28 @@ async def handle_media(message: Message):
     pending_key = dialogue_key(chat_id, message.from_user.id)
     caption = message.caption or ""
 
-    if message.photo:
-        photo = message.photo[-1]
-        file = await message.bot.get_file(photo.file_id)
-        file_bytes = await message.bot.download_file(file.file_path)
-        file_bytes = file_bytes.read()
-        filename = f"{photo.file_id}.jpg"
-    elif message.document:
-        doc = message.document
-        file = await message.bot.get_file(doc.file_id)
-        file_bytes = await message.bot.download_file(file.file_path)
-        file_bytes = file_bytes.read()
-        filename = doc.file_name or f"{doc.file_id}.pdf"
-    else:
-        await safe_answer(message, "Не распознала формат файла. Пришли фото или PDF.")
+    try:
+        if message.photo:
+            photo = message.photo[-1]
+            file = await message.bot.get_file(photo.file_id)
+            file_bytes = (await message.bot.download_file(file.file_path)).read()
+            filename = f"{photo.file_id}.jpg"
+        elif message.document:
+            doc = message.document
+            file = await message.bot.get_file(doc.file_id)
+            file_bytes = (await message.bot.download_file(file.file_path)).read()
+            filename = doc.file_name or f"{doc.file_id}.pdf"
+        else:
+            await safe_answer(message, "Не распознала формат файла. Пришли фото или PDF.")
+            return
+    except Exception as error:
+        # слишком большой файл (лимит Telegram 20 МБ) или сбой сети — раньше бот молчал
+        print(f"[Медиа] Не удалось скачать файл: {error}")
+        await safe_answer(message, "Не смогла скачать файл (возможно, он больше 20 МБ или пропала сеть). Пришли ещё раз или сожми фото.")
         return
 
-    result = await parse_receipt(file_bytes, filename, caption, user_name, _build_recent_context(chat_id, user_name, caption))
+    recent_ctx = await asyncio.to_thread(_build_recent_context, chat_id, user_name, caption)
+    result = await parse_receipt(file_bytes, filename, caption, user_name, recent_ctx)
 
     # Долг (занял/одолжил/вернул), а не обычная покупка — определяется по
     # подписи к фото (например "занял Ануару, перевёл на халык"). Фото/чек
