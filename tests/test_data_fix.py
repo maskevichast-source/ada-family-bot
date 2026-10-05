@@ -138,3 +138,26 @@ def test_subscription_charge_uses_real_source_and_subcategory(db):
     row = dict(zip(TRANSACTION_HEADERS, db.sheets["Transactions"].data[-1]))
     assert due == ["Tele2"]
     assert row["source"] == "Kaspi Gold" and row["subcategory"] == "Мобильная связь и интернет"
+
+
+def test_obvious_category_errors_only(db, monkeypatch):
+    ws = db.sheets["Transactions"]
+    for r in (
+        _row("S1", category="Кафе, рестораны и доставка еды", subcategory="Кафе и рестораны", user_comment="стики", merchant="LOVEKA SHOP"),
+        _row("S2", category="Еда и продукты", user_comment="Стики 1210 тенге, остальное молоко"),          # смесь — не трогаем
+        _row("S3", category="Алкоголь, табак и энергетики", subcategory="Сигареты и стики", user_comment="стики"),
+        _row("P1", category="Развлечения и хобби", subcategory="Игры и хобби", merchant="ZOO OCEANICA ASTANA", user_comment="корм для Кайла"),
+        _row("P2", category="Питомцы", subcategory="Корм и лакомства", merchant="ZOO OCEANICA ASTANA", user_comment="корм"),
+        _row("P3", category="Дом и быт", merchant="IKEA", user_comment="корм"),                              # не зоомагазин
+    ):
+        ws.append_row(r)
+    monkeypatch.setattr(data_fix, "raw_date_cells", lambda w: ["date"] + [46000.5] * (len(ws.data) - 1))
+    found = data_fix.find_changes()
+    assert {f["id"] for f in found["fields"]} == {"S1", "P1"}
+    data_fix.apply_changes(found)
+    by = {r[0]: dict(zip(TRANSACTION_HEADERS, r)) for r in ws.data[1:]}
+    assert by["S1"]["category"] == "Алкоголь, табак и энергетики" and by["S1"]["subcategory"] == "Сигареты и стики"
+    assert by["P1"]["category"] == "Питомцы" and by["S2"]["category"] == "Еда и продукты"
+    data_fix.undo_last()
+    by = {r[0]: dict(zip(TRANSACTION_HEADERS, r)) for r in ws.data[1:]}
+    assert by["S1"]["category"] == "Кафе, рестораны и доставка еды" and by["P1"]["subcategory"] == "Игры и хобби"

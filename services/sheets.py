@@ -14,7 +14,7 @@ from config import GOOGLE_SHEETS_KEY, CREDENTIALS_FILE, normalize_family_user_na
 from services.categories import TYPE_EXPENSE, TYPE_INCOME, is_income_type, SUBCATEGORIES_MAP, DEFAULT_EXPENSE_LIMITS
 from services.money import parse_amount, to_clean_number, normalize_currency_code
 from services.banks import normalize_bank_source
-from services.timezone import parse_flexible_datetime, ASTANA_TZ
+from services.timezone import parse_flexible_datetime, ASTANA_TZ, now_astana
 
 scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
@@ -501,7 +501,7 @@ def count_recent_category_purchases(user_name: str, category: str, days: int = 7
     if not user_name or not category:
         return 0
     count = 0
-    cutoff = datetime.datetime.now() - datetime.timedelta(days=days)
+    cutoff = now_astana().replace(tzinfo=None) - datetime.timedelta(days=days)
     try:
         for t in get_last_200_transactions():
             if t.get("cat") != category:

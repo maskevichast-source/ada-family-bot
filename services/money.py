@@ -9,6 +9,8 @@ _MULTIPLIERS = [
     (re.compile(r'(-?\d[\d\s.,]*\d|-?\d)\s*(?:млн\.?|миллион[а-я]*)\b', re.IGNORECASE), 1_000_000),
 ]
 
+_K_SUFFIX_RE = re.compile(r'(-?\d[\d.,]*\d|-?\d)[кКkK](?![\w])')
+
 _NUMBER_RE = re.compile(r'-?\d[\d\s.,]*\d|-?\d')
 
 
@@ -18,7 +20,7 @@ def _parse_number_token(token: str) -> float:
     if not token:
         return 0.0
     neg = token.startswith('-')
-    token = token.lstrip('-').strip().replace(' ', '')
+    token = re.sub(r'\s+', '', token.lstrip('-'))
     if not token:
         return 0.0
 
@@ -76,6 +78,12 @@ def parse_amount(raw) -> float:
         m = pattern.search(text)
         if m:
             return _parse_number_token(m.group(1)) * mult
+
+    # «1,5к» / «300к» / «2k» — тысяча сокращением, слитно с числом (с пробелом не считаем:
+    # «5 к вечеру» — это не 5000).
+    m = _K_SUFFIX_RE.search(text)
+    if m:
+        return _parse_number_token(m.group(1)) * 1000
 
     m = _NUMBER_RE.search(text)
     if not m:

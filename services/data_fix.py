@@ -10,7 +10,9 @@
      (платёж банку по кредиту не трогаем).
   2. Источник «Основная карта» у записи с известным банком → «BCC Pay», «Kaspi Gold» и т.п.
   3. Доходы: нужность (Need/Want) очищается, пустая подкатегория = категория дохода.
-  4. Даты, записанные текстом, → настоящая дата-время (и формат колонки).
+  4. Очевидные ошибки категории: запись, где в комментарии ТОЛЬКО «стики»/«сигареты»/«пачка сигарет»
+     (а категория другая), и корм/наполнитель в зоомагазине вне «Питомцев».
+  5. Даты, записанные текстом, → настоящая дата-время (и формат колонки).
 Дубли только показываются, сами не удаляются.
 
 Строки находятся по transaction_id, не по номеру строки.
@@ -30,11 +32,17 @@ DATE_PATTERN = "yyyy-mm-dd hh:mm:ss"
 
 # какое поле → заголовок колонки
 FIELDS = ("funds_type", "source", "necessity", "subcategory")
+_SMOKE_ONLY = {"стики", "пачка стиков", "сигареты", "пачка сигарет", "пачка сиг", "стики для iqos", "стики iqos",
+               "сигарета", "пачка сигарет.", "стики."}
+_PET_STORE_RE = re.compile(r"zoo|зоо|petshop|pet shop|zootrade", re.IGNORECASE)
+_PET_ITEM_RE = re.compile(r"корм|наполнител|лоток|когтеточк|лакомств", re.IGNORECASE)
+HARMFUL_CAT = "Алкоголь, табак и энергетики"
 KIND_TITLES = {
     "funds": "карта рассрочки, но тип «Собственные» → «Рассрочка»",
     "source": "источник «Основная карта» → настоящая карта банка",
     "income": "доходы: чистка нужности и подкатегории",
     "date": "дата записана текстом → настоящая дата",
+    "category": "очевидная ошибка категории (только стики/сигареты и корм/наполнитель для питомца)",
 }
 
 
@@ -94,6 +102,17 @@ def find_changes() -> dict:
                 changes["subcategory"] = (cell(row, "category"), "")
                 if "income" not in kinds:
                     kinds.append("income")
+        category, comment = cell(row, "category"), cell(row, "user_comment")
+        if typ == "РАСХОД":
+            if comment.lower().strip(" .!\n") in _SMOKE_ONLY and category != HARMFUL_CAT:
+                changes["category"] = (HARMFUL_CAT, category)
+                changes["subcategory"] = ("Сигареты и стики", cell(row, "subcategory"))
+                kinds.append("category")
+            elif (_PET_STORE_RE.search(cell(row, "merchant")) and _PET_ITEM_RE.search(comment)
+                  and category != "Питомцы"):
+                changes["category"] = ("Питомцы", category)
+                changes["subcategory"] = ("Корм и лакомства", cell(row, "subcategory"))
+                kinds.append("category")
         if changes:
             fields.append({"id": tid, "row": row_number, "date": cell(row, "date")[:10],
                            "amount": parse_amount(cell(row, "amount")),
@@ -156,7 +175,7 @@ def preview_text(found: dict) -> str:
     for f in fields:
         for k in f["kinds"]:
             by_kind.setdefault(k, []).append(f)
-    for kind in ("funds", "source", "income"):
+    for kind in ("funds", "source", "income", "category"):
         items = by_kind.get(kind, [])
         if items:
             lines.append(f"\n• {KIND_TITLES[kind]}: {len(items)}")

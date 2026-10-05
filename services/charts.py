@@ -13,6 +13,12 @@ from services.categories import TYPE_EXPENSE, TYPE_INCOME
 from services.plot_lock import serialized_plot
 
 
+def _now() -> datetime:
+    """Текущее время Астаны без tzinfo: даты в таблице тоже по Астане, а сервер Railway живёт по UTC."""
+    from services.timezone import now_astana
+    return now_astana().replace(tzinfo=None)
+
+
 def _parse_date(date_str: str) -> datetime:
     try:
         return datetime.strptime(str(date_str), "%Y-%m-%d %H:%M:%S")
@@ -20,7 +26,7 @@ def _parse_date(date_str: str) -> datetime:
         try:
             return datetime.strptime(str(date_str)[:10], "%Y-%m-%d")
         except (ValueError, TypeError):
-            return datetime.now()
+            return _now()
 
 
 def _group_by_day(transactions: list) -> dict:
@@ -105,7 +111,7 @@ def _get_month_range(year: int, month: int) -> tuple[str, str]:
 
 @serialized_plot
 def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
-    now = datetime.now()
+    now = _now()
     year = year or now.year
     month = month or now.month
 
@@ -308,11 +314,14 @@ def generate_expense_chart(year: int = None, month: int = None) -> bytes | None:
 
 @serialized_plot
 def generate_trend_chart(months_back: int = 3) -> bytes | None:
-    now = datetime.now()
+    now = _now()
     monthly_data = defaultdict(float)
 
     for i in range(months_back, -1, -1):
-        dt = now - timedelta(days=i*30)
+        # шаг ровно по календарным месяцам: «минус 30 дней» на 29–31 числа пропускал месяц
+        y = now.year + (now.month - 1 - i) // 12
+        m = (now.month - 1 - i) % 12 + 1
+        dt = datetime(y, m, 1)
         start, end = _get_month_range(dt.year, dt.month)
         txs = get_transactions_for_period(start, end)
         expense = sum(
