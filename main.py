@@ -589,7 +589,10 @@ async def check_limit_warnings():
                         pct = amount_spent / limit
                         if pct < 0.85:
                             continue
-                        marker_key = f"limit_warning:{cat}:{month_key}"
+                        # отдельные маркеры для «почти выбран» и «превышен», иначе после
+                        # предупреждения на 85% о превышении лимита уже не сообщалось бы
+                        level = "over" if pct >= 1 else "near"
+                        marker_key = f"limit_warning:{cat}:{month_key}" + ("" if level == "near" else ":over")
                         if state.get("scheduler", marker_key):
                             continue
                         state.put("scheduler", marker_key, {"warned_at": now.isoformat(), "pct": pct})

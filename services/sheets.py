@@ -1541,7 +1541,7 @@ def add_price_tracking(payload: dict) -> Optional[dict]:
     вызывающий код (handlers/text_handler.py) сам решает, звать ли эту
     функцию, в зависимости от того, что вернул detect_marketplace()."""
     try:
-        now = datetime.datetime.now()
+        now = now_astana().replace(tzinfo=None)
         ws = _get_or_create_price_tracking_sheet()
         price = parse_amount(payload.get("price", 0))
         # Тот же товар у того же человека уже отслеживается — не заводим вторую запись (раньше
@@ -1628,7 +1628,7 @@ def record_price_check_success(row_idx: int, price: float, image_url: str = "",
         if notified_at:
             ws.update_cell(row_idx, col["notified_at"], notified_at)
         ws.update_cell(row_idx, col["last_price"], price)
-        ws.update_cell(row_idx, col["last_checked_at"], datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        ws.update_cell(row_idx, col["last_checked_at"], now_astana().strftime("%Y-%m-%d %H:%M:%S"))
         ws.update_cell(row_idx, col["fail_count"], 0)
         if image_url:
             ws.update_cell(row_idx, col["image_url"], image_url)
