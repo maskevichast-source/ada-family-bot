@@ -168,6 +168,12 @@ def _format_receipt_report(transactions: list[dict], ai_comment: str = "") -> st
             extras.append(f"чек от {when.strftime('%d.%m.%Y %H:%M')}")      # поздняя загрузка: показываем настоящую дату
         extra_str = f" · {', '.join(extras)}" if extras else ""
         lines.append(f"• {sign}{amt} {curr} | {bank} | {cat}{comm_str}{extra_str}")
+    if len(transactions) > 1:
+        try:
+            total = sum(float(t.get("amount") or 0) for t in transactions if not is_income_type(t.get("type")))
+            lines.append(f"Итого по чеку: {_format_currency(total)} KZT")
+        except (TypeError, ValueError):
+            pass
     if ai_comment:
         lines.append(f"\n💬 {ai_comment}")
     return "\n".join(lines)

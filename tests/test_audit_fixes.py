@@ -87,3 +87,39 @@ def test_vision_retries_once_on_empty_result(monkeypatch):
     result = asyncio.run(vision.parse_receipt(b"\xff\xd8\xff", "a.jpg", "", "Влад", ""))
     assert len(calls) == 2
     assert result["transactions"][0]["amount"] == 1280
+
+
+def _tx(amount, cat, sub="", summary=""):
+    return {"amount": amount, "category": cat, "subcategory": sub, "items_summary": summary, "confidence": 1.0}
+
+
+def test_receipt_split_kept_when_sum_matches_total():
+    from services.vision import normalize_receipt_split
+    r = {"receipt_total": 44340, "transactions": [
+        _tx(40592, "Еда и продукты"), _tx(1969, "Алкоголь, табак и энергетики"), _tx(1779, "Одежда и обувь")]}
+    assert normalize_receipt_split(r)["transactions"] == r["transactions"]
+
+
+def test_receipt_split_collapses_when_sum_differs():
+    from services.vision import normalize_receipt_split
+    r = {"receipt_total": 3919, "transactions": [
+        _tx(3221, "Дом и быт", summary="контейнер"), _tx(500, "Еда и продукты", summary="пряники")]}
+    out = normalize_receipt_split(r)["transactions"]
+    assert len(out) == 1 and out[0]["amount"] == 3919 and out[0]["category"] == "Дом и быт"
+    assert out[0]["confidence"] <= 0.8
+
+
+def test_duplicate_copy_of_same_receipt_collapses():
+    from services.vision import normalize_receipt_split
+    r = {"receipt_total": 12990, "transactions": [_tx(12990, "Красота и уход"), _tx(12990, "Красота и уход")]}
+    out = normalize_receipt_split(r)["transactions"]
+    assert len(out) == 1 and out[0]["amount"] == 12990
+
+
+def test_commission_and_no_total_are_left_alone():
+    from services.vision import normalize_receipt_split
+    r = {"receipt_total": 1000, "transactions": [_tx(1000, "Финансовые расходы и переводы"),
+                                                  _tx(10, "Финансовые расходы и переводы", "Банковские комиссии")]}
+    assert normalize_receipt_split(r) == r
+    r2 = {"transactions": [_tx(10, "Еда и продукты"), _tx(20, "Дом и быт")]}
+    assert normalize_receipt_split(r2) == r2

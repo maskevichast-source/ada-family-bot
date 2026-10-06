@@ -53,10 +53,12 @@ VISION_SYSTEM_PROMPT = f"""
       "alternatives": []
     }}
   ],
+  "receipt_total": 500,
   "trip_hint": null,
   "subscription_hint": null,
   "debt_hint": null
 }}
+"receipt_total" — ИТОГО, оплаченное по чеку (число, как напечатано в строке итога); null, если итога нет.
 
 TRIP_HINT (билет на самолёт/поезд/автобус МЕЖДУ ГОРОДАМИ/странами, бронь отеля) —
 заполняй "trip_hint" ТОЛЬКО для таких документов, НЕ для обычного разового проездного
@@ -135,6 +137,20 @@ necessity:
 - Если на документе нет даты — "occurred_at": null (код возьмёт время отправки).
 - Для скриншота перевода/платежа бери дату ОПЕРАЦИИ, а не дату выписки или время на часах телефона.
   Год бери с документа; если он не виден — null.
+
+РАЗБИВКА ЧЕКА ПО КАТЕГОРИЯМ (только для чеков магазина, где напечатаны позиции):
+- Если позиции относятся к РАЗНЫМ категориям (например, в одном чеке продукты, алкоголь и одежда) — верни
+  ОТДЕЛЬНУЮ транзакцию на каждую категорию: "amount" = сумма позиций этой категории (скидки относи к
+  своей позиции), "items_summary" — что именно в этой категории. Остальные поля (merchant, occurred_at,
+  bank, source, funds_type) одинаковые.
+- Сумма всех таких транзакций ДОЛЖНА ровно равняться "receipt_total". Проверь сложением; если не
+  сходится — не дроби, верни одну транзакцию на весь итог с главной категорией.
+- Не дроби на мелочи: группа дешевле 500 ₸ присоединяется к самой крупной группе (пакет за 20–70 ₸ —
+  это часть продуктов). Исключение: «Алкоголь, табак и энергетики» выделяй всегда, даже если сумма мала.
+- Не больше 5 транзакций на один чек. Если категория группы сомнительна — отнеси к главной.
+- Чек с одной категорией, скриншот платежа, перевод — одна транзакция, как раньше.
+- Если на фото один и тот же чек напечатан дважды (одинаковые номер, время и сумма) — это ОДНА покупка,
+  верни её один раз.
 
 ЧТО КУПЛЕНО ("items_summary"):
 - Если в чеке перечислены позиции — коротко напиши, что куплено, до 140 символов, по-русски, без
@@ -284,6 +300,47 @@ def _render_pdf_pages(pdf_path: Path, output_dir: Path, max_pages: int = MAX_PDF
         doc.close()
 
 
+MAX_SPLIT_TRANSACTIONS = 5
+_SPLIT_TOLERANCE = 1.0   # ₸: копейки и округление в чеке
+
+
+def normalize_receipt_split(result: dict) -> dict:
+    """Проверяет разбивку чека по категориям. Модель только раскладывает позиции — сходимость с итогом
+    проверяет код: если сумма частей не равна «receipt_total» (или частей слишком много, или одна и та
+    же покупка вернулась дважды), всё схлопывается в одну запись на полный итог с главной категорией.
+    Комиссии за перевод (отдельная запись «Банковские комиссии») в проверке не участвуют."""
+    from services.money import parse_amount
+    transactions = result.get("transactions") or []
+    main = [t for t in transactions if str(t.get("subcategory") or "") != "Банковские комиссии"]
+    if len(main) < 2:
+        return result
+    try:
+        total = float(parse_amount(result.get("receipt_total") or 0))
+    except (TypeError, ValueError):
+        total = 0.0
+    if total <= 0:
+        return result                      # итога нет — проверить нечем, оставляем как есть
+    amounts = [float(parse_amount(t.get("amount") or 0)) for t in main]
+    if abs(sum(amounts) - total) <= _SPLIT_TOLERANCE and len(main) <= MAX_SPLIT_TRANSACTIONS:
+        return result
+    print(f"[Распознавание] Разбивка не сходится с итогом ({sum(amounts):.2f} против {total:.2f}, "
+          f"частей {len(main)}) — записываю одной суммой")
+    biggest = main[max(range(len(main)), key=lambda i: amounts[i])]
+    merged = dict(biggest)
+    merged["amount"] = round(total, 2)
+    merged["confidence"] = min(float(biggest.get("confidence") or 1.0), 0.8)
+    summaries = []
+    for t in main:
+        text = str(t.get("items_summary") or "").strip()
+        if text and text not in summaries:
+            summaries.append(text)
+    merged["items_summary"] = "; ".join(summaries)[:160]
+    kept = [t for t in transactions if t not in main] + [merged]
+    result = dict(result)
+    result["transactions"] = kept
+    return result
+
+
 async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                         user_name: str = "Пользователь", recent_context: str = "") -> dict:
     if not file_bytes:
@@ -356,7 +413,7 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                             ]},
                         ],
                         response_format={"type": "json_object"},
-                        max_tokens=1300,
+                        max_tokens=2200,
                     )
 
                     choice = response.choices[0]
@@ -377,6 +434,7 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                     print(f"[Распознавание] Пустой результат (попытка {attempt}), ответ модели: "
                           f"{str(choice.message.content)[:300]!r}")
 
+                result = normalize_receipt_split(result)
                 transactions = result.get("transactions", [])
                 for tx in transactions:
                     user_comment = str(tx.get("user_comment", "") or caption)
