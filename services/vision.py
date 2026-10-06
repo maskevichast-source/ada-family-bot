@@ -344,32 +344,38 @@ async def parse_receipt(file_bytes: bytes, filename: str, caption: str = "",
                     + (f"НЕДАВНИЙ КОНТЕКСТ СЕМЬИ (последние сообщения/траты, самое новое внизу):\n{recent_context}\n" if recent_context else "")
                     + "Распознай чек/скриншот перевода и верни JSON."
                 )
-                response = await client.chat.completions.create(
-                    model="gpt-4o",
-                    messages=[
-                        {"role": "system", "content": VISION_SYSTEM_PROMPT},
-                        {"role": "user", "content": [{"type": "text", "text": prompt}] + [
-                            {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{enc}"}}
-                            for enc in encoded_images
-                        ]},
-                    ],
-                    response_format={"type": "json_object"},
-                    max_tokens=1300,
-                )
+                result = {}
+                for attempt in (1, 2):
+                    response = await client.chat.completions.create(
+                        model="gpt-4o",
+                        messages=[
+                            {"role": "system", "content": VISION_SYSTEM_PROMPT},
+                            {"role": "user", "content": [{"type": "text", "text": prompt}] + [
+                                {"type": "image_url", "image_url": {"url": f"data:{mime_type};base64,{enc}"}}
+                                for enc in encoded_images
+                            ]},
+                        ],
+                        response_format={"type": "json_object"},
+                        max_tokens=1300,
+                    )
 
-                choice = response.choices[0]
-                if getattr(choice, "finish_reason", None) == "length":
-                    # Ответ обрезан лимитом токенов — это значит, что модель
-                    # НЕ договорила JSON. Молча принять его — значит рискнуть
-                    # либо потерять часть покупок из длинного чека, либо
-                    # словить невалидный JSON. Явно просим прислать по частям.
-                    print("[Распознавание] Ответ Vision обрезан по finish_reason=length")
-                    return {
-                        "transactions": [],
-                        "reply": "Чек слишком длинный, ответ модели обрезался. Пришли, пожалуйста, частями (например, по фото на каждые несколько позиций).",
-                    }
+                    choice = response.choices[0]
+                    if getattr(choice, "finish_reason", None) == "length":
+                        # Ответ обрезан лимитом токенов — модель НЕ договорила JSON. Молча принять его —
+                        # значит потерять часть покупок или словить невалидный JSON. Просим прислать по частям.
+                        print("[Распознавание] Ответ Vision обрезан по finish_reason=length")
+                        return {
+                            "transactions": [],
+                            "reply": "Чек слишком длинный, ответ модели обрезался. Пришли, пожалуйста, частями (например, по фото на каждые несколько позиций).",
+                        }
 
-                result = _parse_json(choice.message.content)
+                    result = _parse_json(choice.message.content)
+                    if result.get("transactions") or result.get("reply") or result.get("debt_hint"):
+                        break
+                    # Модель иногда возвращает пустой JSON на хорошем скриншоте (на повторе он читается).
+                    # Раньше сразу отвечали «Не удалось распознать чек» и в логах не было причины.
+                    print(f"[Распознавание] Пустой результат (попытка {attempt}), ответ модели: "
+                          f"{str(choice.message.content)[:300]!r}")
 
                 transactions = result.get("transactions", [])
                 for tx in transactions:

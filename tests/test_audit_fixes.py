@@ -61,3 +61,29 @@ def test_owm_blocks_are_converted_from_utc_to_astana():
     from services.weather import _owm_local_dt
     import datetime
     assert _owm_local_dt("2026-10-05 15:00:00") == datetime.datetime(2026, 10, 5, 20, 0)
+
+
+def test_vision_retries_once_on_empty_result(monkeypatch):
+    import asyncio
+    from types import SimpleNamespace
+    from services import vision
+
+    replies = ['{}', '{"transactions": [{"amount": 1280}]}']
+    calls = []
+
+    class FakeCompletions:
+        async def create(self, **kw):
+            calls.append(1)
+            msg = SimpleNamespace(content=replies[len(calls) - 1])
+            return SimpleNamespace(choices=[SimpleNamespace(message=msg, finish_reason="stop")])
+
+    class FakeClient:
+        def __init__(self, *a, **k):
+            self.chat = SimpleNamespace(completions=FakeCompletions())
+        async def close(self):
+            pass
+
+    monkeypatch.setattr(vision, "AsyncOpenAI", FakeClient)
+    result = asyncio.run(vision.parse_receipt(b"\xff\xd8\xff", "a.jpg", "", "Влад", ""))
+    assert len(calls) == 2
+    assert result["transactions"][0]["amount"] == 1280
