@@ -95,52 +95,112 @@ def split_windows(points: list[dict]) -> list[list[dict]]:
     return [win for win in windows if len(win) >= 2]
 
 
+_DAY_SHORT = ["пн", "вт", "ср", "чт", "пт", "сб", "вс"]
+
+
 def window_label(win: list[dict]) -> str:
+    """«09:00 → 21:00 · вт» или «21:00 → 09:00 · вт → ср», если окно переходит через полночь."""
     a, b = win[0]["dt"], win[-1]["dt"]
-    return f"{a:%H:%M} → {b:%H:%M}"
+    days = _DAY_SHORT[a.weekday()] if a.date() == b.date() else f"{_DAY_SHORT[a.weekday()]} → {_DAY_SHORT[b.weekday()]}"
+    return f"{a:%H:%M} → {b:%H:%M} · {days}"
 
 
 def title_for(start: datetime.datetime) -> str:
     return f"Астана · {WEEKDAYS_RU[start.weekday()]}, {start.day} {MONTHS_RU_GEN[start.month - 1]}"
 
 
-def caption_for(points: list[dict], windows: list[list[dict]], start: datetime.datetime) -> str:
-    """Короткая подпись под картинкой: размах температуры по окнам, осадки, ветер, что надеть."""
+def _precip_hours(points: list[dict], codes: set[int]) -> list[datetime.datetime]:
+    return [p["dt"] for p in points if p["code"] is not None and int(p["code"]) in codes]
+
+
+def _span(hours: list[datetime.datetime]) -> str:
+    first, last = min(hours), max(hours)
+    return f"около {first:%H:%M}" if first == last else f"с {first:%H:%M} до {last:%H:%M}"
+
+
+def umbrella_text(points: list[dict]) -> tuple[str, str]:
+    """(текст про зонт, цвет): нужен ли зонт и почему. Снег — зонт ни при чём, важнее обувь и капюшон."""
+    rain_hours = _precip_hours(points, _RAIN | _STORM)
+    snow_hours = _precip_hours(points, _SNOW)
+    max_rain = max((p["rain"] for p in points), default=0)
+    if rain_hours and snow_hours:
+        return (f"Зонт пригодится: дождь {_span(rain_hours)} и снег {_span(snow_hours)} (осадки до {max_rain:.0f}%). "
+                "Обувь непромокаемая, куртка с капюшоном."), FEELS_COLOR
+    if rain_hours:
+        return f"Зонт нужен: дождь {_span(rain_hours)}, вероятность осадков до {max_rain:.0f}%.", FEELS_COLOR
+    if snow_hours:
+        return (f"Зонт не нужен, ожидается снег {_span(snow_hours)} (до {max_rain:.0f}%). "
+                "Важнее непромокаемая нескользящая обувь и капюшон."), "#CFEFFF"
+    if max_rain >= 50:
+        return f"Явных осадков не видно, но вероятность до {max_rain:.0f}%: зонт на всякий случай.", "#E6D98C"
+    return "Зонт не нужен: осадков не ожидается.", "#7BD88F"
+
+
+def clothes_text(points: list[dict]) -> str:
+    """Что надеть на все 24 часа окна: по самой низкой/высокой температуре и самому сильному ветру.
+    Про осадки здесь не пишем — для них отдельная строка про зонт."""
     from services import weather as w
-    lines = [f"🌤 {title_for(start)}"]
-    for win in windows:
-        t = [p["temp"] for p in win]
-        f = [p["feels"] for p in win]
-        rain = max(p["rain"] for p in win)
-        wind = max(p["wind"] for p in win)
-        lines.append(f"{window_label(win)}: {_fmt(min(t))}…{_fmt(max(t))} (ощущ. {_fmt(min(f))}…{_fmt(max(f))}), "
-                     f"осадки до {rain:.0f}%, ветер до {wind:.0f} км/ч")
-    codes = {int(p["code"]) for p in points if p["code"] is not None}
-    has_snow, has_rain = bool(codes & _SNOW), bool(codes & (_RAIN | _STORM))
     temps = [p["temp"] for p in points]
-    advice = w._clothes_advice(min(temps), max(temps), max(p["wind"] for p in points),
-                               max(p["rain"] for p in points), has_rain=has_rain, has_snow=has_snow)
-    lines.append(f"👕 {advice}")
+    return w._clothes_advice(min(temps), max(temps), max(p["wind"] for p in points))
+
+
+def footer_rows(points: list[dict]) -> list[tuple[str, str, str]]:
+    """Строки нижнего блока картинки: (подпись, текст, цвет подписи)."""
+    from services import weather as w
+    umbrella, umbrella_color = umbrella_text(points)
+    rows = [("Одежда", clothes_text(points), TEMP_COLOR), ("Зонт", umbrella, umbrella_color)]
     if max(p["spread"] for p in points) >= w.TEMP_DISAGREEMENT_C:
-        lines.append("🔀 Модели расходятся по температуре — прогноз может измениться.")
-    text = "\n".join(lines)
-    return text if len(text) <= 1000 else text[:997] + "…"
+        rows.append(("Модели", "расходятся по температуре — прогноз может измениться.", MUTED))
+    return rows
+
+
+def caption_for(points: list[dict], windows: list[list[dict]], start: datetime.datetime) -> str:
+    """Короткая подпись (видна в уведомлении): заголовок и вывод про зонт. Всё остальное — на картинке."""
+    umbrella, _ = umbrella_text(points)
+    return f"🌤 {title_for(start)}\n☂ {umbrella.split('.')[0]}."
 
 
 @serialized_plot
-def render(windows: list[list[dict]], title: str) -> bytes:
+def render(windows: list[list[dict]], title: str, footer: list[tuple[str, str, str]] | None = None) -> bytes:
     n = len(windows)
-    fig, axes = plt.subplots(n, 1, figsize=(8.2, 4.7 * n + 0.8), dpi=150, facecolor=BG)
-    if n == 1:
-        axes = [axes]
-    fig.suptitle(title, fontsize=16, fontweight="bold", color=TEXT, y=0.985 if n == 2 else 0.97)
-    for ax, win in zip(axes, windows):
+    footer = footer or []
+    footer_h = 0.5 + 0.55 * len(footer) if footer else 0.0
+    chart_h = 4.15
+    height = chart_h * n + footer_h + 0.8
+    fig = plt.figure(figsize=(8.2, height), dpi=150, facecolor=BG)
+    fig.suptitle(title, fontsize=16, fontweight="bold", color=TEXT, y=1 - 0.15 / height)
+    top = 1 - 0.45 / height
+    for k, win in enumerate(windows):
+        ax = fig.add_axes([0.04, top - (k + 1) * chart_h / height + 0.8 / height, 0.92, (chart_h - 1.8) / height])
         _draw_window(ax, win)
-    fig.tight_layout(rect=(0, 0, 1, 0.965 if n == 2 else 0.93), h_pad=2.2)
+    if footer:
+        _draw_footer(fig, footer, footer_h / height)
     buf = io.BytesIO()
     fig.savefig(buf, format="png", facecolor=BG)
     plt.close(fig)
     return buf.getvalue()
+
+
+def _draw_footer(fig, rows, rel_height: float) -> None:
+    import textwrap
+    ax = fig.add_axes([0.04, 0.01, 0.92, rel_height - 0.01])
+    ax.set_facecolor(PANEL)
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    lines_total = sum(max(1, len(textwrap.wrap(text, 62, break_on_hyphens=False))) for _, text, _ in rows)
+    unit = 1 / (lines_total + 0.6 * len(rows) + 0.6)
+    y = 1 - 0.7 * unit
+    for label, text, color in rows:
+        wrapped = textwrap.wrap(text, 62, break_on_hyphens=False) or [""]
+        ax.text(0.03, y, label, color=color, fontsize=11, fontweight="bold", va="center", ha="left")
+        for line in wrapped:
+            ax.text(0.17, y, line, color=TEXT, fontsize=10.5, va="center", ha="left")
+            y -= unit
+        y -= 0.6 * unit
 
 
 def _draw_window(ax, win: list[dict]) -> None:
@@ -186,8 +246,11 @@ def _draw_window(ax, win: list[dict]) -> None:
         ax.text(i, -0.2, f"{p['wind']:.0f} км/ч", transform=ax.get_xaxis_transform(), ha="center",
                 fontsize=9, color=MUTED)
 
-    ax.set_xticks([i for i in xs if i % 3 == 0])
-    ax.set_xticklabels([f"{win[i]['dt']:%H:%M}" for i in xs if i % 3 == 0], color=TEXT, fontsize=10)
+    ax.set_xticks(xs)                                              # подпись времени под каждым часом
+    ax.set_xticklabels([f"{p['dt']:%H:%M}" for p in win], fontsize=7.6)
+    for i, label in enumerate(ax.get_xticklabels()):
+        label.set_color(TEXT if i % 3 == 0 else MUTED)
+        label.set_fontweight("bold" if i % 3 == 0 else "normal")
     ax.tick_params(axis="x", length=0, pad=4)
     ax.set_yticks([])
     ax.set_title(window_label(win), loc="left", color=TEXT, fontsize=12.5, fontweight="bold", pad=10)

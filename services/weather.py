@@ -781,7 +781,8 @@ async def get_weather_image(kind: str, now: datetime.datetime | None = None):
         windows = weather_chart.split_windows(points)
         if not windows:
             return None
-        png = await asyncio.to_thread(weather_chart.render, windows, weather_chart.title_for(start))
+        png = await asyncio.to_thread(weather_chart.render, windows, weather_chart.title_for(start),
+                                      weather_chart.footer_rows(points))
         return png, weather_chart.caption_for(points, windows, start)
     except Exception as error:
         print(f"[Погода] Не удалось нарисовать картинку: {error}")

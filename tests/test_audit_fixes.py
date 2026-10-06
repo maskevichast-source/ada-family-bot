@@ -158,7 +158,7 @@ def test_weather_windows_are_two_halves_of_12_hours():
     pts = wc.build_points(_weather_data(), start)
     wins = wc.split_windows(pts)
     assert len(pts) == 25 and len(wins) == 2
-    assert wc.window_label(wins[0]) == "09:00 → 21:00" and wc.window_label(wins[1]) == "21:00 → 09:00"
+    assert wc.window_label(wins[0]) == "09:00 → 21:00 · вт" and wc.window_label(wins[1]) == "21:00 → 09:00 · вт → ср"
     assert wins[0][-1]["dt"] == wins[1][0]["dt"]
 
 
@@ -176,7 +176,9 @@ def test_weather_render_returns_png_and_caption_fits():
     wins = wc.split_windows(pts)
     assert wc.render(wins, wc.title_for(start))[:8] == b"\x89PNG\r\n\x1a\n"
     caption = wc.caption_for(pts, wins, start)
-    assert "09:00 → 21:00" in caption and len(caption) <= 1024
+    assert "Зонт" in caption and "Астана" in caption and len(caption) <= 1024
+    rows = dict((label, text) for label, text, _ in wc.footer_rows(pts))
+    assert "Одежда" in rows and "Зонт" in rows
     assert wc._fmt(-0.4) == "0°" and wc._fmt(-3.2) == "−3°"
 
 
@@ -201,3 +203,17 @@ def test_weather_image_falls_back_to_none_on_failure(monkeypatch):
     monkeypatch.setattr(weather, "_request_open_meteo", boom)
     assert asyncio.run(weather.get_weather_image("morning")) is None
     assert asyncio.run(weather.get_weather_image("week")) is None
+
+
+def test_umbrella_text_rain_snow_and_dry():
+    import datetime
+    from services import weather_chart as wc
+    base = datetime.datetime(2026, 10, 6, 9, 0)
+
+    def pts(code, rain):
+        return [{"dt": base + datetime.timedelta(hours=i), "temp": 3, "feels": 0, "rain": rain, "wind": 10,
+                 "code": code, "spread": 0} for i in range(5)]
+    assert wc.umbrella_text(pts(63, 80))[0].startswith("Зонт нужен")
+    assert wc.umbrella_text(pts(73, 80))[0].startswith("Зонт не нужен, ожидается снег")
+    assert wc.umbrella_text(pts(3, 10))[0] == "Зонт не нужен: осадков не ожидается."
+    assert "на всякий случай" in wc.umbrella_text(pts(3, 70))[0]
