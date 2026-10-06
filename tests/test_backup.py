@@ -177,3 +177,20 @@ def test_scheduler_failure_retries_then_reports_once(app, monkeypatch):
     tick(app.backup_scheduler)
     assert len(calls) == 1 and not state.get("scheduler", "backup:2026-10-04")    # маркера нет: повторим позже
     assert app.bot.send_message.call_count == 0                                  # первую неудачу в чат не несём
+
+
+def test_deliver_backup_sends_then_removes_file(app, tmp_path):
+    f = tmp_path / "Ada_backup_x.xlsx"
+    f.write_bytes(b"PK")
+    app.bot.send_document = AsyncMock()
+    assert asyncio.run(app._deliver_backup({"path": str(f)}, 123, "c")) is True
+    assert app.bot.send_document.call_count == 1 and not f.exists()
+
+
+def test_deliver_backup_keeps_file_when_send_fails(app, tmp_path):
+    f = tmp_path / "Ada_backup_x.xlsx"
+    f.write_bytes(b"PK")
+    app.bot.send_document = AsyncMock(side_effect=RuntimeError("forbidden"))
+    assert asyncio.run(app._deliver_backup({"path": str(f)}, 123, "c")) is False
+    assert f.exists()
+    assert asyncio.run(app._deliver_backup({"ok": True}, 123, "c")) is True      # копия на Drive — слать нечего

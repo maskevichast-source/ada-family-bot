@@ -244,6 +244,31 @@ async def cmd_limits_undo(message: types.Message):
     await safe_answer(message, text)
 
 
+async def _deliver_backup(result: dict, chat_id, caption: str) -> bool:
+    """Отправляет файл копии в Telegram и удаляет его с тома бота (Railway копии не хранит).
+    Если отправить не вышло — файл остаётся на томе, чтобы копия не пропала. True — доставлено (или копия на Drive)."""
+    path = result.get("path")
+    if not path:
+        return True
+    try:
+        await bot.send_document(chat_id, types.FSInputFile(path), caption=caption)
+    except Exception as e:
+        print(f"[Бэкап] Не удалось отправить файл в Telegram: {e}")
+        return False
+    try:
+        os.remove(path)
+    except OSError as e:
+        print(f"[Бэкап] Файл отправлен, но не удалился с тома: {e}")
+    return True
+
+
+def _backup_dm_id():
+    try:
+        return int(VLAD_TELEGRAM_ID)
+    except (TypeError, ValueError):
+        return None
+
+
 def _backup_result_text(result: dict) -> str:
     if result.get("ok"):
         extra = f" Старых удалено: {result['deleted']}." if result.get("deleted") else ""
@@ -258,10 +283,7 @@ async def cmd_backup(message: types.Message):
     result = await asyncio.to_thread(backup_module.make_backup, now)
     await safe_answer(message, _backup_result_text(result))
     if result.get("ok") and result.get("path"):
-        try:
-            await message.answer_document(types.FSInputFile(result["path"]), caption="Копия таблицы (откроется в Excel)")
-        except Exception as e:
-            print(f"[Бэкап] Не удалось отправить файл: {e}")
+        await _deliver_backup(result, message.chat.id, "Копия таблицы (откроется в Excel)")
 
 
 async def _send_status_dm(text: str) -> bool:
@@ -338,7 +360,9 @@ async def cmd_fix_loans(message: types.Message, command: CommandObject = None):
                     await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
                                                f"({result.get('reason')}). Ничего не изменено.")
                     return
-                note = " Резервная копия таблицы сделана." + note
+                sent = await _deliver_backup(result, _backup_dm_id(), "Копия таблицы перед правкой")
+                note = (" Резервная копия таблицы сделана" + (" (файл прислала Владу в личку)." if result.get("path") and sent
+                        else " (файл в личку не ушёл, лежит у бота).") if result.get("path") else " Резервная копия таблицы сделана.") + note
                 done = await asyncio.to_thread(loan_fix.apply_changes, changes)
                 text = (f"Исправила {done} записей: теперь это «Финансовые расходы и переводы › Кредиты и рассрочки»."
                         f"{note} Посмотреть, как изменятся лимиты: /limits_plan")
@@ -366,7 +390,9 @@ async def cmd_fix_data(message: types.Message, command: CommandObject = None):
                 await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
                                            f"({result.get('reason')}). Ничего не изменено.")
                 return
-            note = " Резервная копия таблицы сделана."
+            sent = await _deliver_backup(result, _backup_dm_id(), "Копия таблицы перед правкой")
+            note = (" Резервная копия таблицы сделана" + (" (файл прислала Владу в личку)." if sent
+                    else " (файл в личку не ушёл, лежит у бота).")) if result.get("path") else " Резервная копия таблицы сделана."
             if arg.startswith(("удалить ", "delete ")):
                 text = await asyncio.to_thread(data_fix.delete_one, raw_arg.split(None, 1)[1]) + note
             else:
@@ -978,7 +1004,49 @@ async def monthly_limits_scheduler():
 
 
 async def backup_scheduler():
-    """Ежедневная копия таблицы: каждую ночь с 03:30 до 03:59 по Астане (по воскресеньям файл ещё уходит Владу в личку).
+    """Ежедневная копия таблицы: каждую ночь с 03:30 до 03:59 по Астане; файл уходит Владу в личку и с тома бота удаляется.
+
+    Маркер дня ставится после успеха или после 3 неудач (тогда один раз пишем в чат).
+    Без BACKUP_FOLDER_ID копия сохраняется файлом на томе бота (services/backup.py).
+    """
+    attempts: dict[str, list] = {}
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            day = now.strftime("%Y-%m-%d")
+            marker = f"backup:{day}"
+            if (now.hour == 3 and now.minute >= 30
+                    and not state.get("scheduler", marker)):
+                count, last = attempts.get(day, [0, None])
+                if count < 3 and (last is None or (now - last).total_seconds() >= 600):
+                    attempts[day] = [count + 1, now]
+                    result = await asyncio.to_thread(backup_module.make_backup, now)
+                    if result.get("ok"):
+                        state.put("scheduler", marker, {"done_at": now.isoformat(), "title": result["title"]})
+                        if result.get("path"):
+                            dm = _backup_dm_id()
+                            delivered = bool(dm) and await _deliver_backup(result, dm, "Ночная копия таблицы")
+                            warn_key = f"backup_dm_warn:{now.strftime('%G-W%V')}"
+                            if not delivered and not state.get("scheduler", warn_key):
+                                state.put("scheduler", warn_key, {"at": now.isoformat()})
+                                await safe_send_message(
+                                    bot, chat_id=FAMILY_CHAT_ID,
+                                    text="Копия таблицы готова, но прислать её Владу в личку не получилось. "
+                                         "Влад, открой личный чат с ботом и нажми Start. Пока копия лежит у бота.")
+                    elif count + 1 >= 3:
+                        await safe_send_message(
+                            bot, chat_id=FAMILY_CHAT_ID,
+                            text="Не смогла пересчитать лимиты: не удалось прочитать траты из таблицы. "
+                                 "Лимиты остались прежними. Позже можно посмотреть черновик командой /limits_plan.",
+                        )
+                        state.put("scheduler", marker_key, {"failed_at": now.isoformat()})
+        except Exception as e:
+            print(f"[Автолимиты] Ошибка: {e}")
+        await asyncio.sleep(60)
+
+
+async def backup_scheduler():
+    """Ежедневная копия таблицы: каждую ночь с 03:30 до 03:59 по Астане; файл уходит Владу в личку и с тома бота удаляется.
 
     Маркер дня ставится после успеха или после 3 неудач (тогда один раз пишем в чат).
     Без BACKUP_FOLDER_ID копия сохраняется файлом на томе бота (services/backup.py).
