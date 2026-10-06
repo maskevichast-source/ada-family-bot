@@ -66,12 +66,12 @@ def test_copy_goes_to_folder_without_permissions_and_names_by_date(monkeypatch):
 
 def test_retention_keeps_latest_and_never_touches_foreign_files(monkeypatch):
     foreign = [{"id": "PHOTO", "name": "Фото отпуска"}, {"id": "SRC", "name": backup.BACKUP_PREFIX + " source"}]
-    client = FakeClient(existing=old_files(10) + foreign)
+    client = FakeClient(existing=old_files(35) + foreign)
     wire(monkeypatch, client)
     out = backup.make_backup(NOW)
-    # после копии их 11; остаются 8 свежих (новая + 7 самых новых старых), удаляются 3 самых старых
-    assert out["deleted"] == 3
-    assert sorted(client.deleted) == ["OLD1", "OLD2", "OLD3"]
+    # после копии их 36; остаются 30 свежих (новая + 29 самых новых старых), удаляются 6 самых старых
+    assert out["deleted"] == 6
+    assert sorted(client.deleted) == [f"OLD{i}" for i in range(1, 7)]
     assert "PHOTO" not in client.deleted and "SRC" not in client.deleted and "NEW" not in client.deleted
 
 
@@ -109,19 +109,22 @@ def test_backup_command_texts(app, monkeypatch):
     assert "папка не найдена" in run({"ok": False, "reason": "папка не найдена"})
 
 
-def test_scheduler_runs_only_sunday_night_once_per_week(app, monkeypatch):
+def test_scheduler_runs_nightly_once_per_day(app, monkeypatch):
     calls = []
     monkeypatch.setattr(app.backup_module, "make_backup", lambda now: calls.append(now) or {"ok": True, "title": "T"})
     monkeypatch.setenv("BACKUP_FOLDER_ID", "F")
     frozen(monkeypatch, app, NOW)
     tick(app.backup_scheduler)
-    assert len(calls) == 1 and state.get("scheduler", "backup:2026-W40")
-    tick(app.backup_scheduler)                                            # маркер недели уже стоит
+    assert len(calls) == 1 and state.get("scheduler", "backup:2026-10-04")
+    tick(app.backup_scheduler)                                            # маркер дня уже стоит
     assert len(calls) == 1
-    for when in (NOW.replace(day=5), NOW.replace(hour=4), NOW.replace(minute=10)):   # пн / не тот час / до 03:30
+    for when in (NOW.replace(hour=4), NOW.replace(minute=10)):   # не тот час / до 03:30
         frozen(monkeypatch, app, when)
         tick(app.backup_scheduler)
     assert len(calls) == 1
+    frozen(monkeypatch, app, NOW.replace(day=5))                          # следующая ночь — новая копия
+    tick(app.backup_scheduler)
+    assert len(calls) == 2
 
 
 def test_scheduler_disabled_without_folder(app, monkeypatch):
@@ -140,5 +143,5 @@ def test_scheduler_failure_retries_then_reports_once(app, monkeypatch):
     frozen(monkeypatch, app, NOW)
     app.bot.send_message.reset_mock()
     tick(app.backup_scheduler)
-    assert len(calls) == 1 and not state.get("scheduler", "backup:2026-W40")    # маркера нет: повторим позже
+    assert len(calls) == 1 and not state.get("scheduler", "backup:2026-10-04")    # маркера нет: повторим позже
     assert app.bot.send_message.call_count == 0                                  # первую неудачу в чат не несём

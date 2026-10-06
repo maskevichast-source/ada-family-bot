@@ -1,4 +1,4 @@
-"""Еженедельная резервная копия всей таблицы Google Sheets.
+"""Ежедневная резервная копия всей таблицы Google Sheets.
 
 Копия создаётся целым файлом в папке на Google Drive (BACKUP_FOLDER_ID): в неё нужно
 один раз дать доступ «Редактор» сервисному аккаунту бота. Хранятся последние KEEP копий;
@@ -9,7 +9,7 @@ import datetime
 import os
 
 BACKUP_PREFIX = "Ada backup Family_Finance"
-KEEP = 8
+KEEP = 30
 
 
 def backup_folder_id() -> str:

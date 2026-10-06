@@ -250,7 +250,7 @@ _BACKUP_HELP = (
     "2. Открой доступ к ней (Поделиться) для email сервисного аккаунта бота — роль «Редактор». "
     "Email лежит в файле ключа Google (поле client_email).\n"
     "3. Скопируй id папки из адреса (часть после /folders/) и вставь в Railway → Variables → BACKUP_FOLDER_ID.\n"
-    "После перезапуска бот будет делать копию каждое воскресенье ночью и хранить 8 последних."
+    "После перезапуска бот будет делать копию каждую ночь и хранить 30 последних."
 )
 
 
@@ -987,22 +987,22 @@ async def monthly_limits_scheduler():
 
 
 async def backup_scheduler():
-    """Еженедельная копия таблицы: воскресенье с 03:30 до 03:59 по Астане.
+    """Ежедневная копия таблицы: каждую ночь с 03:30 до 03:59 по Астане.
 
-    Маркер недели ставится после успеха или после 3 неудач (тогда один раз пишем в чат).
+    Маркер дня ставится после успеха или после 3 неудач (тогда один раз пишем в чат).
     Без BACKUP_FOLDER_ID ничего не делает.
     """
     attempts: dict[str, list] = {}
     while True:
         try:
             now = datetime.datetime.now(ASTANA_TZ)
-            week = now.strftime("%G-W%V")
-            marker = f"backup:{week}"
-            if (backup_module.backup_folder_id() and now.weekday() == 6 and now.hour == 3 and now.minute >= 30
+            day = now.strftime("%Y-%m-%d")
+            marker = f"backup:{day}"
+            if (backup_module.backup_folder_id() and now.hour == 3 and now.minute >= 30
                     and not state.get("scheduler", marker)):
-                count, last = attempts.get(week, [0, None])
+                count, last = attempts.get(day, [0, None])
                 if count < 3 and (last is None or (now - last).total_seconds() >= 600):
-                    attempts[week] = [count + 1, now]
+                    attempts[day] = [count + 1, now]
                     result = await asyncio.to_thread(backup_module.make_backup, now)
                     if result.get("ok"):
                         state.put("scheduler", marker, {"done_at": now.isoformat(), "title": result["title"]})
