@@ -98,7 +98,7 @@ def _say(app, args, monkeypatch=None):
 
 def test_command_preview_then_apply_then_undo(app, db, monkeypatch):
     ws = _seed(db)
-    monkeypatch.delenv("BACKUP_FOLDER_ID", raising=False)
+    monkeypatch.setattr(app.backup_module, "make_backup", lambda now: {"ok": True, "title": "T"})
     assert "Нашла 2 платежа" in _say(app, "")
     assert ws.get_all_values()[1][10] == "Электроника и техника"               # предпросмотр ничего не пишет
     said = _say(app, "да")

@@ -51,7 +51,7 @@ def old_files(n):
 def test_not_configured_does_nothing(monkeypatch):
     client = FakeClient()
     wire(monkeypatch, client, folder=None)
-    assert backup.make_backup(NOW) == {"ok": False, "reason": "not_configured"}
+    assert backup.make_drive_backup(NOW) == {"ok": False, "reason": "not_configured"}
     assert client.copies == []
 
 
@@ -102,8 +102,6 @@ def test_backup_command_texts(app, monkeypatch):
         msg = SimpleNamespace(chat=SimpleNamespace(id=1, type="private"), answer=AsyncMock(), message_id=1)
         asyncio.run(app.cmd_backup(msg))
         return msg.answer.call_args.args[0]
-    assert "Резервные копии пока не настроены" in run({"ok": False, "reason": "not_configured"}) 
-    assert "BACKUP_FOLDER_ID" in run({"ok": False, "reason": "not_configured"})
     ok = run({"ok": True, "title": "T", "url": "https://x/y", "deleted": 2})
     assert "T" in ok and "https://x/y" in ok and "удалено: 2" in ok
     assert "папка не найдена" in run({"ok": False, "reason": "папка не найдена"})
@@ -127,13 +125,47 @@ def test_scheduler_runs_nightly_once_per_day(app, monkeypatch):
     assert len(calls) == 2
 
 
-def test_scheduler_disabled_without_folder(app, monkeypatch):
+def test_scheduler_works_without_folder_using_local_backup(app, monkeypatch):
     calls = []
-    monkeypatch.setattr(app.backup_module, "make_backup", lambda now: calls.append(now))
+    monkeypatch.setattr(app.backup_module, "make_backup", lambda now: calls.append(now) or {"ok": True, "title": "T"})
     monkeypatch.delenv("BACKUP_FOLDER_ID", raising=False)
     frozen(monkeypatch, app, NOW)
     tick(app.backup_scheduler)
-    assert calls == []
+    assert len(calls) == 1
+
+
+class FakeExportClient:
+    def __init__(self, data=b"PK" + b"x" * 2000):
+        self.data = data
+
+    def export(self, file_id, format):
+        return self.data
+
+
+def test_local_backup_writes_file_and_keeps_last_30(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADA_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("BACKUP_FOLDER_ID", raising=False)
+    monkeypatch.setattr(sheets, "get_db", lambda: SimpleNamespace(id="SRC"))
+    monkeypatch.setattr(sheets, "get_client", lambda: FakeExportClient())
+    folder = tmp_path / "backups"
+    folder.mkdir()
+    for i in range(1, 36):
+        (folder / f"Ada_backup_2026-08-{i:02d}_0330.xlsx").write_bytes(b"PK")
+    (folder / "notes.txt").write_text("не трогать")
+    out = backup.make_backup(NOW)
+    assert out["ok"] and out["deleted"] == 6 and out["path"].endswith("Ada_backup_2026-10-04_0335.xlsx")
+    files = sorted(f.name for f in folder.glob("Ada_backup_*.xlsx"))
+    assert len(files) == 30 and files[-1].startswith("Ada_backup_2026-10-04")
+    assert "Ada_backup_2026-08-01_0330.xlsx" not in files and (folder / "notes.txt").exists()
+
+
+def test_local_backup_rejects_empty_export(monkeypatch, tmp_path):
+    monkeypatch.setenv("ADA_STATE_DIR", str(tmp_path))
+    monkeypatch.delenv("BACKUP_FOLDER_ID", raising=False)
+    monkeypatch.setattr(sheets, "get_db", lambda: SimpleNamespace(id="SRC"))
+    monkeypatch.setattr(sheets, "get_client", lambda: FakeExportClient(b""))
+    out = backup.make_backup(NOW)
+    assert out["ok"] is False and not (tmp_path / "backups").exists()
 
 
 def test_scheduler_failure_retries_then_reports_once(app, monkeypatch):

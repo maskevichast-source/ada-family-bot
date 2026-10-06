@@ -233,9 +233,6 @@ def sheets_health(now: datetime.datetime) -> dict:
 
 
 def backup_info() -> dict:
-    from services import backup
-    if not backup.backup_folder_id():
-        return {"configured": False}
     last = ""
     try:
         for key, value in state.entries("scheduler"):

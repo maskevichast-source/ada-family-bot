@@ -244,23 +244,11 @@ async def cmd_limits_undo(message: types.Message):
     await safe_answer(message, text)
 
 
-_BACKUP_HELP = (
-    "Резервные копии пока не настроены. Как включить:\n"
-    "1. В Google Drive создай папку, например «Ada backups».\n"
-    "2. Открой доступ к ней (Поделиться) для email сервисного аккаунта бота — роль «Редактор». "
-    "Email лежит в файле ключа Google (поле client_email).\n"
-    "3. Скопируй id папки из адреса (часть после /folders/) и вставь в Railway → Variables → BACKUP_FOLDER_ID.\n"
-    "После перезапуска бот будет делать копию каждую ночь и хранить 30 последних."
-)
-
-
 def _backup_result_text(result: dict) -> str:
     if result.get("ok"):
         extra = f" Старых удалено: {result['deleted']}." if result.get("deleted") else ""
         link = f"\n{result['url']}" if result.get("url") else ""
         return f"Резервная копия готова: {result['title']}.{extra}{link}"
-    if result.get("reason") == "not_configured":
-        return _BACKUP_HELP
     return f"Не получилось сделать резервную копию: {result.get('reason')}."
 
 
@@ -269,6 +257,11 @@ async def cmd_backup(message: types.Message):
     now = datetime.datetime.now(ASTANA_TZ)
     result = await asyncio.to_thread(backup_module.make_backup, now)
     await safe_answer(message, _backup_result_text(result))
+    if result.get("ok") and result.get("path"):
+        try:
+            await message.answer_document(types.FSInputFile(result["path"]), caption="Копия таблицы (откроется в Excel)")
+        except Exception as e:
+            print(f"[Бэкап] Не удалось отправить файл: {e}")
 
 
 async def _send_status_dm(text: str) -> bool:
@@ -340,13 +333,12 @@ async def cmd_fix_loans(message: types.Message, command: CommandObject = None):
                 text = loan_fix.preview_text([])
             else:
                 note = " Откатить: /fix_loans откат."
-                if backup_module.backup_folder_id():
-                    result = await asyncio.to_thread(backup_module.make_backup, datetime.datetime.now(ASTANA_TZ))
-                    if not result.get("ok"):
-                        await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
-                                                   f"({result.get('reason')}). Ничего не изменено.")
-                        return
-                    note = " Резервная копия таблицы сделана." + note
+                result = await asyncio.to_thread(backup_module.make_backup, datetime.datetime.now(ASTANA_TZ))
+                if not result.get("ok"):
+                    await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
+                                               f"({result.get('reason')}). Ничего не изменено.")
+                    return
+                note = " Резервная копия таблицы сделана." + note
                 done = await asyncio.to_thread(loan_fix.apply_changes, changes)
                 text = (f"Исправила {done} записей: теперь это «Финансовые расходы и переводы › Кредиты и рассрочки»."
                         f"{note} Посмотреть, как изменятся лимиты: /limits_plan")
@@ -369,13 +361,12 @@ async def cmd_fix_data(message: types.Message, command: CommandObject = None):
             text = await asyncio.to_thread(data_fix.undo_last)
         elif arg in ("да", "yes", "применить") or arg.startswith(("удалить ", "delete ")):
             note = ""
-            if backup_module.backup_folder_id():
-                result = await asyncio.to_thread(backup_module.make_backup, datetime.datetime.now(ASTANA_TZ))
-                if not result.get("ok"):
-                    await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
-                                               f"({result.get('reason')}). Ничего не изменено.")
-                    return
-                note = " Резервная копия таблицы сделана."
+            result = await asyncio.to_thread(backup_module.make_backup, datetime.datetime.now(ASTANA_TZ))
+            if not result.get("ok"):
+                await safe_answer(message, "Не применяю: не удалось сделать резервную копию "
+                                           f"({result.get('reason')}). Ничего не изменено.")
+                return
+            note = " Резервная копия таблицы сделана."
             if arg.startswith(("удалить ", "delete ")):
                 text = await asyncio.to_thread(data_fix.delete_one, raw_arg.split(None, 1)[1]) + note
             else:
@@ -987,10 +978,10 @@ async def monthly_limits_scheduler():
 
 
 async def backup_scheduler():
-    """Ежедневная копия таблицы: каждую ночь с 03:30 до 03:59 по Астане.
+    """Ежедневная копия таблицы: каждую ночь с 03:30 до 03:59 по Астане (по воскресеньям файл ещё уходит Владу в личку).
 
     Маркер дня ставится после успеха или после 3 неудач (тогда один раз пишем в чат).
-    Без BACKUP_FOLDER_ID ничего не делает.
+    Без BACKUP_FOLDER_ID копия сохраняется файлом на томе бота (services/backup.py).
     """
     attempts: dict[str, list] = {}
     while True:
@@ -998,7 +989,7 @@ async def backup_scheduler():
             now = datetime.datetime.now(ASTANA_TZ)
             day = now.strftime("%Y-%m-%d")
             marker = f"backup:{day}"
-            if (backup_module.backup_folder_id() and now.hour == 3 and now.minute >= 30
+            if (now.hour == 3 and now.minute >= 30
                     and not state.get("scheduler", marker)):
                 count, last = attempts.get(day, [0, None])
                 if count < 3 and (last is None or (now - last).total_seconds() >= 600):
@@ -1006,6 +997,14 @@ async def backup_scheduler():
                     result = await asyncio.to_thread(backup_module.make_backup, now)
                     if result.get("ok"):
                         state.put("scheduler", marker, {"done_at": now.isoformat(), "title": result["title"]})
+                        if now.weekday() == 6 and result.get("path"):
+                            # раз в неделю копия уходит Владу в личку — чтобы файл лежал и вне Railway
+                            try:
+                                uid = int(VLAD_TELEGRAM_ID)
+                                await bot.send_document(uid, types.FSInputFile(result["path"]),
+                                                        caption="Еженедельная копия таблицы")
+                            except Exception as e:
+                                print(f"[Бэкап] Не удалось отправить копию в личку: {e}")
                     elif count + 1 >= 3:
                         await safe_send_message(
                             bot, chat_id=FAMILY_CHAT_ID,
