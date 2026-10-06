@@ -136,3 +136,68 @@ def test_every_registered_command_is_listed_in_help(app):
     listed = {name for name, _ in app.COMMANDS} | {"start"}
     assert registered <= listed, registered - listed
     assert all(len(name) <= 32 and len(desc) <= 256 for name, desc in app.COMMANDS)
+
+
+# ---------- погода картинкой ----------
+
+def _weather_data(days=2):
+    import datetime, math
+    n = 24 * days
+    base = datetime.datetime(2026, 10, 6, 0, 0)
+    times = [(base + datetime.timedelta(hours=i)).strftime("%Y-%m-%dT%H:%M") for i in range(n)]
+    temp = [round(3 + 4 * math.sin((i - 9) / 24 * 2 * math.pi), 1) for i in range(n)]
+    return {"hourly": {"time": times, "temperature_2m": temp, "apparent_temperature": [t - 5 for t in temp],
+                       "precipitation_probability": [30] * n, "weather_code": [3] * n,
+                       "wind_speed_10m": [18.0] * n}}
+
+
+def test_weather_windows_are_two_halves_of_12_hours():
+    import datetime
+    from services import weather_chart as wc
+    start = datetime.datetime(2026, 10, 6, 9, 0)
+    pts = wc.build_points(_weather_data(), start)
+    wins = wc.split_windows(pts)
+    assert len(pts) == 25 and len(wins) == 2
+    assert wc.window_label(wins[0]) == "09:00 → 21:00" and wc.window_label(wins[1]) == "21:00 → 09:00"
+    assert wins[0][-1]["dt"] == wins[1][0]["dt"]
+
+
+def test_weather_points_empty_when_start_not_in_data():
+    import datetime
+    from services import weather_chart as wc
+    assert wc.build_points(_weather_data(1), datetime.datetime(2026, 10, 9, 9, 0)) == []
+
+
+def test_weather_render_returns_png_and_caption_fits():
+    import datetime
+    from services import weather_chart as wc
+    start = datetime.datetime(2026, 10, 6, 9, 0)
+    pts = wc.build_points(_weather_data(), start)
+    wins = wc.split_windows(pts)
+    assert wc.render(wins, wc.title_for(start))[:8] == b"\x89PNG\r\n\x1a\n"
+    caption = wc.caption_for(pts, wins, start)
+    assert "09:00 → 21:00" in caption and len(caption) <= 1024
+    assert wc._fmt(-0.4) == "0°" and wc._fmt(-3.2) == "−3°"
+
+
+def test_weather_image_start_hours():
+    import datetime
+    from services.timezone import ASTANA_TZ
+    from services.weather import _image_start
+    now = datetime.datetime(2026, 10, 6, 14, 20, tzinfo=ASTANA_TZ)
+    assert _image_start("morning", now).hour == 9 and _image_start("evening", now).hour == 21
+    assert _image_start("tomorrow", now) == datetime.datetime(2026, 10, 7, 9, 0)
+    assert _image_start("today", now) == datetime.datetime(2026, 10, 6, 14, 0)
+    assert _image_start("today", now.replace(hour=6)).hour == 9
+
+
+def test_weather_image_falls_back_to_none_on_failure(monkeypatch):
+    import asyncio
+    from services import weather
+
+    def boom(days):
+        raise RuntimeError("нет сети")
+
+    monkeypatch.setattr(weather, "_request_open_meteo", boom)
+    assert asyncio.run(weather.get_weather_image("morning")) is None
+    assert asyncio.run(weather.get_weather_image("week")) is None

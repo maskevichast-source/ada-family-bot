@@ -32,7 +32,7 @@ from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
 from services.pending_clarifications import sweep_expired_clarifications
 from services.timezone import ASTANA_TZ, parse_flexible_datetime
-from services.weather import get_weather_forecast, get_tomorrow_forecast
+from services.weather import get_weather_forecast, get_tomorrow_forecast, get_weather_image
 from services.charts import generate_expense_chart, generate_trend_chart
 from services.reports import generate_pdf_report, generate_excel_export
 from services.analytics import analyze_budget_leaks, detect_category_pace_anomalies
@@ -774,6 +774,23 @@ async def check_subscriptions():
         await asyncio.sleep(60)
 
 
+async def _send_weather(kind: str, text_target: str) -> bool:
+    """Прогноз в семейный чат: картинка с двумя графиками, а если не получилась — привычный текст."""
+    image = await get_weather_image(kind)
+    if image:
+        try:
+            await bot.send_photo(FAMILY_CHAT_ID, types.BufferedInputFile(image[0], filename="weather.png"),
+                                 caption=image[1])
+            return True
+        except Exception as e:
+            print(f"[Погода-Шедулер] Не удалось отправить картинку: {e}")
+    forecast = await get_weather_forecast(target=text_target)
+    if forecast:
+        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
+        return True
+    return False
+
+
 async def weather_scheduler():
     """Раньше "отправлено сегодня" хранилось в локальных переменных внутри
     функции — при перезапуске процесса (например, деплой на Railway прямо
@@ -788,18 +805,14 @@ async def weather_scheduler():
             if (now.hour == 8 and now.minute >= 30) or (now.hour == 9 and now.minute == 0):
                 marker_key = f"weather_morning:{today_str}"
                 if not state.get("scheduler", marker_key):
-                    forecast = await get_weather_forecast(target="today")
-                    if forecast:
-                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
+                    if await _send_weather("morning", "today"):
                         state.put("scheduler", marker_key, {"sent_at": now.isoformat()})
 
             # 22:30 — вечерний прогноз на завтра
             if (now.hour == 22 and now.minute >= 30) or (now.hour == 23 and now.minute == 0):
                 marker_key = f"weather_evening:{today_str}"
                 if not state.get("scheduler", marker_key):
-                    forecast = await get_tomorrow_forecast()
-                    if forecast:
-                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast)
+                    if await _send_weather("evening", "tomorrow"):
                         state.put("scheduler", marker_key, {"sent_at": now.isoformat()})
 
         except Exception as e:

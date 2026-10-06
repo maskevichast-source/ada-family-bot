@@ -735,6 +735,59 @@ async def get_weather_forecast(target: str = "today", days: int = 1) -> str | No
             return None
 
 
+IMAGE_KINDS = ("morning", "evening", "today", "tomorrow")
+
+
+def _image_start(kind: str, now: datetime.datetime) -> datetime.datetime:
+    """С какого часа рисуем 24 часа (два окна по 12): утром 09:00 сегодня, вечером 21:00 сегодня,
+    «сегодня» по запросу — с текущего часа (не раньше 09:00), «завтра» — с 09:00 завтра."""
+    day = now.replace(minute=0, second=0, microsecond=0, tzinfo=None)
+    if kind == "morning":
+        return day.replace(hour=9)
+    if kind == "evening":
+        return day.replace(hour=21)
+    if kind == "tomorrow":
+        return (day + datetime.timedelta(days=1)).replace(hour=9)
+    return day if day.hour >= 9 else day.replace(hour=9)
+
+
+async def _fetch_open_meteo(req_days: int) -> dict:
+    data = await asyncio.to_thread(_request_open_meteo, req_days)
+    try:
+        consensus = await asyncio.to_thread(_request_open_meteo_consensus, req_days)
+        c_hourly = consensus.get("hourly")
+        if isinstance(c_hourly, dict):
+            data.setdefault("hourly", {})
+            for var_key, values in c_hourly.items():
+                if var_key != "time":
+                    data["hourly"][var_key] = values
+    except Exception as consensus_error:
+        print(f"[Погода] Консенсус-запрос не удался, использую best_match: {consensus_error}")
+    return data
+
+
+async def get_weather_image(kind: str, now: datetime.datetime | None = None):
+    """Прогноз картинкой: (png-байты, подпись) или None, если не вышло — тогда вызывающий код
+    отправляет обычный текстовый прогноз. Резервный источник (OpenWeatherMap) картинкой не рисуем."""
+    if kind not in IMAGE_KINDS:
+        return None
+    from services import weather_chart
+    now = now or datetime.datetime.now(ASTANA_TZ)
+    start = _image_start(kind, now)
+    days_ahead = (start.date() - now.date()).days + 2          # 24 часа от start могут уйти на следующие сутки
+    try:
+        data = await _fetch_open_meteo(max(2, min(days_ahead, 7)))
+        points = weather_chart.build_points(data, start)
+        windows = weather_chart.split_windows(points)
+        if not windows:
+            return None
+        png = await asyncio.to_thread(weather_chart.render, windows, weather_chart.title_for(start))
+        return png, weather_chart.caption_for(points, windows, start)
+    except Exception as error:
+        print(f"[Погода] Не удалось нарисовать картинку: {error}")
+        return None
+
+
 async def get_tomorrow_forecast() -> str | None:
     """Для фоновой рассылки в 22:30."""
     return await get_weather_forecast(target="tomorrow")

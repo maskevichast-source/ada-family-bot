@@ -35,7 +35,7 @@ from services.sheets import (
 from services.banks import canonical_bank_name
 from services.charts import generate_expense_chart
 from services.limits_ai import generate_limits_from_history
-from services.weather import get_weather_forecast
+from services.weather import get_weather_forecast, get_weather_image
 from services.telegram_safe import safe_answer
 from services.pending_receipts import has_pending, pop_pending, ack_pending
 from services import ada_voice
@@ -307,6 +307,23 @@ async def handle_text(message: Message):
     await _process_text_message(message, message.text or "")
 
 
+async def _answer_weather_image(message: Message, target: str, chat_id) -> bool:
+    """«Погода на сегодня/завтра» — картинкой с двумя графиками. False — не вышло (или другой период),
+    тогда вызывающий код отвечает текстом."""
+    if target not in {"today", "tomorrow"}:
+        return False
+    image = await get_weather_image(target)
+    if not image:
+        return False
+    try:
+        await message.answer_photo(BufferedInputFile(image[0], filename="weather.png"), caption=image[1])
+    except Exception as error:
+        print(f"[Погода] Не удалось отправить картинку: {error}")
+        return False
+    add_chat_message(chat_id, "Ада", image[1])
+    return True
+
+
 async def handle_voice(message: Message):
     voice = message.voice or message.audio
     if not voice:
@@ -504,6 +521,8 @@ async def _process_text_message(message: Message, text: str):
     # добавлена обработка intent="get_weather" ниже, после запроса к ИИ.
     if _is_weather_question(t_clean):
         target = _weather_target_from_text(t_clean)
+        if await _answer_weather_image(message, target, chat_id):
+            return
         forecast = await get_weather_forecast(target=target)
         res = forecast or "Не удалось связаться с погодной станцией Open-Meteo."
         add_chat_message(chat_id, "Ада", res)
@@ -1154,6 +1173,8 @@ async def _process_text_message(message: Message, text: str):
         target = parsed.get("weather_target") or "today"
         if target not in {"today", "tomorrow", "after_tomorrow", "week"}:
             target = _weather_target_from_text(t_clean)
+        if await _answer_weather_image(message, target, chat_id):
+            return
         forecast = await get_weather_forecast(target=target)
         res = forecast or reply or "Не удалось связаться с погодной станцией Open-Meteo."
         add_chat_message(chat_id, "Ада", res)
