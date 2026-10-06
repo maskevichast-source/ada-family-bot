@@ -123,3 +123,16 @@ def test_commission_and_no_total_are_left_alone():
     assert normalize_receipt_split(r) == r
     r2 = {"transactions": [_tx(10, "Еда и продукты"), _tx(20, "Дом и быт")]}
     assert normalize_receipt_split(r2) == r2
+
+
+from test_media_schedulers import app  # noqa: E402,F401  (фикстура)
+from test_handlers import handler  # noqa: E402,F401
+
+
+def test_every_registered_command_is_listed_in_help(app):
+    import re
+    src = open("main.py", encoding="utf-8").read()
+    registered = set(re.findall(r'Command\("([a-z_]+)"\)', src))
+    listed = {name for name, _ in app.COMMANDS} | {"start"}
+    assert registered <= listed, registered - listed
+    assert all(len(name) <= 32 and len(desc) <= 256 for name, desc in app.COMMANDS)
