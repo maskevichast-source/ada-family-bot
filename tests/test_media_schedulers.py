@@ -292,3 +292,17 @@ def test_safe_send_puts_markup_only_on_last_chunk():
     calls = bot.send_message.call_args_list
     assert len(calls) > 1
     assert all("reply_markup" not in c.kwargs for c in calls[:-1]) and calls[-1].kwargs["reply_markup"] == "KB"
+
+
+def test_subscription_auto_worker_sends_notice_and_button(app, monkeypatch, db):
+    from services import subscriptions_auto as sa
+    sa.PENDING.clear()
+    sheets.add_or_update_subscription("Netflix", 4500, "Kaspi", 5)
+    sa.enqueue({"type": "РАСХОД", "amount": 4500, "date": "2026-10-02 10:00:00", "merchant": "Netflix",
+                "category": "Связь и подписки", "subcategory": "Цифровые подписки и сервисы"})
+    sa.enqueue({"type": "РАСХОД", "amount": 1990, "date": "2026-10-03 10:00:00", "merchant": "Spotify",
+                "category": "Связь и подписки", "subcategory": "Цифровые подписки и сервисы"})
+    tick(app.subscription_auto_worker)
+    texts = [c.kwargs.get("text", "") for c in app.bot.send_message.call_args_list]
+    assert any("Netflix за октябрь закрыта" in t for t in texts)
+    assert any("Spotify" in t and "Добавить в подписки" in t for t in texts)

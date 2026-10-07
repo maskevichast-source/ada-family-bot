@@ -286,6 +286,8 @@ def append_transaction(data: dict):
     except Exception as e:
         print(f"[Транзакции] Не удалось добавить запись: {e}")
         raise
+    from services import subscriptions_auto
+    subscriptions_auto.enqueue(data)
 
 
 def _store_date_as_datetime(ws, append_result, date_text: str) -> None:
@@ -1008,7 +1010,9 @@ def process_due_subscriptions(now: datetime.datetime) -> list:
                 last_day_of_month = calendar.monthrange(now.year, now.month)[1]
                 effective_day = min(day, last_day_of_month)
 
-                if now.day >= effective_day and not last_paid.startswith(current_month_prefix):
+                paid_month = str(r.get("paid_month") or "").strip()
+                if now.day >= effective_day and not last_paid.startswith(current_month_prefix) \
+                        and paid_month < current_month_prefix:
                     amt = parse_amount(r.get("amount", 0))
                     name = str(r.get("name", "Подписка"))
                     bank = str(r.get("bank", "Не указан"))
@@ -1213,20 +1217,23 @@ def close_installment(search_query: str) -> bool:
     return find_and_update_record("Installments", search_query, INSTALLMENT_STATUS_COLUMN, "closed", search_from_recent=True)
 
 
-SUBSCRIPTION_HEADERS = ["id", "name", "amount", "bank", "day_of_month", "last_paid", "status", "last_warning"]
+SUBSCRIPTION_HEADERS = ["id", "name", "amount", "bank", "day_of_month", "last_paid", "status", "last_warning", "paid_month"]
 
 
 def _get_or_create_subscriptions_sheet():
     ws = _get_or_create_worksheet("Subscriptions", SUBSCRIPTION_HEADERS, rows=100, cols=len(SUBSCRIPTION_HEADERS))
     headers = ws.row_values(1)
     if len(headers) < len(SUBSCRIPTION_HEADERS):
+        if (getattr(ws, "col_count", None) or 0) < len(SUBSCRIPTION_HEADERS):
+            ws.resize(cols=len(SUBSCRIPTION_HEADERS))                # в старой таблице 8 колонок — добавляем девятую
         for col_idx, header in enumerate(SUBSCRIPTION_HEADERS, start=1):
             if col_idx > len(headers) or not headers[col_idx - 1]:
                 ws.update_cell(1, col_idx, header)
     return ws
 
 
-def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month: int):
+def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month: int, paid_date: str | None = None):
+    """paid_date «ГГГГ-ММ-ДД» — оплата уже произошла: месяц оплаты сразу закрыт, повторно списывать его не будем."""
     ws = _get_or_create_subscriptions_sheet()
     records = _get_all_records_safe(ws)
     now = datetime.datetime.now(ASTANA_TZ)
@@ -1241,9 +1248,12 @@ def add_or_update_subscription(name: str, amount: float, bank: str, day_of_month
             ws.update_cell(idx, 4, bank or "Не указан")
             ws.update_cell(idx, 5, day)
             ws.update_cell(idx, 7, "active")
+            if paid_date:
+                ws.update_cell(idx, 6, paid_date)
+                ws.update_cell(idx, 9, paid_date[:7])
             return {"id": r.get("id"), "name": clean_name, "amount": amt, "bank": bank or "Не указан", "day_of_month": day, "status": "active"}
     sub_id = f"SUB_{now.strftime('%Y%m%d_%H%M%S')}"
-    row = [sub_id, clean_name, amt, bank or "Не указан", day, "", "active", ""]
+    row = [sub_id, clean_name, amt, bank or "Не указан", day, paid_date or "", "active", "", (paid_date or "")[:7]]
     ws.append_row(row, table_range=_table_range(len(SUBSCRIPTION_HEADERS)), value_input_option="USER_ENTERED")
     return {"id": sub_id, "name": clean_name, "amount": amt, "bank": bank or "Не указан", "day_of_month": day, "status": "active"}
 
@@ -1303,6 +1313,8 @@ def get_subscription_warnings(now: datetime.datetime, days_before: int = 2) -> l
                     due = datetime.date(year, month, day)
                 if (due - today).days != days_before:
                     continue
+                if str(r.get("paid_month") or "").strip() >= due.strftime("%Y-%m"):
+                    continue                                        # этот месяц уже оплачен — не пугаем
                 if str(r.get("last_warning", "")).strip() == today.strftime("%Y-%m-%d"):
                     continue
                 item = dict(r)

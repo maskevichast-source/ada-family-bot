@@ -774,6 +774,66 @@ async def check_subscriptions():
         await asyncio.sleep(60)
 
 
+async def subscription_auto_worker():
+    """Разбирает очередь свежих трат: оплата подписки закрывает платёж месяца, незнакомый сервис — кнопка
+    «добавить в подписки». Любой сбой тут только пишется в лог и никогда не мешает записи трат."""
+    from services import subscriptions_auto as sa
+    while True:
+        try:
+            for tx in sa.drain():
+                try:
+                    result = await asyncio.to_thread(sa.process_tx, tx)
+                except Exception as e:
+                    print(f"[Подписки-авто] Не разобрала трату: {e}")
+                    continue
+                if not result:
+                    continue
+                if result["kind"] == "paid":
+                    await safe_send_message(
+                        bot, chat_id=FAMILY_CHAT_ID,
+                        text=(f"✅ Подписка {result['name']} за {sa.month_name(result['month'])} закрыта: оплата "
+                              f"{result['date']} учтена, автосписание {result['day']}-го пропущу."),
+                        parse_mode=None)
+                elif result["kind"] == "suggest":
+                    await safe_send_message(
+                        bot, chat_id=FAMILY_CHAT_ID,
+                        text=(f"🔁 Похоже на подписку: {result['name']}, {_format_currency(result['amount'])} тг. "
+                              f"Добавить в подписки (списание каждый месяц {result['day']}-го)?"),
+                        reply_markup=sa.keyboard(result["token"]), parse_mode=None)
+        except Exception as e:
+            print(f"[Подписки-авто] Ошибка цикла: {e}")
+        await asyncio.sleep(10)
+
+
+@dp.callback_query(F.data.startswith("subadd:"))
+async def process_subscription_suggestion(callback: types.CallbackQuery):
+    from services import subscriptions_auto as sa
+    try:
+        _, answer, token = (callback.data or "").split(":", 2)
+        result = await asyncio.to_thread(sa.apply_answer, token, answer == "y")
+    except Exception as e:
+        print(f"[Подписки-авто] Не обработала кнопку: {e}")
+        await callback.answer("Не получилось записать в таблицу. Нажми ещё раз.", show_alert=True)
+        return
+    if result is None:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.answer("Кнопка устарела. Скажи в чате: «добавь подписку …».", show_alert=True)
+        return
+    if result["added"]:
+        text = (f"✅ Добавила подписку {result['name']}: {_format_currency(result['amount'])} тг в месяц, "
+                f"списание {result['day']}-го. Этот месяц уже оплачен, второй раз не спишу.")
+    else:
+        text = f"Ок, {result['name']} не подписка, больше не спрошу."
+    try:
+        await callback.message.edit_text(text, parse_mode=None, reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer()
+
+
 async def _send_weather(kind: str, text_target: str) -> bool:
     """Прогноз в семейный чат: картинка с двумя графиками, а если не получилась — привычный текст."""
     image = await get_weather_image(kind)
@@ -1170,6 +1230,7 @@ async def main():
 
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
+    asyncio.create_task(subscription_auto_worker())
     asyncio.create_task(check_price_tracking())
     asyncio.create_task(check_debt_reminders())
     asyncio.create_task(check_limit_warnings())
