@@ -285,6 +285,11 @@ def append_transaction(data: dict):
         _store_date_as_datetime(ws, result, data["date"])
     except Exception as e:
         print(f"[Транзакции] Не удалось добавить запись: {e}")
+        try:
+            from services import alerts
+            alerts.report_error("sheets-write", "Не удалось записать трату в таблицу", e)
+        except Exception:
+            pass
         raise
     from services import subscriptions_auto
     subscriptions_auto.enqueue(data)

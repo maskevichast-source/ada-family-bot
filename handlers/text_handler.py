@@ -711,7 +711,7 @@ async def _process_text_message(message: Message, text: str):
         "add_goal", "deposit_goal", "get_goals",
         "add_shopping", "clear_shopping", "get_shopping",
         "add_trip", "get_trips",
-        "get_limits", "generate_limits", "get_income", "get_weather",
+        "get_limits", "generate_limits", "get_income", "get_weather", "query_spending",
         "split_transaction",
     }
     if intent in _INTENTS_WITH_OWN_HANDLER:
@@ -1144,6 +1144,19 @@ async def _process_text_message(message: Message, text: str):
         except Exception as error:
             print(f"[Лимиты] Ошибка генерации: {error}")
             res = "Не удалось сгенерировать лимиты."
+        add_chat_message(chat_id, "Ада", res)
+        await safe_answer(message, res)
+        return
+
+    # ВОПРОСЫ ПРО ТРАТЫ: модель разобрала вопрос, цифры считает код
+    if intent == "query_spending":
+        from services import spending_query
+        try:
+            res = await asyncio.to_thread(spending_query.run, parsed.get("query") or {}, get_transactions_for_period,
+                                          now_astana().date())
+        except Exception as e:
+            print(f"[Вопрос про траты] Ошибка: {e}")
+            res = "Не смогла посчитать: таблица не ответила. Попробуй ещё раз чуть позже."
         add_chat_message(chat_id, "Ада", res)
         await safe_answer(message, res)
         return

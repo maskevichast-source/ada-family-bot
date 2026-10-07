@@ -48,7 +48,7 @@ from services import undo as undo_service
 from services import sheets as sheets_module
 from services.timezone import now_astana
 from services.reminders import deliver_due
-from services import preflight, state, debts
+from services import preflight, state, debts, alerts
 from services.webapp import start_webapp, webapp_url
 
 if DefaultBotProperties:
@@ -548,6 +548,7 @@ async def check_reminders():
             await deliver_due(bot)
         except Exception as e:
             print(f"[Напоминания] Ошибка цикла: {e}")
+            alerts.report_error("reminders-loop", "Цикл напоминаний", e)
         await asyncio.sleep(60)
 
 
@@ -582,6 +583,7 @@ async def check_debt_reminders():
                     )
         except Exception as e:
             print(f"[Долги] Ошибка цикла напоминаний: {e}")
+            alerts.report_error("debts-loop", "Цикл напоминаний о долгах", e)
         await asyncio.sleep(60)
 
 
@@ -638,6 +640,7 @@ async def check_limit_warnings():
                         await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text)
         except Exception as e:
             print(f"[Лимиты] Ошибка цикла предупреждений: {e}")
+            alerts.report_error("limits-loop", "Цикл предупреждений по лимитам", e)
         await asyncio.sleep(60)
 
 
@@ -739,6 +742,7 @@ async def check_price_tracking():
                                         notified_price, notified_at)
         except Exception as e:
             print(f"[Цены] Ошибка проверки: {e}")
+            alerts.report_error("prices-loop", "Проверка цен", e)
         await asyncio.sleep(3600)
 
 
@@ -771,7 +775,26 @@ async def check_subscriptions():
                     await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=f"💳 Автосписание подписок: {', '.join(due)}.")
         except Exception as e:
             print(f"[Подписки] Ошибка цикла: {e}")
+            alerts.report_error("subs-loop", "Цикл подписок", e)
         await asyncio.sleep(60)
+
+
+async def alert_worker():
+    """Отправляет накопленные тревоги Владу в личку. Не получилось отправить — только лог (нельзя падать от тревог)."""
+    while True:
+        try:
+            items = alerts.drain()
+            uid = _backup_dm_id()
+            for text in items:
+                if not uid:
+                    break
+                try:
+                    await bot.send_message(chat_id=uid, text=text, parse_mode=None)
+                except Exception as e:
+                    print(f"[Тревоги] Не получилось написать Владу: {e}")
+        except Exception as e:
+            print(f"[Тревоги] Ошибка цикла: {e}")
+        await asyncio.sleep(15)
 
 
 async def subscription_auto_worker():
@@ -802,6 +825,7 @@ async def subscription_auto_worker():
                         reply_markup=sa.keyboard(result["token"]), parse_mode=None)
         except Exception as e:
             print(f"[Подписки-авто] Ошибка цикла: {e}")
+            alerts.report_error("subs-auto-loop", "Автоподписки", e)
         await asyncio.sleep(10)
 
 
@@ -877,6 +901,7 @@ async def weather_scheduler():
 
         except Exception as e:
             print(f"[Погода-Шедулер] Ошибка: {e}")
+            alerts.report_error("weather-loop", "Рассылка погоды", e)
 
         await asyncio.sleep(30)
 
@@ -1050,6 +1075,7 @@ async def finance_report_scheduler():
                     await _send_report(text)
         except Exception as e:
             print(f"[Автоотчёты] Ошибка: {e}")
+            alerts.report_error("reports-loop", "Автоотчёты", e)
         await asyncio.sleep(60)
 
 
@@ -1085,6 +1111,7 @@ async def monthly_limits_scheduler():
                         state.put("scheduler", marker_key, {"failed_at": now.isoformat()})
         except Exception as e:
             print(f"[Автолимиты] Ошибка: {e}")
+            alerts.report_error("autolimits-loop", "Автолимиты", e)
         await asyncio.sleep(60)
 
 
@@ -1126,6 +1153,51 @@ async def backup_scheduler():
                         state.put("scheduler", marker, {"failed_at": now.isoformat()})
         except Exception as e:
             print(f"[Бэкап] Ошибка планировщика: {e}")
+            alerts.report_error("backup-loop", "Ночной бэкап", e)
+        await asyncio.sleep(60)
+
+
+async def backup_check_scheduler():
+    """1-го числа ночью (04:10–05:00 по Астане) проверяет, что копию таблицы можно открыть, и пишет Владу в личку."""
+    from services import backup_check
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            marker = f"backup_check:{now.strftime('%Y-%m')}"
+            if now.day == 1 and now.hour == 4 and now.minute >= 10 and not state.get("scheduler", marker):
+                state.put("scheduler", marker, {"at": now.isoformat()})
+                result = await asyncio.to_thread(backup_check.verify_backup)
+                text = backup_check.report_text(result)
+                uid = _backup_dm_id()
+                if uid:
+                    await bot.send_message(chat_id=uid, text=text, parse_mode=None)
+                if not result.get("ok"):
+                    alerts.report("backup-check", text)
+        except Exception as e:
+            print(f"[Проверка бэкапа] Ошибка: {e}")
+            alerts.report_error("backup-check-loop", "Проверка бэкапа", e)
+        await asyncio.sleep(60)
+
+
+async def weather_alert_scheduler():
+    """Раз в час (с 07:00 до 23:00) смотрит прогноз на ближайшие часы и предупреждает семью о грозе, сильном ветре,
+    резком перепаде температуры и сильных осадках. Каждое событие — не чаще раза в сутки."""
+    from services import weather_alerts
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            hour_key = f"weather_alert_check:{now.strftime('%Y-%m-%dT%H')}"
+            if weather_alerts.in_active_hours(now) and now.minute >= 10 and not state.get("scheduler", hour_key):
+                state.put("scheduler", hour_key, {"at": now.isoformat()})
+                for kind, text in await weather_alerts.collect(now):
+                    day_key = f"weather_alert:{kind}:{now.strftime('%Y-%m-%d')}"
+                    if state.get("scheduler", day_key):
+                        continue
+                    state.put("scheduler", day_key, {"at": now.isoformat()})
+                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=text, parse_mode=None)
+        except Exception as e:
+            print(f"[Погода-предупреждения] Ошибка: {e}")
+            alerts.report_error("weather-alert-loop", "Погодные предупреждения", e)
         await asyncio.sleep(60)
 
 
@@ -1151,6 +1223,7 @@ async def daily_status_scheduler():
                 state.put("scheduler", marker, {"at": now.isoformat(), "delivered": delivered})
         except Exception as e:
             print(f"[Статус] Ошибка планировщика: {e}")
+            alerts.report_error("status-loop", "Утренний статус", e)
         await asyncio.sleep(60)
 
 
@@ -1191,6 +1264,7 @@ async def main():
     asyncio.create_task(check_reminders())
     asyncio.create_task(check_subscriptions())
     asyncio.create_task(subscription_auto_worker())
+    asyncio.create_task(alert_worker())
     asyncio.create_task(check_price_tracking())
     asyncio.create_task(check_debt_reminders())
     asyncio.create_task(check_limit_warnings())
@@ -1201,6 +1275,25 @@ async def main():
     asyncio.create_task(sweep_clarifications())
     asyncio.create_task(backup_scheduler())
     asyncio.create_task(daily_status_scheduler())
+    asyncio.create_task(backup_check_scheduler())
+    asyncio.create_task(weather_alert_scheduler())
+
+    try:                                                           # перезапуск в рабочее время — тревога Владу
+        text = alerts.restart_text(datetime.datetime.now(ASTANA_TZ))
+        if text:
+            alerts.report("restart", text)
+    except Exception as e:
+        print(f"[Тревоги] Не поставила тревогу про перезапуск: {e}")
+
+    try:                                                           # необработанная ошибка в обработчике сообщения
+        @dp.errors()
+        async def on_unhandled_error(event):
+            import traceback
+            traceback.print_exception(event.exception)
+            alerts.report_error("handler-error", "Ошибка в обработчике сообщения", event.exception)
+            return True
+    except Exception as e:
+        print(f"[Тревоги] Не подключила перехват ошибок: {e}")
 
     # Мини-апп (только чтение). Любой сбой здесь не должен мешать боту.
     web_runner = await start_webapp()

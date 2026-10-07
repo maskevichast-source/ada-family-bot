@@ -106,7 +106,7 @@ SYSTEM_PROMPT_TEMPLATE = f"""
 Отвечай ТОЛЬКО валидным JSON-объектом.
 
 Обязательные поля:
-- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "add_goal" | "deposit_goal" | "get_goals" | "get_price_tracking" | "stop_price_tracking" | "chat"
+- "intent": "transaction" | "need_clarification" | "correct_any_record" | "split_transaction" | "add_installment" | "close_installment" | "get_installments" | "add_subscription" | "cancel_subscription" | "get_subscriptions" | "add_reminder" | "update_reminder" | "delete_reminder" | "get_reminders" | "add_shopping" | "clear_shopping" | "get_shopping" | "add_trip" | "get_trips" | "get_limits" | "generate_limits" | "get_summary" | "query_spending" | "get_income" | "get_weather" | "delete_transaction" | "debt" | "get_debts" | "add_goal" | "deposit_goal" | "get_goals" | "get_price_tracking" | "stop_price_tracking" | "chat"
 - "reply": "короткий живой ответ на русском"
 
 ВТОРОЕ, ПОПУТНОЕ НАМЕРЕНИЕ В ТОМ ЖЕ СООБЩЕНИИ (важно!):
@@ -149,6 +149,19 @@ SYSTEM_PROMPT_TEMPLATE = f"""
   например «колбаса и хлеб»). Суммы не считай и не выдумывай: остаток посчитает код.
 - В "reply" НЕ пиши, что ты разбила или разделила: результат сообщит код после записи.
   Пиши в "reply" только уточняющий вопрос, если чего-то реально не хватает.
+
+Для query_spending (ВОПРОС про суммы или последнюю оплату по записанным операциям: «сколько потратили на еду в сентябре»,
+«сколько на Kaspi за неделю», «когда последний раз платили за интернет», «топ-5 трат за месяц»; это не запись траты и не общая сводка get_summary):
+- "query": {{"kind": "sum" | "top" | "last" | "count" | "breakdown",
+  "period": "this_month" | "last_month" | "today" | "yesterday" | "this_week" | "last_week" | "last_7_days" | "last_30_days" | "this_year" | "last_year" | "all" | "YYYY-MM" | "YYYY",
+  "date_from": "YYYY-MM-DD" или null, "date_to": "YYYY-MM-DD" или null (только если названы конкретные даты),
+  "category": название категории из списка или null, "subcategory": подкатегория или null,
+  "merchant": слово из названия магазина или сервиса (например "интернет", "Magnum", "Netflix") или null,
+  "bank": "Kaspi"/"BCC"/"Forte"/"Halyk"/"Freedom" или null,
+  "user": "Влад" | "Диана" | null (про «мы», «семья» — null),
+  "type": "РАСХОД" | "ДОХОД", "limit": число для top (по умолчанию 5)}}
+  sum — общая сумма, top — самые большие операции, last — когда была последняя, count — сколько операций, breakdown — разбивка по категориям.
+  Суммы не считай и не выдумывай: цифры посчитает код. В "reply" напиши короткую вводную или оставь пустым.
 
 Для add_subscription:
 - "subscription": {{"name": "название", "amount": число, "bank": "Kaspi/BCC/Forte/Halyk/Freedom/Не указан", "day_of_month": число 1-31}}
