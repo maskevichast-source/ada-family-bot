@@ -71,6 +71,9 @@ def test_duplicate_detection_rules():
     assert not check(old(merchant="", user="Диана"))                             # один человек, места не видно — не спрашиваем
     assert not check(old(amt=5500))                                              # сумма другая
     assert not check(old(date="2026-10-05 09:30:00"))                            # позавчера
+    assert not check(old(date="2026-10-07 09:29:59"))                            # больше 30 минут разницы
+    assert not check(old(date="2026-10-07 22:00:00", user="Диана"))              # пачка сигарет утром и вечером — не дубль
+    assert not check(old(date="2026-10-07 09:00:00", user="Влад"), dict(NEW, date="2026-10-07 21:30:00", user="Влад"))
     assert not check(old(type="ДОХОД"))
     assert not check(old(transaction_id=NEW["transaction_id"]))                  # сама запись
     assert not check(old(transaction_id="TRX_20261007_100000_111111_5400_1"))    # позиция того же чека

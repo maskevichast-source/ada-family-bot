@@ -13,7 +13,7 @@ from services import state
 NS = "dup_suggest"
 CALLBACK_PREFIX = "dup:"
 MIN_AMOUNT = 1000
-WINDOW_HOURS = 24
+WINDOW_MINUTES = 30   # время операции из чека (или время отправки): утренняя и вечерняя покупки — не дубль
 
 PENDING: deque = deque(maxlen=200)
 _lock = threading.Lock()
@@ -56,7 +56,7 @@ def _merchant_match(a, b) -> bool:
 
 
 def is_probable_duplicate(new: dict, old: dict, parse_dt) -> bool:
-    """Похожие траты: та же сумма, в пределах суток, и либо то же место, либо разные люди с одним банком."""
+    """Похожие траты: та же сумма, время операции в пределах 30 минут, и либо то же место, либо разные люди с одним банком."""
     try:
         amount_new = float(new.get("amount") or 0)
         amount_old = float(old.get("amt") or 0)
@@ -69,7 +69,7 @@ def is_probable_duplicate(new: dict, old: dict, parse_dt) -> bool:
     if _same_receipt(new.get("transaction_id"), old.get("transaction_id")):
         return False
     a, b = parse_dt(new.get("date")), parse_dt(old.get("date"))
-    if not a or not b or abs((a - b).total_seconds()) > WINDOW_HOURS * 3600:
+    if not a or not b or abs((a - b).total_seconds()) > WINDOW_MINUTES * 60:
         return False
     if _merchant_match(new.get("merchant"), old.get("merchant")):
         return True
