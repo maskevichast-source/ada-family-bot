@@ -235,3 +235,14 @@ def test_sun_info_and_moon_phase():
     pts = wc.build_points(_weather_data(), datetime.datetime(2026, 10, 6, 9))
     png = wc.render(wc.split_windows(pts), "t", wc.footer_rows(pts), "s", ("06:45", "18:12"), wc.moon_phase(wins_start))
     assert png[:4] == b"\x89PNG"
+
+
+def test_umbrella_ignores_night_hours():
+    import datetime
+    from services import weather_chart as wc
+    base = datetime.datetime(2026, 10, 7, 0, 0)
+    night = [{"dt": base + datetime.timedelta(hours=i), "temp": 5, "feels": 3, "rain": 90, "wind": 10,
+              "code": 63, "spread": 0} for i in range(0, 6)]            # дождь только 00:00–05:00
+    assert wc.umbrella_text(night) is None
+    day = night + [{"dt": base.replace(hour=8), "temp": 5, "feels": 3, "rain": 90, "wind": 10, "code": 63, "spread": 0}]
+    assert "08:00" in wc.umbrella_text(day)[0]
