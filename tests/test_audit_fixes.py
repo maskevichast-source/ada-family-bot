@@ -246,3 +246,16 @@ def test_umbrella_ignores_night_hours():
     assert wc.umbrella_text(night) is None
     day = night + [{"dt": base.replace(hour=8), "temp": 5, "feels": 3, "rain": 90, "wind": 10, "code": 63, "spread": 0}]
     assert "08:00" in wc.umbrella_text(day)[0]
+
+
+def test_umbrella_only_target_day():
+    import datetime
+    from services import weather_chart as wc
+    def mk(start, rainy_from):
+        return [{"dt": start + datetime.timedelta(hours=i), "temp": 5, "feels": 3, "wind": 10, "spread": 0,
+                 "rain": 90 if (start + datetime.timedelta(hours=i)) >= rainy_from else 0,
+                 "code": 63 if (start + datetime.timedelta(hours=i)) >= rainy_from else 3} for i in range(25)]
+    morning = mk(datetime.datetime(2026, 10, 7, 9), datetime.datetime(2026, 10, 8, 7))   # дождь только завтра утром
+    assert wc.umbrella_text(morning) is None
+    evening = mk(datetime.datetime(2026, 10, 7, 21), datetime.datetime(2026, 10, 8, 7))  # вечерняя рассылка — про завтра
+    assert "07:00" in wc.umbrella_text(evening)[0]

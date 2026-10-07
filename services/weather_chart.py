@@ -120,7 +120,11 @@ def _span(hours: list[datetime.datetime]) -> str:
 
 def umbrella_text(points: list[dict]) -> tuple[str, str] | None:
     """(текст про зонт, цвет), только если зонт или непромокаемая обувь реально нужны; иначе None."""
-    points = [p for p in points if 7 <= p["dt"].hour <= 23]        # ночью на улице никого — зонт считаем по дню и вечеру
+    if not points:
+        return None
+    first = points[0]["dt"]                                         # целевой день: дневной прогноз — этот день,
+    day = first.date() if first.hour < 21 else first.date() + datetime.timedelta(days=1)   # вечерний (с 21:00) — завтра
+    points = [p for p in points if p["dt"].date() == day and 7 <= p["dt"].hour <= 23]     # ночью на улице никого
     rain_hours = _precip_hours(points, _RAIN | _STORM)
     snow_hours = _precip_hours(points, _SNOW)
     max_rain = max((p["rain"] for p in points), default=0)
