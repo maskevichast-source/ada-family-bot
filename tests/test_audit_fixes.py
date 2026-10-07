@@ -176,9 +176,9 @@ def test_weather_render_returns_png_and_caption_fits():
     wins = wc.split_windows(pts)
     assert wc.render(wins, wc.title_for(start))[:8] == b"\x89PNG\r\n\x1a\n"
     caption = wc.caption_for(pts, wins, start)
-    assert "Зонт" in caption and "Астана" in caption and len(caption) <= 1024
+    assert "Астана" in caption and len(caption) <= 1024
     rows = dict((label, text) for label, text, _ in wc.footer_rows(pts))
-    assert "Одежда" in rows and "Зонт" in rows
+    assert "Одежда" in rows
     assert wc._fmt(-0.4) == "0°" and wc._fmt(-3.2) == "−3°"
 
 
@@ -214,6 +214,24 @@ def test_umbrella_text_rain_snow_and_dry():
         return [{"dt": base + datetime.timedelta(hours=i), "temp": 3, "feels": 0, "rain": rain, "wind": 10,
                  "code": code, "spread": 0} for i in range(5)]
     assert wc.umbrella_text(pts(63, 80))[0].startswith("Зонт нужен")
-    assert wc.umbrella_text(pts(73, 80))[0].startswith("Зонт не нужен, ожидается снег")
-    assert wc.umbrella_text(pts(3, 10))[0] == "Зонт не нужен: осадков не ожидается."
+    assert "Зонт не нужен" in wc.umbrella_text(pts(73, 80))[0] and "снег" in wc.umbrella_text(pts(73, 80))[0]
+    assert wc.umbrella_text(pts(3, 10)) is None                      # сухо — про зонт не пишем вовсе
+    assert "Зонт" not in wc.caption_for(pts(3, 10), [], base)
+    assert "Зонт" not in dict((l, t) for l, t, _ in wc.footer_rows(pts(3, 10)))
     assert "на всякий случай" in wc.umbrella_text(pts(3, 70))[0]
+
+
+def test_sun_info_and_moon_phase():
+    import datetime
+    from services import weather_chart as wc
+    data = {"daily": {"time": ["2026-10-07"], "sunrise": ["2026-10-07T06:45"], "sunset": ["2026-10-07T18:12"]}}
+    assert wc.sun_info(data, datetime.datetime(2026, 10, 7, 9)) == ("06:45", "18:12")
+    assert wc.sun_info(data, datetime.datetime(2026, 10, 9, 9)) is None
+    assert wc.sun_info({}, datetime.datetime(2026, 10, 7, 9)) is None
+    phase, name = wc.moon_phase(datetime.datetime(2000, 1, 21, 12))        # полнолуние 21.01.2000
+    assert name == "Полнолуние" and abs(phase - 0.5) < 0.04
+    assert wc.moon_phase(datetime.datetime(2026, 10, 10, 12))[1] in ("Новолуние", "Убывающий серп")
+    wins_start = datetime.datetime(2026, 10, 7, 9)
+    pts = wc.build_points(_weather_data(), datetime.datetime(2026, 10, 6, 9))
+    png = wc.render(wc.split_windows(pts), "t", wc.footer_rows(pts), "s", ("06:45", "18:12"), wc.moon_phase(wins_start))
+    assert png[:4] == b"\x89PNG"

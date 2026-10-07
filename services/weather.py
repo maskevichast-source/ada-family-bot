@@ -221,7 +221,7 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         "longitude": ASTANA_LONGITUDE,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
         "hourly": "temperature_2m,apparent_temperature,precipitation_probability,weather_code,wind_speed_10m",
-        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max",
+        "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max,sunrise,sunset",
         "timezone": "Asia/Almaty",
         "forecast_days": max(1, min(int(forecast_days), 7)),
     })
@@ -782,7 +782,8 @@ async def get_weather_image(kind: str, now: datetime.datetime | None = None):
         if not windows:
             return None
         png = await asyncio.to_thread(weather_chart.render, windows, weather_chart.title_for(start),
-                                      weather_chart.footer_rows(points))
+                                      weather_chart.footer_rows(points), weather_chart.summary_line(points),
+                                      weather_chart.sun_info(data, start), weather_chart.moon_phase(start))
         return png, weather_chart.caption_for(points, windows, start)
     except Exception as error:
         print(f"[Погода] Не удалось нарисовать картинку: {error}")
