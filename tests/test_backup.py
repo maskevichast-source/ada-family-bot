@@ -194,3 +194,44 @@ def test_deliver_backup_keeps_file_when_send_fails(app, tmp_path):
     assert asyncio.run(app._deliver_backup({"path": str(f)}, 123, "c")) is False
     assert f.exists()
     assert asyncio.run(app._deliver_backup({"ok": True}, 123, "c")) is True      # копия на Drive — слать нечего
+
+
+def test_scheduler_sends_file_to_dm_every_night_and_removes_it(app, monkeypatch, tmp_path):
+    f = tmp_path / "Ada_backup_x.xlsx"
+    f.write_bytes(b"PK")
+    monkeypatch.setattr(app.backup_module, "make_backup", lambda now: {"ok": True, "title": "T", "path": str(f)})
+    monkeypatch.setattr(app, "VLAD_TELEGRAM_ID", "777")
+    app.bot.send_document = AsyncMock()
+    frozen(monkeypatch, app, NOW)                                        # 2026-10-04 — воскресенье не важно
+    tick(app.backup_scheduler)
+    assert app.bot.send_document.call_count == 1 and app.bot.send_document.call_args.args[0] == 777
+    assert not f.exists()                                                # на томе бота файл не остаётся
+    f.write_bytes(b"PK")
+    frozen(monkeypatch, app, NOW.replace(day=6))                         # понедельник — всё равно присылает
+    tick(app.backup_scheduler)
+    assert app.bot.send_document.call_count == 2
+
+
+def test_scheduler_reports_failure_after_three_attempts(app, monkeypatch):
+    monkeypatch.setattr(app.backup_module, "make_backup", lambda now: {"ok": False, "reason": "нет прав"})
+    app.bot.send_message.reset_mock()
+    clock = {"now": NOW.replace(minute=35)}
+
+    class Clock(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return clock["now"]
+    monkeypatch.setattr(app, "datetime", SimpleNamespace(datetime=Clock, timedelta=dt.timedelta, date=dt.date))
+    steps = []
+
+    async def fake_sleep(_):
+        steps.append(1)
+        if len(steps) >= 4:
+            raise StopTick()
+        clock["now"] = clock["now"] + dt.timedelta(minutes=11)
+    monkeypatch.setattr(app.asyncio, "sleep", fake_sleep)
+    with pytest.raises(StopTick):
+        asyncio.run(app.backup_scheduler())
+    texts = [c.kwargs.get("text", "") for c in app.bot.send_message.call_args_list]
+    assert any("ночную резервную копию" in t and "нет прав" in t for t in texts)
+    assert state.get("scheduler", "backup:2026-10-04")["failed_at"]

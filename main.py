@@ -1121,47 +1121,7 @@ async def backup_scheduler():
                     elif count + 1 >= 3:
                         await safe_send_message(
                             bot, chat_id=FAMILY_CHAT_ID,
-                            text="Не смогла пересчитать лимиты: не удалось прочитать траты из таблицы. "
-                                 "Лимиты остались прежними. Позже можно посмотреть черновик командой /limits_plan.",
-                        )
-                        state.put("scheduler", marker_key, {"failed_at": now.isoformat()})
-        except Exception as e:
-            print(f"[Автолимиты] Ошибка: {e}")
-        await asyncio.sleep(60)
-
-
-async def backup_scheduler():
-    """Ежедневная копия таблицы: каждую ночь с 03:30 до 03:59 по Астане; файл уходит Владу в личку и с тома бота удаляется.
-
-    Маркер дня ставится после успеха или после 3 неудач (тогда один раз пишем в чат).
-    Без BACKUP_FOLDER_ID копия сохраняется файлом на томе бота (services/backup.py).
-    """
-    attempts: dict[str, list] = {}
-    while True:
-        try:
-            now = datetime.datetime.now(ASTANA_TZ)
-            day = now.strftime("%Y-%m-%d")
-            marker = f"backup:{day}"
-            if (now.hour == 3 and now.minute >= 30
-                    and not state.get("scheduler", marker)):
-                count, last = attempts.get(day, [0, None])
-                if count < 3 and (last is None or (now - last).total_seconds() >= 600):
-                    attempts[day] = [count + 1, now]
-                    result = await asyncio.to_thread(backup_module.make_backup, now)
-                    if result.get("ok"):
-                        state.put("scheduler", marker, {"done_at": now.isoformat(), "title": result["title"]})
-                        if now.weekday() == 6 and result.get("path"):
-                            # раз в неделю копия уходит Владу в личку — чтобы файл лежал и вне Railway
-                            try:
-                                uid = int(VLAD_TELEGRAM_ID)
-                                await bot.send_document(uid, types.FSInputFile(result["path"]),
-                                                        caption="Еженедельная копия таблицы")
-                            except Exception as e:
-                                print(f"[Бэкап] Не удалось отправить копию в личку: {e}")
-                    elif count + 1 >= 3:
-                        await safe_send_message(
-                            bot, chat_id=FAMILY_CHAT_ID,
-                            text=f"Не получилось сделать еженедельную резервную копию таблицы: {result.get('reason')}. "
+                            text=f"Не получилось сделать ночную резервную копию таблицы: {result.get('reason')}. "
                                  "Можно попробовать вручную командой /backup.")
                         state.put("scheduler", marker, {"failed_at": now.isoformat()})
         except Exception as e:
