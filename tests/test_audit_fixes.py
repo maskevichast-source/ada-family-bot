@@ -214,7 +214,10 @@ def test_umbrella_text_rain_snow_and_dry():
         return [{"dt": base + datetime.timedelta(hours=i), "temp": 3, "feels": 0, "rain": rain, "wind": 10,
                  "code": code, "spread": 0} for i in range(5)]
     assert wc.umbrella_text(pts(63, 80))[0].startswith("Зонт нужен")
-    assert "Зонт не нужен" in wc.umbrella_text(pts(73, 80))[0] and "снег" in wc.umbrella_text(pts(73, 80))[0]
+    snow = wc.umbrella_text(pts(73, 80))[0]
+    assert "снег" in snow and "зонт" not in snow.lower()               # в снег про зонт не пишем
+    assert dict((l, t) for l, t, _ in wc.footer_rows(pts(73, 80))).get("Снег") == snow
+    assert wc.caption_for(pts(73, 80), [], base).splitlines()[1].startswith("❄")
     assert wc.umbrella_text(pts(3, 10)) is None                      # сухо — про зонт не пишем вовсе
     assert "Зонт" not in wc.caption_for(pts(3, 10), [], base)
     assert "Зонт" not in dict((l, t) for l, t, _ in wc.footer_rows(pts(3, 10)))

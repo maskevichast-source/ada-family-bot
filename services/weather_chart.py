@@ -135,7 +135,7 @@ def umbrella_text(points: list[dict]) -> tuple[str, str] | None:
         return f"Зонт нужен: дождь {_span(rain_hours)}, вероятность осадков до {max_rain:.0f}%.", FEELS_COLOR
     if snow_hours:
         return (f"Ожидается снег {_span(snow_hours)} (до {max_rain:.0f}%). "
-                "Зонт не нужен, важнее непромокаемая нескользящая обувь и капюшон."), "#CFEFFF"
+                "Важнее непромокаемая нескользящая обувь и капюшон."), "#CFEFFF"
     if max_rain >= 60:
         return f"Явных осадков не видно, но вероятность до {max_rain:.0f}%: зонт на всякий случай.", "#E6D98C"
     return None
@@ -155,7 +155,7 @@ def footer_rows(points: list[dict]) -> list[tuple[str, str, str]]:
     rows = [("Одежда", clothes_text(points), TEMP_COLOR)]
     umbrella = umbrella_text(points)
     if umbrella:
-        rows.append(("Зонт", umbrella[0], umbrella[1]))
+        rows.append(("Зонт" if umbrella[0].startswith("Зонт") or "зонт" in umbrella[0] else "Снег", umbrella[0], umbrella[1]))
     if max(p["spread"] for p in points) >= w.TEMP_DISAGREEMENT_C:
         rows.append(("Модели", "расходятся по температуре — прогноз может измениться.", MUTED))
     return rows
@@ -164,7 +164,7 @@ def footer_rows(points: list[dict]) -> list[tuple[str, str, str]]:
 def caption_for(points: list[dict], windows: list[list[dict]], start: datetime.datetime) -> str:
     """Короткая подпись (видна в уведомлении): заголовок и, если нужен, вывод про зонт."""
     umbrella = umbrella_text(points)
-    return f"🌤 {title_for(start)}" + (f"\n☂ {umbrella[0].split('.')[0]}." if umbrella else "")
+    return f"🌤 {title_for(start)}" + (f"\n{'❄' if umbrella[0].startswith('Ожидается снег') else '☂'} {umbrella[0].split('.')[0]}." if umbrella else "")
 
 
 
