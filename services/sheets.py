@@ -293,6 +293,8 @@ def append_transaction(data: dict):
         raise
     from services import subscriptions_auto
     subscriptions_auto.enqueue(data)
+    from services import duplicates
+    duplicates.enqueue(data)
 
 
 def _store_date_as_datetime(ws, append_result, date_text: str) -> None:

@@ -49,6 +49,7 @@ from services import sheets as sheets_module
 from services.timezone import now_astana
 from services.reminders import deliver_due
 from services import preflight, state, debts, alerts
+from services import forecast as forecast_module
 from services.webapp import start_webapp, webapp_url
 
 if DefaultBotProperties:
@@ -779,6 +780,86 @@ async def check_subscriptions():
         await asyncio.sleep(60)
 
 
+async def forecast_warning_scheduler():
+    """Раз в день в 19:10: если категория с лимитом при текущем темпе выйдет за лимит, предупреждаем заранее.
+    Каждая категория — не чаще раза в месяц. Постоянные платежи (жильё, связь, кредиты) не проверяем."""
+    while True:
+        try:
+            now = datetime.datetime.now(ASTANA_TZ)
+            day_key = f"forecast_check:{now.strftime('%Y-%m-%d')}"
+            if now.hour == 19 and now.minute >= 10 and not state.get("scheduler", day_key):
+                state.put("scheduler", day_key, {"at": now.isoformat()})
+                limits = await asyncio.to_thread(get_category_limits)
+                if limits:
+                    txs = await asyncio.to_thread(
+                        get_transactions_for_period, now.replace(day=1).strftime("%Y-%m-%d"),
+                        (now.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
+                    f = forecast_module.month_forecast(now, txs)
+                    for item in forecast_module.risky_categories(f, limits):
+                        marker = f"forecast_warning:{item['cat']}:{now.strftime('%Y-%m')}"
+                        if state.get("scheduler", marker):
+                            continue
+                        state.put("scheduler", marker, {"at": now.isoformat()})
+                        await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=forecast_module.warning_text(item, f),
+                                                parse_mode=None)
+        except Exception as e:
+            print(f"[Прогноз] Ошибка цикла: {e}")
+            alerts.report_error("forecast-loop", "Прогноз трат", e)
+        await asyncio.sleep(60)
+
+
+async def duplicate_worker():
+    """Разбирает очередь свежих трат: похожую на уже записанную показывает с кнопками. Сам ничего не удаляет."""
+    from services import duplicates
+    from services.timezone import parse_flexible_datetime
+    while True:
+        try:
+            for tx in duplicates.drain():
+                try:
+                    old = await asyncio.to_thread(duplicates.find_duplicate, tx, get_transactions_for_period,
+                                                  parse_flexible_datetime)
+                except Exception as e:
+                    print(f"[Дубли] Не смогла проверить: {e}")
+                    continue
+                if old:
+                    offer = duplicates.suggest(tx, old)
+                    await safe_send_message(bot, chat_id=FAMILY_CHAT_ID, text=offer["text"],
+                                            reply_markup=duplicates.keyboard(offer["token"]), parse_mode=None)
+        except Exception as e:
+            print(f"[Дубли] Ошибка цикла: {e}")
+            alerts.report_error("duplicates-loop", "Проверка дублей", e)
+        await asyncio.sleep(10)
+
+
+@dp.callback_query(F.data.startswith("dup:"))
+async def process_duplicate_answer(callback: types.CallbackQuery):
+    from services import duplicates
+    try:
+        _, answer, token = (callback.data or "").split(":", 2)
+        result = await asyncio.to_thread(duplicates.apply_answer, token, answer == "y")
+    except Exception as e:
+        print(f"[Дубли] Не обработала кнопку: {e}")
+        await callback.answer("Не получилось удалить: таблица не ответила. Нажми ещё раз.", show_alert=True)
+        return
+    if result is None:
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        await callback.answer("Кнопка устарела. Удали запись через чат: «удали последнюю трату».", show_alert=True)
+        return
+    if answer == "y":
+        text = (f"🗑 Удалила дубль: {result['summary']}." if result["deleted"]
+                else f"Этой записи уже нет в таблице: {result['summary']}.")
+    else:
+        text = f"Ок, это разные покупки, обе записи оставила ({result['summary']})."
+    try:
+        await callback.message.edit_text(text, parse_mode=None, reply_markup=None)
+    except Exception:
+        pass
+    await callback.answer()
+
+
 async def alert_worker():
     """Отправляет накопленные тревоги Владу в личку. Не получилось отправить — только лог (нельзя падать от тревог)."""
     while True:
@@ -982,9 +1063,14 @@ def _period_summary_text(title: str, start: str, end: str, compare_start: str = 
     lines.append(f"💸 Расходы: {_format_currency(expense)} тг")
     lines.append(f"📈 Баланс: {_format_currency(income - expense)} тг")
 
+    changes_text = None
     if compare_start and compare_end:
         prev_txs = get_transactions_for_period(compare_start, compare_end)
         prev_expense = sum(float(t.get("amt") or 0) for t in prev_txs if not is_income_type(t.get("type")))
+        try:
+            changes_text = forecast_module.category_changes(by_cat, forecast_module.by_category(prev_txs))
+        except Exception as changes_error:
+            print(f"[Отчёт] Сравнение категорий пропущено: {changes_error}")
         if prev_expense > 0:
             diff_pct = (expense - prev_expense) / prev_expense * 100
             if abs(diff_pct) >= 1:
@@ -998,6 +1084,8 @@ def _period_summary_text(title: str, start: str, end: str, compare_start: str = 
         lines.append("\nТоп категорий:")
         for cat, amount in top:
             lines.append(f"- {cat}: {_format_currency(amount)} тг")
+    if changes_text:
+        lines.append(changes_text)
     return "\n".join(lines)
 
 
@@ -1037,6 +1125,15 @@ async def finance_report_scheduler():
                     reflection = await generate_budget_reflection("weekly", text)
                     if reflection:
                         text = f"{reflection}\n\n{text}"
+                    try:
+                        month_txs = await asyncio.to_thread(
+                            get_transactions_for_period, now.replace(day=1).strftime("%Y-%m-%d"),
+                            (now.date() + datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
+                        line = forecast_module.forecast_line(forecast_module.month_forecast(now, month_txs))
+                        if line:
+                            text = f"{text}\n\n{line}"
+                    except Exception as forecast_error:
+                        print(f"[Прогноз] Пропущено в недельном отчёте: {forecast_error}")
 
                     # Категории БЕЗ заданного лимита (их не видит
                     # check_limit_warnings) — раз в неделю мягко сверяем
@@ -1265,6 +1362,8 @@ async def main():
     asyncio.create_task(check_subscriptions())
     asyncio.create_task(subscription_auto_worker())
     asyncio.create_task(alert_worker())
+    asyncio.create_task(forecast_warning_scheduler())
+    asyncio.create_task(duplicate_worker())
     asyncio.create_task(check_price_tracking())
     asyncio.create_task(check_debt_reminders())
     asyncio.create_task(check_limit_warnings())
