@@ -174,6 +174,8 @@ def process_tx(tx: dict) -> dict | None:
         from services.sheets import SUBSCRIPTION_HEADERS
         ws.update_cell(match["_row"], SUBSCRIPTION_HEADERS.index("last_paid") + 1, date.strftime("%Y-%m-%d"))
         ws.update_cell(match["_row"], SUBSCRIPTION_HEADERS.index("paid_month") + 1, target)
+        _remember_mark(tx.get("transaction_id"), str(match.get("name")), str(match.get("last_paid") or ""),
+                       str(match.get("paid_month") or ""))
         return {"kind": "paid", "name": str(match.get("name")), "month": target, "date": date.strftime("%d.%m"),
                 "day": day, "amount": float(parse_amount(tx.get("amount", 0)) or 0)}
     if not _is_candidate(tx):
@@ -185,7 +187,8 @@ def process_tx(tx: dict) -> dict | None:
     token = uuid.uuid4().hex[:10]
     amount = float(parse_amount(tx.get("amount", 0)) or 0)
     state.put(SUGGEST_NS, token, {"name": name, "amount": amount, "bank": str(tx.get("bank") or "Не указан"),
-                                  "day": date.day, "date": date.strftime("%Y-%m-%d"), "key": key})
+                                  "day": date.day, "date": date.strftime("%Y-%m-%d"), "key": key,
+                                  "tx_id": str(tx.get("transaction_id") or "")})
     state.put(ASKED_NS, key, {"at": time.time(), "never": False})
     return {"kind": "suggest", "token": token, "name": name, "amount": amount, "day": date.day}
 
@@ -202,6 +205,7 @@ def apply_answer(token: str, add: bool) -> dict | None:
         return {"added": False, **data}
     from services.sheets import add_or_update_subscription
     add_or_update_subscription(data["name"], data["amount"], data["bank"], data["day"], paid_date=data["date"])
+    _remember_mark(data.get("tx_id"), data["name"], "", "")
     return {"added": True, **data}
 
 
@@ -211,3 +215,38 @@ def keyboard(token: str):
         InlineKeyboardButton(text="✅ Добавить в подписки", callback_data=f"{CALLBACK_PREFIX}y:{token}"),
         InlineKeyboardButton(text="🚫 Не подписка", callback_data=f"{CALLBACK_PREFIX}n:{token}"),
     ]])
+
+
+MARK_NS = "sub_paid_by"
+
+
+def _remember_mark(tx_id, name: str, prev_last_paid: str, prev_paid_month: str) -> None:
+    """Запоминаем, какая трата закрыла месяц подписки: если трату отменят, отметку нужно снять."""
+    if tx_id:
+        state.put(MARK_NS, str(tx_id), {"name": name, "last_paid": prev_last_paid, "paid_month": prev_paid_month})
+
+
+def revert_for_ids(ids) -> list[str]:
+    """Трата(ы) отменены кнопкой «Отменить»: возвращаем у подписки прежние last_paid и paid_month,
+    чтобы автосписание этого месяца не пропало. Возвращает названия подписок."""
+    from services.sheets import SUBSCRIPTION_HEADERS, _get_all_records_safe, _get_or_create_subscriptions_sheet
+    done = []
+    wanted = [str(i) for i in (ids or []) if str(i or "").strip()]
+    marks = []
+    for key in {w for w in wanted}:
+        record = state.get(MARK_NS, key)
+        if record:
+            marks.append((key, record))
+    if not marks:
+        return done
+    ws = _get_or_create_subscriptions_sheet()
+    records = _get_all_records_safe(ws)
+    for key, record in marks:
+        for idx, row in enumerate(records, start=2):
+            if str(row.get("name", "")).strip().lower() == record["name"].strip().lower():
+                ws.update_cell(idx, SUBSCRIPTION_HEADERS.index("last_paid") + 1, record["last_paid"])
+                ws.update_cell(idx, SUBSCRIPTION_HEADERS.index("paid_month") + 1, record["paid_month"])
+                done.append(record["name"])
+                break
+        state.delete(MARK_NS, key)
+    return done

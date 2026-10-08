@@ -15,6 +15,13 @@ KINDS = {"sum", "top", "last", "count", "breakdown"}
 MAX_TOP = 10
 
 
+def _ops(n: int) -> str:
+    n = int(n)
+    last2, last = n % 100, n % 10
+    word = "операций" if 11 <= last2 <= 14 else "операция" if last == 1 else "операции" if 2 <= last <= 4 else "операций"
+    return f"{n} {word}"
+
+
 def _money(value) -> str:
     return f"{float(value):,.0f}".replace(",", " ")
 
@@ -131,7 +138,7 @@ def answer(q: dict, transactions: list[dict], period_text: str) -> str:
         name = last.get("merchant") or last.get("subcat") or last.get("cat")
         return f"Последняя операция: {day}, {_money(last['amt'])} тг, {name}."
     if kind == "count":
-        return f"{head}: {len(rows)} операций на {_money(total)} тг."
+        return f"{head}: {_ops(len(rows))} на {_money(total)} тг."
     if kind == "top":
         n = max(1, min(int(parse_amount(q.get("limit", 5)) or 5), MAX_TOP))
         best = sorted(rows, key=lambda t: -float(t.get("amt") or 0))[:n]
@@ -149,7 +156,7 @@ def answer(q: dict, transactions: list[dict], period_text: str) -> str:
         for key, value in sorted(by.items(), key=lambda kv: -kv[1])[:10]:
             lines.append(f"- {key}: {_money(value)} тг ({value / total * 100:.0f}%)")
         return "\n".join(lines)
-    return f"{head}: {_money(total)} тг ({len(rows)} операций)."
+    return f"{head}: {_money(total)} тг ({_ops(len(rows))})."
 
 
 def run(q: dict, fetch, today: datetime.date) -> str:

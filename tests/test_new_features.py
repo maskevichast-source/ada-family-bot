@@ -41,7 +41,7 @@ def test_period_resolution():
 
 def test_sum_filters_and_not_found():
     out = sq.run({"kind": "sum", "period": "last_month", "category": "Еда"}, fetch, TODAY)
-    assert "15 000 тг" in out and "2 операций" in out
+    assert "15 000 тг" in out and "2 операции" in out
     assert "5 000 тг" in sq.run({"kind": "sum", "period": "last_month", "category": "Еда", "user": "Диана"}, fetch, TODAY)
     assert "ничего не нашла" in sq.run({"kind": "sum", "period": "last_month", "merchant": "Netflix"}, fetch, TODAY)
     assert "ничего не нашла" in sq.run({"kind": "sum", "period": "this_month", "bank": "Kaspi"}, fetch, TODAY)
@@ -214,3 +214,61 @@ def test_weather_alert_scheduler_sends_once_per_day(app, monkeypatch):
     calls.reset_mock()
     tick(app.weather_alert_scheduler)                                      # ночью не смотрим вообще
     assert calls.call_count == 0
+
+
+# ---------- починки: тревоги по временным сбоям, повтор напоминаний, откат подписки ----------
+def test_transient_network_error_alerts_only_when_repeated():
+    alerts.PENDING.clear()
+    alerts._transient_hits.clear()
+    with state.connection() as conn:
+        conn.execute("DELETE FROM state WHERE namespace='alert_sent'")
+    err = ConnectionError("('Connection aborted.', RemoteDisconnected('Remote end closed connection without response'))")
+    assert alerts.is_transient(err) and not alerts.is_transient(KeyError("x"))
+    assert alerts.report_error("rem", "Цикл напоминаний", err) is False
+    assert alerts.report_error("rem", "Цикл напоминаний", err) is False
+    assert alerts.report_error("rem", "Цикл напоминаний", err) is True        # третий раз за 20 минут — это уже серьёзно
+    alerts._transient_hits.clear()
+    assert alerts.report_error("other", "Другой", KeyError("боль")) is True    # обычная ошибка — сразу
+
+
+def test_reminder_not_resent_when_sheet_update_failed(db, monkeypatch):
+    from services import reminders
+    sent = []
+
+    class Bot:
+        async def send_message(self, **kw):
+            sent.append(kw)
+    rows = [{"reminder_id": "R1", "remind_at": "2026-10-07 10:00:00", "target_user": "Семья", "text": "Тест",
+             "recurrence": "once", "row_idx": 2}]
+    monkeypatch.setattr(reminders, "pending", lambda: [dict(r) for r in rows])
+    calls = {"n": 0}
+
+    def flaky(r, when, now):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise RuntimeError("Google 503")
+    monkeypatch.setattr(reminders, "_advance_after_send", flaky)
+    now = dt.datetime(2026, 10, 7, 10, 5, tzinfo=ASTANA_TZ)
+    asyncio.run(reminders.deliver_due(Bot(), now))
+    asyncio.run(reminders.deliver_due(Bot(), now))           # следующая минута: таблица опять доступна
+    assert len(sent) == 1 and calls["n"] == 2                 # сообщение ушло один раз, статус дообновили
+
+
+def test_undo_reverts_subscription_mark(db):
+    from services import sheets, subscriptions_auto as sa, undo
+    sheets.add_or_update_subscription("Netflix", 4500, "Kaspi", 5)
+    tx = {"merchant": "Netflix", "amount": 4500, "date": "2026-10-02 12:00:00", "category": "Связь и подписки",
+          "subcategory": "Цифровые подписки и сервисы", "bank": "Kaspi", "type": "РАСХОД", "transaction_id": "TRXNF"}
+    sheets.append_transaction(dict(tx, user_comment="Netflix"))
+    assert sa.process_tx(tx)["kind"] == "paid"
+    assert db.worksheet("Subscriptions").data[1][8] == "2026-10"
+    assert sa.revert_for_ids(["TRXNF"]) == ["Netflix"]
+    assert db.worksheet("Subscriptions").data[1][8] == "" and db.worksheet("Subscriptions").data[1][5] == ""
+    sheets.delete_transactions_by_ids(["TRXNF"])                              # сама трата при отмене тоже удаляется
+    assert sheets.process_due_subscriptions(dt.datetime(2026, 10, 5, 10, 0, tzinfo=ASTANA_TZ)) == ["Netflix"]
+
+
+def test_operations_plural():
+    from services.spending_query import _ops
+    assert [_ops(n) for n in (1, 2, 5, 11, 21, 71, 112)] == ["1 операция", "2 операции", "5 операций", "11 операций",
+                                                              "21 операция", "71 операция", "112 операций"]

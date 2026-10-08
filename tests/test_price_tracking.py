@@ -107,15 +107,38 @@ def test_recently_checked_item_is_skipped(app, monkeypatch, db):
     assert not app.bot.send_message.called
 
 
-def test_three_failures_marks_broken_and_notifies_once(app, monkeypatch, db):
+def test_few_failures_keep_tracking_silently(app, monkeypatch, db):
     now = dt.datetime(2026, 9, 20, 10, 0, tzinfo=ASTANA_TZ)
     frozen(monkeypatch, app, now)
-    _seed_tracking_row(db, fail_count=2, last_checked_at="2026-09-20 06:00:00")
+    _seed_tracking_row(db, fail_count=2, last_checked_at="2026-09-20 06:00:00")   # третий сбой подряд — ещё не повод
     monkeypatch.setattr(app, "fetch_product_info", AsyncMock(return_value=None))
+    app.bot.send_message.reset_mock()
     tick(app.check_price_tracking)
-    assert app.bot.send_message.called
+    assert not app.bot.send_message.called
+    assert len(sheets.get_active_price_trackings()) == 1
+
+
+def test_sixth_failure_warns_once_and_keeps_tracking(app, monkeypatch, db):
+    now = dt.datetime(2026, 9, 20, 10, 0, tzinfo=ASTANA_TZ)
+    frozen(monkeypatch, app, now)
+    _seed_tracking_row(db, fail_count=5, last_checked_at="2026-09-20 06:00:00")
+    monkeypatch.setattr(app, "fetch_product_info", AsyncMock(return_value=None))
+    app.bot.send_message.reset_mock()
+    tick(app.check_price_tracking)
     text = app.bot.send_message.call_args.kwargs.get("text") or app.bot.send_message.call_args.args[-1]
-    assert "Отслеживание остановлено" in text
+    assert "Продолжаю пробовать" in text and app.bot.send_message.call_args.kwargs["chat_id"] == VLAD_ID
+    assert len(sheets.get_active_price_trackings()) == 1
+
+
+def test_day_of_failures_marks_broken_and_notifies_once(app, monkeypatch, db):
+    now = dt.datetime(2026, 9, 20, 10, 0, tzinfo=ASTANA_TZ)
+    frozen(monkeypatch, app, now)
+    _seed_tracking_row(db, fail_count=23, last_checked_at="2026-09-20 06:00:00")
+    monkeypatch.setattr(app, "fetch_product_info", AsyncMock(return_value=None))
+    app.bot.send_message.reset_mock()
+    tick(app.check_price_tracking)
+    text = app.bot.send_message.call_args.kwargs.get("text") or app.bot.send_message.call_args.args[-1]
+    assert "Отслеживание остановлено" in text and "больше суток" in text
     assert app.bot.send_message.call_args.kwargs["chat_id"] == VLAD_ID
     assert sheets.get_active_price_trackings() == []
 

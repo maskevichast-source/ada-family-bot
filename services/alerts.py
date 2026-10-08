@@ -33,7 +33,31 @@ def report(kind: str, text: str) -> bool:
         return False
 
 
+TRANSIENT_WINDOW_SECONDS = 20 * 60
+TRANSIENT_REPEATS = 3
+_transient_hits: dict[str, deque] = {}
+_TRANSIENT_NAMES = ("connection", "timeout", "remotedisconnected", "urlerror", "clienterror", "serverdisconnected",
+                    "ssl", "protocolerror", "readerror", "chunkedencoding")
+_TRANSIENT_TEXT = ("connection aborted", "connection reset", "temporarily", "timed out", "502", "503", "504",
+                   "429", "quota exceeded", "remote end closed")
+
+
+def is_transient(error: BaseException) -> bool:
+    """Разовые сетевые сбои (оборвалось соединение, Google ответил 5xx): сами проходят, пугать ими не нужно."""
+    names = [c.__name__.lower() for c in type(error).__mro__]
+    if any(any(t in n for t in _TRANSIENT_NAMES) for n in names):
+        return True
+    return any(t in str(error).lower() for t in _TRANSIENT_TEXT)
+
+
 def report_error(kind: str, where: str, error: BaseException) -> bool:
+    """Временный сбой сети тревогу вызывает, только если повторился 3 раза за 20 минут; остальные ошибки сразу."""
+    if is_transient(error):
+        hits = _transient_hits.setdefault(kind, deque(maxlen=TRANSIENT_REPEATS))
+        now = time.time()
+        hits.append(now)
+        if len(hits) < TRANSIENT_REPEATS or now - hits[0] > TRANSIENT_WINDOW_SECONDS:
+            return False
     return report(kind, f"{where}: {type(error).__name__}: {str(error)[:300]}")
 
 

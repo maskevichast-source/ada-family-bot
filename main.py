@@ -499,7 +499,7 @@ async def cmd_export(message: types.Message):
 @dp.message(Command("debug"))
 async def cmd_debug(message: types.Message):
     from services.sheets import debug_transactions_snapshot
-    debug_text = debug_transactions_snapshot()
+    debug_text = await asyncio.to_thread(debug_transactions_snapshot)
     await safe_answer(message, f"```\n{debug_text}\n```")
 
 
@@ -681,6 +681,10 @@ async def _send_price_dm(owner: str, text: str, image_url: str = "") -> bool:
     return False
 
 
+PRICE_WARN_AFTER_FAILS = 6
+PRICE_STOP_AFTER_FAILS = 24
+
+
 async def check_price_tracking():
     """Раз в час: каждую активную позицию перепроверяем, если с её last_checked_at прошло >= 3 часов.
 
@@ -710,11 +714,19 @@ async def check_price_tracking():
                 info = await fetch_product_info(item.get("url"))
                 if not info or not info.get("price"):
                     fail_count = await asyncio.to_thread(record_price_check_failure, row_idx)
-                    if fail_count >= 3:
+                    # Сбои магазина (антибот, перезагрузка страницы) обычно проходят за часы. Бросаем отслеживание
+                    # только после суток подряд неудач, а на 6-й час один раз предупреждаем.
+                    if fail_count == PRICE_WARN_AFTER_FAILS:
+                        await _send_price_dm(
+                            owner,
+                            f"Уже несколько часов не получается проверить цену: {price_alerts.short_title(item.get('product_name'))}. "
+                            f"Продолжаю пробовать, отслеживание пока не остановлено.",
+                        )
+                    elif fail_count >= PRICE_STOP_AFTER_FAILS:
                         await asyncio.to_thread(set_price_tracking_status, row_idx, "broken")
                         await _send_price_dm(
                             owner,
-                            f"Не получается проверить цену: {price_alerts.short_title(item.get('product_name'))}. "
+                            f"Не получается проверить цену уже больше суток: {price_alerts.short_title(item.get('product_name'))}. "
                             f"Возможно, товар убрали или Kaspi изменил страницу. Отслеживание остановлено. "
                             f"Пришли ссылку заново, если нужно продолжить.",
                         )

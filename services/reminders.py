@@ -9,6 +9,7 @@ import re
 import uuid
 import html
 
+from services import state
 from services.timezone import now_astana, parse_flexible_datetime, parse_ru_relative_datetime
 from services.telegram_safe import safe_answer, safe_send_message
 import config
@@ -559,14 +560,46 @@ def _mention_for(target, vlad_id, diana_id):
     return f"{vlad_part} и {diana_part}"
 
 
+def _advance_after_send(r: dict, when, now) -> None:
+    """После отправки: разовое — «sent», повторяющееся — следующее время. Синхронная (идёт в потоке)."""
+    rec = str(r.get("recurrence", "once")).lower()
+    ws = worksheet()
+    until_str = str(r.get("until") or "").strip()
+    until_dt = parse_flexible_datetime(until_str) if until_str else None
+    if rec in {"daily", "weekly", "monthly"} and not (until_dt and now.date() >= until_dt.date()):
+        anchor = r.get("anchor_day")
+        next_dt = next_occurrence(when, rec, now, anchor_day=int(anchor) if anchor else None)
+        if next_dt and not (until_dt and next_dt.date() > until_dt.date()):
+            ws.update_cell(r["row_idx"], 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
+        else:
+            ws.update_cell(r["row_idx"], 6, "sent")
+    else:
+        ws.update_cell(r["row_idx"], 6, "sent")
+
+
+def _cleanup_sent_markers() -> None:
+    try:
+        for key, _ in state.entries("reminder_sent", older_than=7 * 86400):
+            state.delete("reminder_sent", key)
+    except Exception:
+        pass
+
+
 async def deliver_due(bot, now=None):
     """Фоновая отправка в семейный чат."""
     now = now or now_astana()
     async with dispatch_lock:
+        await asyncio.to_thread(_cleanup_sent_markers)
         for r in await asyncio.to_thread(pending):
             try:
                 when = parse_flexible_datetime(r.get("remind_at"))
                 if not when or when > now:
+                    continue
+
+                sent_key = f'{r.get("reminder_id") or r.get("row_idx")}|{r.get("remind_at")}'
+                if state.get("reminder_sent", sent_key):
+                    # уже отправлено, но таблицу обновить не вышло (сбой Google): повторно не шлём, только дообновляем
+                    await asyncio.to_thread(_advance_after_send, r, when, now)
                     continue
 
                 target = r.get("target_user", "Семья")
@@ -583,19 +616,8 @@ async def deliver_due(bot, now=None):
                 # будет отправлено повторно на следующем цикле.
                 await safe_send_message(bot, config.FAMILY_CHAT_ID, msg, parse_mode="HTML")
 
-                rec = str(r.get("recurrence", "once")).lower()
-                ws = worksheet()
-                until_str = str(r.get("until") or "").strip()
-                until_dt = parse_flexible_datetime(until_str) if until_str else None
-                if rec in {"daily", "weekly", "monthly"} and not (until_dt and now.date() >= until_dt.date()):
-                    anchor = r.get("anchor_day")
-                    next_dt = next_occurrence(when, rec, now, anchor_day=int(anchor) if anchor else None)
-                    if next_dt and not (until_dt and next_dt.date() > until_dt.date()):
-                        ws.update_cell(r["row_idx"], 4, next_dt.strftime("%Y-%m-%d %H:%M:%S"))
-                    else:
-                        ws.update_cell(r["row_idx"], 6, "sent")
-                else:
-                    ws.update_cell(r["row_idx"], 6, "sent")
+                state.put("reminder_sent", sent_key, {"at": now.isoformat()})
+                await asyncio.to_thread(_advance_after_send, r, when, now)
 
             except Exception as e:
                 logging.exception(f"[Deliver Reminder Error]: {e}")

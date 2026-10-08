@@ -1,3 +1,4 @@
+import asyncio
 import json
 import datetime
 import traceback
@@ -335,7 +336,7 @@ async def parse_and_analyze(user_text: str = "", user_name: str = "Пользо�
         # Решает код (см. habit_remark_due в services/analytics.py): только если
         # в самом сообщении речь про такую покупку, повторов уже достаточно и
         # прошлое замечание было давно — иначе модель озвучивает факт каждый раз.
-        harmful_count = habit_remark_due(user_name, text_to_parse)
+        harmful_count = await asyncio.to_thread(habit_remark_due, user_name, text_to_parse)
         if harmful_count:
             system_sections.append(
                 f"ФАКТ (посчитано кодом, не выдумано): за последние 7 дней у {user_name} уже было "

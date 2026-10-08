@@ -128,6 +128,12 @@ def perform_undo(token: str) -> dict:
         entry["status"] = "done"
         entry["deleted"] = deleted
         state.put(NS, token, entry)
+    if deleted:
+        try:
+            from services import subscriptions_auto
+            subscriptions_auto.revert_for_ids(entry.get("ids") or [])
+        except Exception as error:
+            print(f"[Undo] Не смогла снять отметку подписки: {error}")
     if not deleted:
         return {"status": "not_found", "summary": entry.get("summary", "")}
     return {"status": "done", "deleted": len(deleted), "summary": entry.get("summary", "")}
