@@ -32,7 +32,7 @@ from services.telegram_safe import safe_answer, safe_send_message
 from services.pending_receipts import sweep_expired
 from services.pending_clarifications import sweep_expired_clarifications
 from services.timezone import ASTANA_TZ, parse_flexible_datetime
-from services.weather import get_weather_forecast, get_tomorrow_forecast, get_weather_image
+from services.weather import get_weather_forecast, get_tomorrow_forecast, get_weather_image, get_pixel_weather
 from services.charts import generate_expense_chart, generate_trend_chart
 from services.reports import generate_pdf_report, generate_excel_export
 from services.analytics import analyze_budget_leaks, detect_category_pace_anomalies
@@ -953,6 +953,23 @@ async def process_subscription_suggestion(callback: types.CallbackQuery):
 
 async def _send_weather(kind: str, text_target: str) -> bool:
     """Прогноз в семейный чат: картинка с двумя графиками, а если не получилась — привычный текст."""
+    pixel = await get_pixel_weather(kind)
+    if pixel:
+        try:
+            await bot.send_animation(FAMILY_CHAT_ID, types.BufferedInputFile(pixel.gif, filename="ada_weather.gif"),
+                                     caption=pixel.caption)
+        except Exception as e:
+            print(f"[Погода-Шедулер] Не удалось отправить пиксельную карточку: {e}")
+            pixel = None
+        if pixel:                                  # карточка ушла — «успех»; страницы — приятное дополнение
+            try:
+                await bot.send_media_group(FAMILY_CHAT_ID, [
+                    types.InputMediaPhoto(media=types.BufferedInputFile(pixel.chart_png, filename="chart.png")),
+                    types.InputMediaPhoto(media=types.BufferedInputFile(pixel.modules_png, filename="modules.png")),
+                ])
+            except Exception as e:
+                print(f"[Погода-Шедулер] Страницы не отправились: {e}")
+            return True
     image = await get_weather_image(kind)
     if image:
         try:

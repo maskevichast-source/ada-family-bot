@@ -220,7 +220,8 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         "latitude": ASTANA_LATITUDE,
         "longitude": ASTANA_LONGITUDE,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
-        "hourly": "temperature_2m,apparent_temperature,precipitation_probability,weather_code,wind_speed_10m",
+        "hourly": "temperature_2m,apparent_temperature,precipitation_probability,weather_code,wind_speed_10m,"
+                  "relative_humidity_2m,surface_pressure,uv_index,visibility,wind_gusts_10m,cape,precipitation,snowfall,cloud_cover",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max,sunrise,sunset",
         "timezone": "Asia/Almaty",
         "forecast_days": max(1, min(int(forecast_days), 7)),
@@ -787,6 +788,38 @@ async def get_weather_image(kind: str, now: datetime.datetime | None = None):
         return png, weather_chart.caption_for(points, windows, start)
     except Exception as error:
         print(f"[Погода] Не удалось нарисовать картинку: {error}")
+        return None
+
+
+def _request_air_quality() -> dict:
+    params = urllib.parse.urlencode({
+        "latitude": ASTANA_LATITUDE, "longitude": ASTANA_LONGITUDE,
+        "current": "european_aqi,pm2_5", "timezone": "Asia/Almaty",
+    })
+    with urllib.request.urlopen(f"https://air-quality-api.open-meteo.com/v1/air-quality?{params}", timeout=10) as response:
+        import json
+        cur = (json.loads(response.read().decode("utf-8")).get("current") or {})
+    return {"aqi": _num(cur.get("european_aqi")), "pm25": _num(cur.get("pm2_5"))}
+
+
+async def get_pixel_weather(kind: str, now: datetime.datetime | None = None):
+    """Пиксельная погода: PixelSet (GIF-карточка + 2 страницы + подпись) или None, если не вышло."""
+    if kind not in IMAGE_KINDS:
+        return None
+    from services.pixel_weather import render
+    now = now or datetime.datetime.now(ASTANA_TZ)
+    start = _image_start(kind, now)
+    days_ahead = (start.date() - now.date()).days + 2
+    try:
+        data = await _fetch_open_meteo(max(2, min(days_ahead, 7)))
+        try:
+            aqi = await asyncio.to_thread(_request_air_quality)
+        except Exception as aqi_error:                      # воздух — необязательный модуль
+            print(f"[Погода] Качество воздуха недоступно: {aqi_error}")
+            aqi = None
+        return await render.build_set(data, start, kind, aqi)
+    except Exception as error:
+        print(f"[Погода] Пиксельная картинка не получилась: {error}")
         return None
 
 

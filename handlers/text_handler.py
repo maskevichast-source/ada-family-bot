@@ -4,7 +4,7 @@ import asyncio
 import datetime
 import re
 
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
+from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile, InputMediaPhoto
 from aiogram import types
 
 from config import get_authorized_user_name
@@ -35,7 +35,7 @@ from services.sheets import (
 from services.banks import canonical_bank_name
 from services.charts import generate_expense_chart
 from services.limits_ai import generate_limits_from_history
-from services.weather import get_weather_forecast, get_weather_image
+from services.weather import get_weather_forecast, get_weather_image, get_pixel_weather
 from services.telegram_safe import safe_answer
 from services.pending_receipts import has_pending, pop_pending, ack_pending
 from services import ada_voice
@@ -312,6 +312,23 @@ async def _answer_weather_image(message: Message, target: str, chat_id) -> bool:
     тогда вызывающий код отвечает текстом."""
     if target not in {"today", "tomorrow"}:
         return False
+    pixel = await get_pixel_weather(target)
+    if pixel:
+        try:
+            await message.answer_animation(BufferedInputFile(pixel.gif, filename="ada_weather.gif"), caption=pixel.caption)
+        except Exception as error:
+            print(f"[Погода] Не удалось отправить пиксельную карточку: {error}")
+            pixel = None
+        if pixel:
+            try:
+                await message.answer_media_group([
+                    InputMediaPhoto(media=BufferedInputFile(pixel.chart_png, filename="chart.png")),
+                    InputMediaPhoto(media=BufferedInputFile(pixel.modules_png, filename="modules.png")),
+                ])
+            except Exception as error:
+                print(f"[Погода] Страницы не отправились: {error}")
+            add_chat_message(chat_id, "Ада", pixel.caption)
+            return True
     image = await get_weather_image(target)
     if not image:
         return False

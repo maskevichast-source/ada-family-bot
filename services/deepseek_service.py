@@ -503,3 +503,28 @@ async def generate_budget_reflection(kind: str, facts: str) -> str:
     except Exception as error:
         print(f"[Живая реплика Ады] Ошибка ({kind}): {error}")
         return ""
+
+
+async def generate_weather_phrase(facts: str, kind: str = "morning") -> str:
+    """Короткая остроумная фраза Ады для пиксельной карточки погоды. Цифры берёт только из facts.
+    Возвращает "" при любой ошибке — тогда карточка берёт запасную фразу из шаблонов."""
+    when = "на сегодня" if kind in ("morning", "today") else "на завтра" if kind in ("evening", "tomorrow") else ""
+    prompt = (
+        "Ты — Ада, домашняя помощница семьи. Напиши ОДНУ короткую фразу про погоду " + when + " "
+        "для экрана в стиле старого терминала. Максимум 90 символов, одно-два предложения, по-русски, "
+        "с лёгким юмором и заботой, как умная подруга. Опирайся только на факты ниже, цифры не выдумывай и "
+        "не повторяй все подряд — выбери самое важное (холод, ветер, осадки, гололёд, гроза, воздух). "
+        "Если есть опасность (гололёд, гроза, сильный мороз или ветер) — шути мягче и скажи, что делать. "
+        "Без эмодзи, без кавычек, без вступлений, не начинай с «Сегодня».\n"
+        "Верни только саму фразу."
+    )
+    try:
+        response = await client.chat.completions.create(
+            model=DEEPSEEK_REASONING_MODEL,
+            messages=[{"role": "system", "content": prompt}, {"role": "user", "content": facts}],
+            max_tokens=120,
+        )
+        return (response.choices[0].message.content or "").strip()
+    except Exception as error:
+        print(f"[Фраза погоды] Ошибка: {error}")
+        return ""
