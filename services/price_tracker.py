@@ -75,6 +75,51 @@ async def resolve_redirects(url: str) -> tuple[str, str]:
 # 1. KASPI МАГАЗИН
 # ═══════════════════════════════════════════════════════════════════════════════
 
+
+KASPI_PROFILES = ("chrome124", "safari17_2_ios", "chrome120", "chrome131")
+
+
+async def _kaspi_get(url: str, headers: dict, timeout: int = 10, attempts: int = 3, as_json: bool = False):
+    """GET к Kaspi с перебором «отпечатков» браузера: часть сбоев — это сброс соединения антиботом
+    по TLS-отпечатку, другой профиль обычно проходит. Возвращает ответ или None; статус пишем в лог."""
+    last = None
+    for i in range(attempts):
+        profile = KASPI_PROFILES[i % len(KASPI_PROFILES)]
+        try:
+            async with AsyncSession(impersonate=profile) as session:
+                resp = await session.get(url, headers=headers, timeout=timeout)
+            if resp.status_code == 200:
+                return resp
+            last = f"HTTP {resp.status_code}"
+        except Exception as e:
+            last = str(e)[:120]
+        await asyncio.sleep(1 + i)
+    print(f"[Kaspi] {url[:70]}… не открылся за {attempts} попытки: {last}")
+    return None
+
+
+def _price_from_html(html_content: str) -> float:
+    """Цена из страницы: видимый текст, мета-тег, JSON-LD (offers.price / lowPrice), data-атрибуты."""
+    patterns = (
+        r'class="[^"]*item__price-once[^"]*"[^>]*>([\d\s\xa0]+)\s*₸',
+        r'<meta\s+property="product:price:amount"\s+content="([\d.]+)"',
+        r'"offers"\s*:\s*\{[^{}]*?"price"\s*:\s*"?([\d.]+)"?',
+        r'"lowPrice"\s*:\s*"?([\d.]+)"?',
+        r'class="[^"]*price[^"]*"[^>]*>([\d\s\xa0]+)\s*₸',
+    )
+    for pattern in patterns:
+        m = re.search(pattern, html_content)
+        if m:
+            digits = "".join(c for c in m.group(1) if c.isdigit() or c == ".")
+            try:
+                value = float(digits) if digits else 0.0
+            except ValueError:
+                value = 0.0
+            if value > 0:
+                return value
+    return 0.0
+
+
 async def parse_kaspi(url: str) -> Optional[dict]:
     final_url = url
     html_content = ""
@@ -83,92 +128,67 @@ async def parse_kaspi(url: str) -> Optional[dict]:
     price = 0.0
     image_url = None
 
-    async with AsyncSession(impersonate="chrome124") as session:
-        if "l.kaspi.kz" in url.lower():
-            final_url, html_content = await resolve_redirects(url)
+    if "l.kaspi.kz" in url.lower():
+        final_url, html_content = await resolve_redirects(url)
 
-        match = re.search(r'-(\d+)(?:/|\?|$)', final_url) or re.search(r'/p/[^/]+-(\d+)', final_url)
-        if match:
-            product_id = match.group(1)
+    match = re.search(r'-(\d+)(?:/|\?|$)', final_url) or re.search(r'/p/[^/]+-(\d+)', final_url)
+    if match:
+        product_id = match.group(1)
 
-        # Если ещё не загрузили полную страницу товара, загружаем её
-        if not html_content or "l.kaspi.kz" in url.lower():
-            target_url = f"https://kaspi.kz/shop/p/-{product_id}/" if product_id else final_url
+    page_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Referer": "https://kaspi.kz/",
+        "Cookie": "kaspi.store.city=710000000",
+    }
+    # Страницу товара грузим, если ещё нет html или он не содержит цену
+    if not html_content or _price_from_html(html_content) == 0:
+        target_url = f"https://kaspi.kz/shop/p/-{product_id}/" if product_id else final_url
+        resp = await _kaspi_get(target_url, page_headers)
+        if resp is not None:
+            html_content = resp.text
+            if not product_id:
+                id_m = re.search(r'data-product-id="(\d+)"', html_content) or re.search(r'kaspi\.kz/shop/p/[^"]*?-(\d+)', html_content)
+                if id_m:
+                    product_id = id_m.group(1)
+
+    if html_content:
+        price = _price_from_html(html_content)
+        t_m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_content) or re.search(r'<title>([^<]+)</title>', html_content)
+        if t_m:
+            title = clean_kaspi_title(t_m.group(1))
+        img_m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_content)
+        if img_m:
+            image_url = html.unescape(img_m.group(1))
+
+    # Если страница не дала цену — API Астаны (город 710000000)
+    if (price == 0 or not title) and product_id:
+        api_headers = {"Referer": "https://kaspi.kz/", "Cookie": "kaspi.store.city=710000000"}
+        api_resp = await _kaspi_get(f"https://kaspi.kz/yml/product-view/p/{product_id}?c=710000000", api_headers, timeout=8)
+        if api_resp is not None:
             try:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-                    "Referer": "https://kaspi.kz/",
-                    "Cookie": "kaspi.store.city=710000000",
-                }
-                resp = await session.get(target_url, headers=headers, timeout=10)
-                html_content = resp.text
-                if not product_id:
-                    id_m = re.search(r'data-product-id="(\d+)"', html_content) or re.search(r'kaspi\.kz/shop/p/[^"]*?-(\d+)', html_content)
-                    if id_m:
-                        product_id = id_m.group(1)
+                api_data = api_resp.json()
+                if not title and api_data.get("title"):
+                    title = clean_kaspi_title(api_data.get("title"))
+                if not image_url:
+                    images = api_data.get("images") or []
+                    if images and isinstance(images, list):
+                        first_image = images[0]
+                        image_url = (
+                            first_image.get("medium") or first_image.get("large")
+                            or first_image.get("small") if isinstance(first_image, dict) else None
+                        )
+                # Реальная цена предложения (offers), а не общереспубликанский lowPrice
+                offers = api_data.get("offers", [])
+                if offers and offers[0].get("price"):
+                    price = float(offers[0].get("price"))
+                elif api_data.get("unitPrice"):
+                    price = float(api_data.get("unitPrice"))
+                elif api_data.get("price"):
+                    price = float(api_data.get("price"))
             except Exception as e:
-                print(f"[Kaspi Page] Ошибка: {e}")
-
-        # 1. Считываем ТОЧНУЮ цену с экрана (item__price-once)
-        if html_content:
-            price_once_match = re.search(r'class="[^"]*item__price-once[^"]*"[^>]*>([\d\s]+)\s*₸', html_content)
-            if not price_once_match:
-                price_once_match = re.search(r'class="[^"]*price[^"]*"[^>]*>([\d\s]+)\s*₸', html_content)
-
-            if price_once_match:
-                digits = "".join(c for c in price_once_match.group(1) if c.isdigit())
-                if digits:
-                    price = float(digits)
-
-            # Метатег product:price:amount отдаётся сервером статично (без JS)
-            # и надёжнее видимого текста на странице — пробуем в первую очередь,
-            # если экранная цена не нашлась (и как проверку, если нашлась).
-            if price == 0:
-                meta_price_m = re.search(r'<meta\s+property="product:price:amount"\s+content="([\d.]+)"', html_content)
-                if meta_price_m:
-                    try:
-                        price = float(meta_price_m.group(1))
-                    except ValueError:
-                        pass
-
-            t_m = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html_content) or re.search(r'<title>([^<]+)</title>', html_content)
-            if t_m:
-                title = clean_kaspi_title(t_m.group(1))
-
-            img_m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html_content)
-            if img_m:
-                image_url = html.unescape(img_m.group(1))
-
-        # 2. Если парсинг экрана не удался, запрашиваем API Астаны (город 710000000)
-        if (price == 0 or not title) and product_id:
-            api_url = f"https://kaspi.kz/yml/product-view/p/{product_id}?c=710000000"
-            headers = {
-                "Referer": "https://kaspi.kz/",
-                "Cookie": "kaspi.store.city=710000000",
-            }
-            try:
-                api_resp = await session.get(api_url, headers=headers, timeout=8)
-                if api_resp.status_code == 200:
-                    api_data = api_resp.json()
-                    if not title and api_data.get("title"):
-                        title = clean_kaspi_title(api_data.get("title"))
-                    if not image_url:
-                        images = api_data.get("images") or []
-                        if images and isinstance(images, list):
-                            first_image = images[0]
-                            image_url = (
-                                first_image.get("medium") or first_image.get("large")
-                                or first_image.get("small") if isinstance(first_image, dict) else None
-                            )
-
-                    # Берём реальную цену предложения (offers), а не общереспубликанский lowPrice
-                    offers = api_data.get("offers", [])
-                    if offers and offers[0].get("price"):
-                        price = float(offers[0].get("price"))
-                    elif api_data.get("unitPrice"):
-                        price = float(api_data.get("unitPrice"))
-            except Exception as e:
-                print(f"[Kaspi API] Ошибка: {e}")
+                print(f"[Kaspi API] Не разобрал ответ для {product_id}: {e}")
+    if price == 0:
+        print(f"[Kaspi] Цена не найдена: id={product_id}, страница {'есть' if html_content else 'не загрузилась'}")
 
     final_title = title or f"Товар Kaspi {product_id}"
     return {
