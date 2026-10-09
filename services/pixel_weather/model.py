@@ -82,7 +82,7 @@ def uv_info(points: list[dict]) -> tuple[float, str]:
     if not vals:
         return 0.0, "—"
     top = max(vals)
-    label = "НИЗКИЙ" if top < 3 else "УМЕРЕН." if top < 6 else "ВЫСОКИЙ" if top < 8 else "ОЧ.ВЫС."
+    label = "НИЗКИЙ" if top < 3 else "УМЕРЕННЫЙ" if top < 6 else "ВЫСОКИЙ" if top < 8 else "ОЧЕНЬ ВЫСОКИЙ"
     return top, label
 
 
@@ -169,11 +169,11 @@ def threat(points: list[dict], thunder: int, ice: int) -> tuple[int, list[str]]:
 
 
 def golden_hour(sun: tuple[str, str] | None) -> str:
-    """Золотой час вечером: за час до заката."""
+    """Золотой час вечером: за 30 минут до заката (как в RAD)."""
     if not sun:
         return "—"
     h, m = map(int, sun[1].split(":"))
-    t = datetime.datetime(2000, 1, 1, h, m) - datetime.timedelta(hours=1)
+    t = datetime.datetime(2000, 1, 1, h, m) - datetime.timedelta(minutes=30)
     return f"{t:%H:%M}"
 
 

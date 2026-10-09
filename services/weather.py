@@ -221,7 +221,8 @@ def _request_open_meteo(forecast_days: int = 7) -> dict:
         "longitude": ASTANA_LONGITUDE,
         "current": "temperature_2m,apparent_temperature,weather_code,wind_speed_10m",
         "hourly": "temperature_2m,apparent_temperature,precipitation_probability,weather_code,wind_speed_10m,"
-                  "relative_humidity_2m,surface_pressure,uv_index,visibility,wind_gusts_10m,cape,precipitation,snowfall,cloud_cover",
+                  "relative_humidity_2m,surface_pressure,uv_index,visibility,wind_gusts_10m,cape,precipitation,snowfall,cloud_cover,"
+                  "dew_point_2m,wind_direction_10m,pressure_msl",
         "daily": "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,wind_speed_10m_max,sunrise,sunset",
         "timezone": "Asia/Almaty",
         "forecast_days": max(1, min(int(forecast_days), 7)),
@@ -811,7 +812,7 @@ async def get_pixel_weather(kind: str, now: datetime.datetime | None = None):
     start = _image_start(kind, now)
     days_ahead = (start.date() - now.date()).days + 2
     try:
-        data = await _fetch_open_meteo(max(2, min(days_ahead, 7)))
+        data = await _fetch_open_meteo(7)                   # 7 дней: нужны и «По дням»
         try:
             aqi = await asyncio.to_thread(_request_air_quality)
         except Exception as aqi_error:                      # воздух — необязательный модуль
@@ -820,6 +821,24 @@ async def get_pixel_weather(kind: str, now: datetime.datetime | None = None):
         return await render.build_set(data, start, kind, aqi)
     except Exception as error:
         print(f"[Погода] Пиксельная картинка не получилась: {error}")
+        return None
+
+
+async def get_dispatch_card(kind: str, now: datetime.datetime | None = None) -> bytes | None:
+    """Новая карточка Dispatch (кнопка «Перемешать»): те же данные, новая фраза Ады."""
+    if kind not in IMAGE_KINDS:
+        return None
+    from services.pixel_weather import phrase, render
+    now = now or datetime.datetime.now(ASTANA_TZ)
+    try:
+        data = await _fetch_open_meteo(7)
+        m = render.build_model(data, _image_start(kind, now), kind)
+        if m is None:
+            return None
+        _, text = await phrase.make_phrases(m, kind)
+        return await asyncio.to_thread(render.make_dispatch, m, text)
+    except Exception as error:
+        print(f"[Погода] Dispatch не получился: {error}")
         return None
 
 

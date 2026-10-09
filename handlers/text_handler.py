@@ -314,19 +314,10 @@ async def _answer_weather_image(message: Message, target: str, chat_id) -> bool:
         return False
     pixel = await get_pixel_weather(target)
     if pixel:
-        try:
-            await message.answer_animation(BufferedInputFile(pixel.gif, filename="ada_weather.gif"), caption=pixel.caption)
-        except Exception as error:
-            print(f"[Погода] Не удалось отправить пиксельную карточку: {error}")
-            pixel = None
-        if pixel:
-            try:
-                await message.answer_media_group([
-                    InputMediaPhoto(media=BufferedInputFile(pixel.chart_png, filename="chart.png")),
-                    InputMediaPhoto(media=BufferedInputFile(pixel.modules_png, filename="modules.png")),
-                ])
-            except Exception as error:
-                print(f"[Погода] Страницы не отправились: {error}")
+        from services.pixel_weather.delivery import deliver
+        sent = await deliver(pixel, target, lambda f, c: message.answer_animation(f, caption=c),
+                             lambda g: message.answer_media_group(g), lambda f, k: message.answer_photo(f, reply_markup=k))
+        if sent:
             add_chat_message(chat_id, "Ада", pixel.caption)
             return True
     image = await get_weather_image(target)

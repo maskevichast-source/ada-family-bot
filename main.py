@@ -843,6 +843,23 @@ async def duplicate_worker():
         await asyncio.sleep(10)
 
 
+@dp.callback_query(F.data.startswith("wxmix:"))
+async def process_weather_mix(callback: types.CallbackQuery):
+    """«Перемешать» под карточкой Dispatch: новая фраза Ады на тех же данных погоды."""
+    kind = (callback.data or "").split(":", 1)[1]
+    await callback.answer("Придумываю новую…")
+    from services.weather import get_dispatch_card
+    from services.pixel_weather.delivery import mix_keyboard
+    card = await get_dispatch_card(kind)
+    if not card:
+        await callback.message.answer("Не получилось обновить фразу: погодный сервис не ответил.")
+        return
+    try:
+        await callback.message.answer_photo(types.BufferedInputFile(card, filename="dispatch.png"), reply_markup=mix_keyboard(kind))
+    except Exception as e:
+        print(f"[Погода] Перемешать не удалось: {e}")
+
+
 @dp.callback_query(F.data.startswith("dup:"))
 async def process_duplicate_answer(callback: types.CallbackQuery):
     from services import duplicates
@@ -955,20 +972,14 @@ async def _send_weather(kind: str, text_target: str) -> bool:
     """Прогноз в семейный чат: картинка с двумя графиками, а если не получилась — привычный текст."""
     pixel = await get_pixel_weather(kind)
     if pixel:
-        try:
-            await bot.send_animation(FAMILY_CHAT_ID, types.BufferedInputFile(pixel.gif, filename="ada_weather.gif"),
-                                     caption=pixel.caption)
-        except Exception as e:
-            print(f"[Погода-Шедулер] Не удалось отправить пиксельную карточку: {e}")
-            pixel = None
-        if pixel:                                  # карточка ушла — «успех»; страницы — приятное дополнение
-            try:
-                await bot.send_media_group(FAMILY_CHAT_ID, [
-                    types.InputMediaPhoto(media=types.BufferedInputFile(pixel.chart_png, filename="chart.png")),
-                    types.InputMediaPhoto(media=types.BufferedInputFile(pixel.modules_png, filename="modules.png")),
-                ])
-            except Exception as e:
-                print(f"[Погода-Шедулер] Страницы не отправились: {e}")
+        from services.pixel_weather.delivery import deliver
+        sent = await deliver(
+            pixel, kind,
+            lambda f, c: bot.send_animation(FAMILY_CHAT_ID, f, caption=c),
+            lambda g: bot.send_media_group(FAMILY_CHAT_ID, g),
+            lambda f, k: bot.send_photo(FAMILY_CHAT_ID, f, reply_markup=k),
+        )
+        if sent:
             return True
     image = await get_weather_image(kind)
     if image:
