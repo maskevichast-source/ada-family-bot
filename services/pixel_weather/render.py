@@ -10,11 +10,11 @@ from services.pixel_weather import insights, model, phrase, rad_pages, scene
 class PixelSet:
     gif: bytes
     pages: list[bytes]
-    dispatch: bytes
     caption: str
     street: str
     dispatch_text: str
-    names: list[str] = field(default_factory=lambda: ["now", "terminal", "wind", "spread", "days", "tiles"])
+    dispatch: bytes = b""
+    names: list[str] = field(default_factory=lambda: ["day"])
 
 
 def caption_for(m: dict) -> str:
@@ -52,14 +52,14 @@ async def build_set(data: dict, start: datetime.datetime, kind: str, aqi: dict |
     street, dispatch_text = await phrase.make_phrases(m, kind)
 
     def work():
-        thumb = scene.scene_image(m, 0.4)
-        pages = [rad_pages.page_now(m, street, thumb), rad_pages.page_terminal(m), rad_pages.page_wind_rain(m),
-                 rad_pages.page_spread_sun(m), rad_pages.page_days(m), rad_pages.page_tiles(m)]
         sgn = rad_pages._sgn
-        foot = f"{sgn(m['first']['temp'])}°  ·  ощущается {sgn(m['first']['feels'])}°  ·  ветер {m['wind_kmh']:.0f} км/ч"
-        gif = scene.render_gif(m, street, foot=foot, tag=rad_pages.COND_RU.get(
-            rad_pages.icons.kind_of(m["first"].get("code"), m["night"]), ""))
-        return PixelSet(gif=gif, pages=pages, dispatch=make_dispatch(m, dispatch_text), caption=caption_for(m),
-                        street=street, dispatch_text=dispatch_text)
+        f = m["first"]
+        threat = insights.THREAT_NAMES[m["threat"]].capitalize()
+        foot = f"{threat}  ·  ветер {m['wind_kmh']:.0f} км/ч  ·  {sgn(m['tmin'])}…{sgn(m['tmax'])}°"
+        kind_icon = rad_pages.icons.kind_of(f.get("code"), m["night"])
+        gif = scene.render_gif(m, street, foot=foot, tag=rad_pages.COND_RU.get(kind_icon, ""),
+                               big=f"{sgn(f['temp'])}°", sub=f"ощущается {sgn(f['feels'])}°")
+        return PixelSet(gif=gif, pages=[rad_pages.page_day(m)], caption=caption_for(m), street=street,
+                        dispatch_text=dispatch_text)
 
     return await asyncio.to_thread(work)

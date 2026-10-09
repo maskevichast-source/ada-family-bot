@@ -113,10 +113,10 @@ def test_build_set_renders_everything(monkeypatch):
     result = asyncio.run(render.build_set(synth(code=61, rain=80), START, "morning", {"aqi": 50, "pm25": 12}))
     gif = Image.open(io.BytesIO(result.gif))
     assert gif.n_frames > 30 and gif.size == (640, 360) and len(result.gif) < 3_000_000
-    assert len(result.pages) == 6 and len(result.names) == 6
+    assert len(result.pages) == 1 and result.names == ["day"]
     for png in result.pages:
         assert Image.open(io.BytesIO(png)).size[0] == 1080
-    assert Image.open(io.BytesIO(result.dispatch)).size == (1080, 1080)
+    assert result.dispatch == b""
     assert "Астана" in result.caption and len(result.caption) <= 1000
 
 
@@ -128,7 +128,7 @@ def test_render_without_air_night_and_missing_extras():
     data["daily"] = {"time": ["2026-10-08"], "sunrise": [], "sunset": []}
     m = render.build_model(data, datetime.datetime(2026, 10, 8, 21), "evening", None)
     assert m["night"] is True and m["aqi_value"] is None and m["arc"] is None
-    for page in (rad_pages.page_now(m, "тест", None), rad_pages.page_terminal(m), rad_pages.page_wind_rain(m),
+    for page in (rad_pages.page_day(m), rad_pages.page_now(m, "тест", None), rad_pages.page_terminal(m), rad_pages.page_wind_rain(m),
                  rad_pages.page_spread_sun(m), rad_pages.page_days(m), rad_pages.page_tiles(m)):
         assert page[:4] == b"\x89PNG"
 
@@ -155,3 +155,21 @@ def test_delivery_sends_in_order_and_survives_partial_failure():
         raise RuntimeError("no")
 
     assert asyncio.run(delivery.deliver(pix, "morning", bad_anim, group, photo)) is False
+
+
+def test_delivery_single_page_goes_as_photo():
+    from services.pixel_weather import delivery
+    pix = type("P", (), {"gif": b"g", "pages": [b"1"], "names": ["day"], "dispatch": b"", "caption": "c"})()
+    log = []
+
+    async def anim(f, c):
+        log.append("anim")
+
+    async def group(g):
+        log.append("group")
+
+    async def photo(f, k):
+        log.append(("photo", k))
+
+    assert asyncio.run(delivery.deliver(pix, "morning", anim, group, photo)) is True
+    assert log == ["anim", ("photo", None)]

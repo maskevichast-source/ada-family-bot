@@ -266,7 +266,7 @@ def scene_image(m: dict, phase: float = 0.35) -> Image.Image:
     return p.im
 
 
-def _overlay(img: Image.Image, text: str, shown: float, cursor: bool, tag: str, foot: str) -> Image.Image:
+def _overlay(img: Image.Image, text: str, shown: float, cursor: bool, tag: str, foot: str, big: str = "", sub: str = "") -> Image.Image:
     from PIL import ImageDraw
     from services.pixel_weather import ui
     d = ImageDraw.Draw(img, "RGBA")
@@ -277,6 +277,9 @@ def _overlay(img: Image.Image, text: str, shown: float, cursor: bool, tag: str, 
     d.ellipse([172, 17, 184, 29], fill=ui.GREEN)
     d.text((192, 13), "LIVE", font=f_s, fill=ui.GREEN)
     d.text((W - 18, 13), tag, font=f_s, fill=ui.AMBER, anchor="ra")
+    if big:
+        d.text((W - 24, 62), big, font=ui.font_px(86, 200), fill=ui.WHITE, anchor="ra")
+        d.text((W - 24, 160), sub, font=ui.font_px(20, 500), fill=ui.AMBER, anchor="ra")
     d.rectangle([0, H - 112, W, H], fill=(10, 10, 10, 225))
     lines = gfx.wrap(text, 38, 2)
     total = sum(len(x) for x in lines)
@@ -295,13 +298,13 @@ def _overlay(img: Image.Image, text: str, shown: float, cursor: bool, tag: str, 
     return img
 
 
-def render_gif(m: dict, text: str, foot: str = "", tag: str = "", scale: int = 4) -> bytes:
+def render_gif(m: dict, text: str, foot: str = "", tag: str = "", scale: int = 4, big: str = "", sub: str = "") -> bytes:
     frames = []
     for i in range(FRAMES):
         phase = i / FRAMES
         img = scene_image(m, phase).resize((SW * scale, SH * scale), Image.NEAREST)
         shown = min(1.0, (i + 1) / TYPE_FRAMES)
-        frames.append(_overlay(img, text, shown, (i // 4) % 2 == 0, tag, foot))
+        frames.append(_overlay(img, text, shown, (i // 4) % 2 == 0, tag, foot, big, sub))
     sample = Image.new("RGB", (frames[0].width, frames[0].height * 4))
     for k, idx in enumerate((0, FRAMES // 4, FRAMES // 2, FRAMES - 1)):
         sample.paste(frames[idx], (0, k * frames[0].height))

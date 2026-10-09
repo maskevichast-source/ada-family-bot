@@ -566,3 +566,88 @@ def dispatch_card(m: dict, text: str, frame: Image.Image | None, tag: str) -> by
     cv.wrap(76, 750, text, 44, AMBER, 930, 400, max_lines=3)
     cv.text(76, 1000, "СДЕЛАНО В АДЕ · СЕМЕЙНЫЙ БОТ", 17, FAINT, 500, track=2)
     return cv.finish()
+
+
+# ───────────────────── ОДНА КАРТИНКА: ПРОГНОЗ НА 24 ЧАСА ─────────────────────
+def _window_card(cv: Canvas, m: dict, win: list[dict], y0: int, label: str):
+    cv.card(CARD_X0, y0, CARD_X1, y0 + 424)
+    cv.text(64, y0 + 20, label, 27, WHITE, 600, track=2)
+    cv.dot(740, y0 + 36, 8, AMBER)
+    cv.text(756, y0 + 24, "ТЕМП.", 19, DIM, 500)
+    cv.dot(850, y0 + 36, 8, CYAN)
+    cv.text(866, y0 + 24, "ОЩУЩАЕТСЯ", 19, DIM, 500)
+    n = len(win)
+    X0, X1 = 150, 1004
+    xs = [X0 + i * (X1 - X0) / (n - 1) for i in range(n)]
+    CT, CB = y0 + 96, y0 + 190
+    lo = min(min(p["temp"] for p in win), min(p["feels"] for p in win))
+    hi = max(max(p["temp"] for p in win), max(p["feels"] for p in win))
+    pad = max(1.5, (hi - lo) * 0.15)
+    lo, hi = lo - pad, hi + pad
+
+    def ty(v):
+        return CB - (v - lo) / (hi - lo) * (CB - CT)
+
+    if lo < 0 < hi:
+        cv.line([(X0, ty(0)), (X1, ty(0))], (70, 70, 70), 2, dashed=True, dash=(6, 6))
+    line = [(xs[i], ty(p["temp"])) for i, p in enumerate(win)]
+    cv.fill_under(line, CB, (46, 38, 24), (14, 18, 20))
+    cv.line([(xs[i], ty(p["feels"])) for i, p in enumerate(win)], (30, 130, 160), 3, dashed=True)
+    cv.line(line, AMBER, 4)
+    for i, p in enumerate(win):
+        if p["dt"].hour % 3 == 0:
+            cv.dot(xs[i], ty(p["temp"]), 6, AMBER)
+            cv.text(xs[i], ty(p["temp"]) - 36, f"{_sgn(p['temp'])}°", 24, WHITE, 600, anchor="m")
+            cv.text(xs[i], y0 + 204, f"{p['dt'].hour:02d}", 20, DIM, 500, anchor="m")
+            icons.draw_icon(cv, _kind(m, p), xs[i], y0 + 250, 46)
+    cv.text(24, y0 + 306, "ДОЖДЬ", 15, CYAN, 600, track=1)
+    cv.text(24, y0 + 324, "%", 14, DIM, 400)
+    base = y0 + 346
+    for i, p in enumerate(win):
+        h = 40 * p["rain"] / 100
+        if h >= 1:
+            cv.rect(xs[i] - 12, base - h, xs[i] + 12, base, fill=CYAN if p["rain"] < 70 else (150, 120, 255))
+        if p["dt"].hour % 3 == 0:
+            cv.text(xs[i], base + 6, f"{p['rain']:.0f}%", 17, DIM, 400, anchor="m")
+    cv.rect(X0 - 14, base, X1 + 14, base + 1, fill=(60, 60, 60))
+    cv.text(24, y0 + 384, "ВЕТЕР", 15, GREEN, 600, track=1)
+    cv.text(24, y0 + 402, "км/ч", 14, DIM, 400)
+    for i, p in enumerate(win):
+        if p["dt"].hour % 3 == 0:
+            w = p["wind_kmh"]
+            cv.text(xs[i], y0 + 386, f"{w:.0f}", 21, GREEN if w < 30 else AMBER if w < 50 else RED, 600, anchor="m")
+
+
+def page_day(m: dict) -> bytes:
+    """Одна картинка: два окна по 12 часов (температура, ощущается, осадки, ветер) + одежда, зонт при необходимости, солнце и луна."""
+    from services import weather_chart as wc
+    cv = Canvas(1080, 1450)
+    st = m["start"]
+    ui.header(cv, "АСТАНА", f"{wc.WEEKDAYS_RU[st.weekday()]}, {st.day} {wc.MONTHS_RU_GEN[st.month - 1]}".upper())
+    pts = m["points"]
+    wins = [pts[:13], pts[12:25]]
+    y = 150
+    for win in wins:
+        if len(win) >= 2:
+            _window_card(cv, m, win, y, wc.window_label(win).upper())
+            y += 444
+    # нижний блок
+    cv.card(CARD_X0, y, CARD_X1, 1430)
+    yy = y + 22
+    cv.caps(64, yy, "Одежда", 19, AMBER, 600)
+    yy = cv.wrap(64, yy + 28, m["clothes"], 23, WHITE, 940, 400, max_lines=3) + 8
+    umb = wc.umbrella_text(pts)
+    if umb:
+        cv.caps(64, yy, "Зонт" if "снег" not in umb[0].lower() else "Снег", 19, CYAN, 600)
+        yy = cv.wrap(64, yy + 28, umb[0], 23, WHITE, 940, 400, max_lines=3) + 8
+    if m["sun"]:
+        cv.caps(64, yy, "Солнце", 19, AMBER, 600)
+        cv.text(64, yy + 28, f"восход {m['sun'][0]}  ·  закат {m['sun'][1]}  ·  золотой час {m['golden']}", 23, WHITE, 400)
+        yy += 70
+    cv.caps(64, yy, "Луна", 19, AMBER, 600)
+    cv.text(64, yy + 28, m["moon"][1], 23, WHITE, 400)
+    _moon(cv, 960, yy + 20, 26, m["moon"][0])
+    spread = max(p.get("spread", 0) for p in pts)
+    if spread >= 3:
+        cv.text(64, yy + 68, f"Модели расходятся до {spread:.0f}°: прогноз может поплыть", 20, DIM, 400)
+    return cv.finish()
