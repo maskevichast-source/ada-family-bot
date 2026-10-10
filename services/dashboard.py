@@ -206,6 +206,7 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
     cur_income = cur_expense = prev_income = prev_expense = 0.0
     by_cat: dict[str, float] = {}
     expenses: list[dict] = []
+    incomes: list[dict] = []
     cur_count = 0
     # для графиков: расходы по дням (только вид «месяц») и по месяцам периода
     day_cur: dict[int, float] = {}
@@ -249,6 +250,16 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
             user_name = _user_of(t)
             if income:
                 cur_income += amount
+                i_title, i_note = _title_and_note(t)
+                incomes.append({
+                    "date": dt.strftime("%d.%m.%Y"),
+                    "amount": round(amount, 2),
+                    "category": cat,
+                    "text": i_title,
+                    "note": i_note,
+                    "user": user_name,
+                    "_ts": dt.timestamp(),
+                })
                 if user_name in people_inc:
                     people_inc[user_name] += amount
             else:
@@ -312,6 +323,8 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
 
     expenses.sort(key=lambda e: (e["amount"], e["_ts"]), reverse=True)
     top = [{k: v for k, v in e.items() if k != "_ts"} for e in expenses[:MAX_EXPENSE_ROWS]]
+    incomes.sort(key=lambda e: e["_ts"], reverse=True)
+    income_rows = [{k: v for k, v in e.items() if k != "_ts"} for e in incomes]
 
     dynamics = _build_dynamics(months, now, sy, sm, py, pm, day_cur, day_prev, by_month)
 
@@ -382,6 +395,7 @@ def compute_dashboard(transactions: list[dict], limits: dict, now: datetime.date
         "dynamics": dynamics,
         "week": week,
         "expenses": top,
+        "incomes": income_rows,
         "expenses_total": len(expenses),
         "banks": banks,
         "merchants": merchants,

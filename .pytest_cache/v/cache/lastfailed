@@ -1,1 +1,4 @@
-{}
+{
+  "tests/test_backup.py::test_scheduler_disabled_without_folder": true,
+  "tests/test_price_tracking.py::test_three_failures_marks_broken_and_notifies_once": true
+}

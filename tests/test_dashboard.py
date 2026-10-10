@@ -467,3 +467,18 @@ def test_api_period_7d_maps_to_days(monkeypatch):
             await client.close()
 
     asyncio.run(run())
+
+
+def test_income_list_matches_total_and_sorted():
+    extra = TXS + [tx("2026-09-12 09:00:00", 15000, "Подработка", "ДОХОД")]
+    d = dashboard.compute_dashboard(extra, LIMITS, NOW)
+    rows = d["incomes"]
+    assert [r["amount"] for r in rows] == [15000, 500000]        # новые сверху
+    assert sum(r["amount"] for r in rows) == d["income"]
+    assert rows[0]["category"] == "Подработка" and rows[0]["date"] == "12.09.2026"
+    assert "_ts" not in rows[0]
+
+
+def test_income_list_empty_without_income():
+    d = dashboard.compute_dashboard([tx("2026-09-01 10:00:00", 100)], LIMITS, NOW)
+    assert d["incomes"] == []

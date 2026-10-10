@@ -26,6 +26,8 @@
   .sub { color: var(--hint); font-size: 13px; }
   .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .card { background: var(--card); border-radius: 14px; padding: 12px 14px; }
+  .card.tap { cursor: pointer; }
+  .card.tap:active { opacity: .7; }
   .card.wide { grid-column: 1 / -1; }
   .label { color: var(--hint); font-size: 13px; }
   .value { font-size: 22px; font-weight: 650; margin-top: 2px; font-variant-numeric: tabular-nums; }
@@ -375,7 +377,7 @@
   function closeCategory() { state.cat = null; state.q = ""; message("Загружаю…"); load(false); }
   function syncBack() {
     if (!tg || !tg.BackButton) return;
-    if (state.cat && state.tab === "overview") tg.BackButton.show(); else tg.BackButton.hide();
+    if ((state.cat || state.income) && state.tab === "overview") tg.BackButton.show(); else tg.BackButton.hide();
   }
 
   function alertLine(a) {
@@ -505,9 +507,33 @@
     root.replaceChildren(frag);
   }
 
+  function renderIncome(d) {
+    document.getElementById("title").textContent = "Доходы";
+    document.getElementById("updated").textContent = "обновлено " + d.updated_at;
+    var frag = document.createDocumentFragment();
+    var back = el("button", "back", "‹ Назад");
+    back.addEventListener("click", closeIncome);
+    frag.appendChild(back);
+    frag.appendChild(el("div", "cmp", d.month_label + (d.who === "family" ? " · вся семья" : " · " + d.who)));
+    var cards = el("div", "cards");
+    cards.appendChild(card("Доход за период", money(d.income), { wide: true }));
+    frag.appendChild(cards);
+    frag.appendChild(el("h2", "", "Поступления (" + d.incomes.length + ")"));
+    d.incomes.forEach(function (i) {
+      var subs = [{ text: i.date + " · " + i.category + (d.who === "family" && i.user ? " · " + i.user : "") }];
+      if (i.note) subs.push({ text: i.note });
+      frag.appendChild(itemRow(i.text || i.category, "+" + money(i.amount), subs));
+    });
+    root.replaceChildren(frag);
+  }
+  function closeIncome() { state.income = false; if (lastData) render(lastData); }
+
+  var lastData = null;
   function render(d) {
+    lastData = d;
     syncBack();
     if (d.category) return renderDetail(d);
+    if (state.income) return renderIncome(d);
     document.getElementById("title").textContent = d.month_label;
     document.getElementById("updated").textContent = "обновлено " + d.updated_at;
     var otherBtn = document.querySelector('#who button[data-v="other"]');
@@ -516,7 +542,13 @@
     var frag = document.createDocumentFragment();
     var cards = el("div", "cards");
     cards.appendChild(card("Расход", money(d.expense)));
-    cards.appendChild(card("Доход", money(d.income)));
+    var incCard = card("Доход", money(d.income));
+    if ((d.incomes || []).length) {
+      incCard.classList.add("tap");
+      incCard.appendChild(el("div", "sub", "нажми, чтобы посмотреть ›"));
+      incCard.addEventListener("click", function () { state.income = true; render(d); window.scrollTo(0, 0); });
+    }
+    cards.appendChild(incCard);
     cards.appendChild(card("Остаток", money(d.balance), { wide: true, neg: d.balance < 0 }));
     frag.appendChild(cards);
     var cmp = comparison(d);
@@ -534,7 +566,7 @@
     root.replaceChildren(frag);
   }
 
-  var state = { who: "family", period: "1", tab: "overview", cat: null, q: "", view: "categories" };
+  var state = { who: "family", period: "1", tab: "overview", cat: null, q: "", view: "categories", income: false };
   var seq = 0, qseq = 0;
 
   function buildQuery(force) {
@@ -758,6 +790,7 @@
     var b = ev.target.closest("button");
     if (!b || b.dataset.t === state.tab) return;
     state.tab = b.dataset.t;
+    state.income = false;
     syncBack();
     this.querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
     document.getElementById("controls").style.display = state.tab === "overview" ? "" : "none";
@@ -770,6 +803,7 @@
       var b = ev.target.closest("button");
       if (!b || b.dataset.v === state[key]) return;
       state[key] = b.dataset.v;
+      state.income = false;
       this.querySelectorAll("button").forEach(function (x) { x.classList.toggle("on", x === b); });
       message("Загружаю…");
       load(false);
@@ -784,7 +818,10 @@
   }
   tg.ready();
   tg.expand();
-  if (tg.BackButton) tg.BackButton.onClick(function () { if (state.cat && state.tab === "overview") closeCategory(); });
+  if (tg.BackButton) tg.BackButton.onClick(function () {
+    if (state.income) closeIncome();
+    else if (state.cat && state.tab === "overview") closeCategory();
+  });
   load(false);
 })();
 </script>
