@@ -482,3 +482,14 @@ def test_income_list_matches_total_and_sorted():
 def test_income_list_empty_without_income():
     d = dashboard.compute_dashboard([tx("2026-09-01 10:00:00", 100)], LIMITS, NOW)
     assert d["incomes"] == []
+
+
+def test_load_raw_raises_instead_of_zeros_when_sheets_empty(monkeypatch):
+    import pytest
+    import services.sheets as sheets
+    monkeypatch.setattr(sheets, "get_transactions_for_period", lambda a, b: [])
+    monkeypatch.setattr(sheets, "get_category_limits", lambda: {})
+    monkeypatch.setattr(dashboard, "LOAD_RETRY_SECONDS", 0)
+    dashboard.reset_cache()
+    with pytest.raises(RuntimeError):
+        dashboard.load_raw(NOW)

@@ -18,6 +18,8 @@ from services.timezone import ASTANA_TZ, now_astana, parse_flexible_datetime
 WARN_RATIO = 0.85
 
 CACHE_TTL_SECONDS = 90
+LOAD_ATTEMPTS = 3
+LOAD_RETRY_SECONDS = 8
 EMPTY_CACHE_TTL_SECONDS = 15   # пустой результат мог быть сбоем чтения Sheets
 MIN_REFRESH_INTERVAL_SECONDS = 15
 
@@ -416,11 +418,19 @@ def load_raw(now: datetime.datetime | None = None) -> dict:
     start = datetime.date(fy, fm, 1).strftime("%Y-%m-%d")
     # +1 день: период считается как [start, end), а сегодня должно попасть.
     end = (now + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
-    return {
-        "transactions": get_transactions_for_period(start, end),
-        "limits": get_category_limits(),
-        "now": now,
-    }
+    transactions = []
+    for attempt in range(LOAD_ATTEMPTS):
+        transactions = get_transactions_for_period(start, end)
+        if transactions:
+            break
+        if attempt < LOAD_ATTEMPTS - 1:
+            time.sleep(LOAD_RETRY_SECONDS * (attempt + 1))   # пустой ответ чаще всего — лимит чтений Google (429)
+    limits = get_category_limits()
+    if not transactions:
+        if _cache["raw"] is not None:
+            return _cache["raw"]                  # лучше показать прошлые данные, чем нули
+        raise RuntimeError("Google Sheets не вернул транзакции (возможно, лимит запросов)")
+    return {"transactions": transactions, "limits": limits, "now": now}
 
 
 def load_dashboard(now: datetime.datetime | None = None, months: int = 1,
