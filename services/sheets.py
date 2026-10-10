@@ -20,6 +20,35 @@ scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/au
 
 _cached_client = None
 _cached_db = None
+_ws_cache: dict = {}          # title -> (db, worksheet): лист ищем и проверяем заголовки один раз, а не на каждый вызов
+
+QUOTA_RETRY_DELAYS = (4.0, 10.0, 20.0)   # лимит Google — «за минуту»: секундные паузы не помогают
+
+
+def _install_quota_retry() -> None:
+    """Любой запрос к Google Sheets, упёршийся в лимит чтений/записей (429), ждёт и повторяется,
+    вместо того чтобы сразу ронять запись траты или показывать нули."""
+    from gspread import http_client as _hc
+    original = _hc.HTTPClient.request
+    if getattr(original, "_ada_quota_retry", False):
+        return
+
+    def request(self, *args, **kwargs):
+        for attempt in range(len(QUOTA_RETRY_DELAYS) + 1):
+            try:
+                return original(self, *args, **kwargs)
+            except gspread.exceptions.APIError as e:
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                if status != 429 or attempt == len(QUOTA_RETRY_DELAYS):
+                    raise
+                print(f"[Google Таблицы] Лимит запросов (429), жду {QUOTA_RETRY_DELAYS[attempt]:.0f} с и повторяю")
+                time.sleep(QUOTA_RETRY_DELAYS[attempt])
+
+    request._ada_quota_retry = True
+    _hc.HTTPClient.request = request
+
+
+_install_quota_retry()
 
 
 def _digits_only(text) -> str:
@@ -85,11 +114,15 @@ def _get_all_records_safe(ws):
 
 def _get_or_create_worksheet(title: str, headers: list[str], rows: int = 50, cols: int | None = None):
     db = get_db()
+    cached = _ws_cache.get(title)
+    if cached and cached[0] is db:
+        return cached[1]
     try:
         ws = db.worksheet(title)
     except gspread.WorksheetNotFound:
         ws = db.add_worksheet(title=title, rows=rows, cols=cols or len(headers))
         ws.append_row(headers, table_range=_table_range(len(headers)))
+        _ws_cache[title] = (db, ws)
         return ws
     # Любая другая ошибка (403/сеть/квота) — не подменяем её тихим
     # созданием нового листа поверх настоящего, а даём ей всплыть наружу.
@@ -101,6 +134,7 @@ def _get_or_create_worksheet(title: str, headers: list[str], rows: int = 50, col
         first = str(values[0][0]).strip().lower()
         if first == "id":
             ws.update_cell(1, 1, "reminder_id")
+    _ws_cache[title] = (db, ws)
     return ws
 
 
